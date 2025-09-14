@@ -1,5 +1,5 @@
 // =======================================================================================
-// ==     ESP32C3 智能风扇控制器 v3.4.1 (最终修复版: 修复重定义错误/可手动解锁)     ==
+// ==     ESP32C3 智能风扇控制器 v3.5 (智能恢复增强版: 显示续航/严格恢复)     ==
 // =======================================================================================
 
 #include <Arduino.h>
@@ -36,7 +36,7 @@ const uint32_t MIN_PULSE_INTERVAL_US = 800;
 const int MAX_REASONABLE_RPM = 15000;
 
 // ============== 继电器与智能电源管理配置 ==============
-const float VOLTAGE_THRESHOLD = 2.0;
+const float VOLTAGE_THRESHOLD = 2.8;
 const float VOLTAGE_HIGH_THRESHOLD = 4.0;
 const long LOCKOUT_DURATION_MS = 3600000;
 
@@ -58,6 +58,8 @@ int fanSliderValue = 0;
 int lastRpm = 0;
 float loadVoltage = 0, current_mA = 0, power_mW = 0;
 float lockoutTriggerVoltage = 0.0;
+long lastRunDurationMinutes = 0;    // 新增：用于记录上次运行了多少分钟
+unsigned long lastRunStartTime = 0; // 新增：用于计算运行时长
 bool ina219_ok = false;
 bool relayState = false;
 bool isLockedOut = false;
@@ -109,6 +111,11 @@ void setRelay(bool state, bool manualOverride = false) {
       return;
   }
   
+  // 如果继电器从关闭变为开启，记录开始运行时间
+  if (state == true && relayState == false) {
+    lastRunStartTime = millis();
+  }
+
   relayState = state;
   digitalWrite(RELAY_PIN, relayState ? HIGH : LOW);
   Serial.printf("继电器 (Pin %d) 已设置为: %s\n", RELAY_PIN, relayState ? "ON (HIGH)" : "OFF (LOW)");
@@ -149,8 +156,12 @@ window.addEventListener('load',()=>{
 setInterval(()=>{
   fetchJson('/getData').then(data=>{
     rpm.textContent=data.rpm;v_el.textContent=data.voltage.toFixed(2);c_el.textContent=data.current.toFixed(1);p_el.textContent=data.power.toFixed(0);timeEl.textContent=data.time;
-    if(data.lockout){lockoutEl.style.display='block';lockoutEl.textContent='低压保护已触发 ('+data.lockout_trigger_v.toFixed(2)+'V)! 继电器已锁定关闭。 剩余时间: '+data.lockout_rem+' 分钟'}
-    else{lockoutEl.style.display='none'}
+    if(data.lockout){
+      lockoutEl.style.display='block';
+      lockoutEl.textContent='低压保护 ('+data.lockout_trigger_v.toFixed(2)+'V)! 上次运行 '+data.last_run_duration+' 分钟。继电器已锁定, 剩余: '+data.lockout_rem+' 分钟';
+    } else {
+      lockoutEl.style.display='none';
+    }
     updateRelayBtn(data.relay);
   }).catch(e=>console.error(e));
   fetchJson('/sysinfo').then(info=>{sys.innerHTML=`芯片: ${info.chip_model} (rev ${info.chip_rev})<br>CPU: ${info.cpu_freq_mhz} MHz<br>空闲内存: ${info.free_heap} B<br>IP: ${info.ip}`}).catch(e=>console.error(e));
@@ -171,6 +182,7 @@ void handleGetData() {
   json += "\"relay\":" + String(relayState ? "true" : "false") + ",";
   json += "\"lockout\":" + String(isLockedOut ? "true" : "false") + ",";
   json += "\"lockout_trigger_v\":" + String(lockoutTriggerVoltage) + ",";
+  json += "\"last_run_duration\":" + String(lastRunDurationMinutes) + ",";
   if(isLockedOut) {
     long remaining_ms = LOCKOUT_DURATION_MS - (millis() - lockoutStartTime);
     json += "\"lockout_rem\":" + String(remaining_ms / 60000) + ",";
@@ -290,12 +302,13 @@ void checkVoltageProtection() {
     if (millis() - lockoutStartTime >= LOCKOUT_DURATION_MS) {
       Serial.println("锁定时间已到，正在检查电压以尝试自动恢复...");
       sampleINA219();
-      if (loadVoltage >= VOLTAGE_THRESHOLD) {
-        Serial.printf("电压已恢复 (%.2fV)。自动重新开启继电器。\n", loadVoltage);
+      // 关键修改：只有电压高于“高位阈值”时才自动恢复
+      if (loadVoltage >= VOLTAGE_HIGH_THRESHOLD) {
+        Serial.printf("电压已恢复至安全水平 (%.2fV > %.2fV)。自动重新开启继电器。\n", loadVoltage, VOLTAGE_HIGH_THRESHOLD);
         isLockedOut = false;
         setRelay(true);
       } else {
-        Serial.printf("电压仍然过低 (%.2fV)。解除锁定，但继电器保持关闭。\n", loadVoltage);
+        Serial.printf("电压仍然不足 (%.2fV)。解除锁定，但继电器保持关闭，等待手动操作或充电。\n", loadVoltage);
         isLockedOut = false;
       }
     }
@@ -314,7 +327,13 @@ void checkVoltageProtection() {
     sampleINA219();
     if (loadVoltage > 0.1 && loadVoltage < VOLTAGE_THRESHOLD) {
       Serial.printf("!!! 触发低压保护: V=%.2fV (阈值: %.2fV)\n", loadVoltage, VOLTAGE_THRESHOLD);
+      
+      // 关键修改：计算并记录上次运行时长
+      unsigned long lastRunDurationMs = millis() - lastRunStartTime;
+      lastRunDurationMinutes = lastRunDurationMs / 60000;
+      Serial.printf("!!! 上次运行了 %ld 分钟。\n", lastRunDurationMinutes);
       Serial.println("!!! 继电器将关闭并锁定1小时。");
+      
       isLockedOut = true;
       lockoutStartTime = millis();
       lockoutTriggerVoltage = loadVoltage;
@@ -327,7 +346,7 @@ void checkVoltageProtection() {
 void setup() {
   Serial.begin(115200);
   delay(100);
-  Serial.println("\n\n===== ESP32C3 智能风扇控制器 v3.4.1 (最终修复版) =====");
+  Serial.println("\n\n===== ESP32C3 智能风扇控制器 v3.5 (智能恢复增强版) =====");
   
   Serial.println("--- 硬件初始化开始 ---");
   pinMode(RELAY_PIN, OUTPUT);
