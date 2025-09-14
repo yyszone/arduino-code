@@ -1,5 +1,5 @@
 // =======================================================================================
-// ==       ESP32C3 智能风扇控制器 v3.3 (UI增强版: 首页显示自动启停阈值)       ==
+// ==     ESP32C3 智能风扇控制器 v3.4.1 (最终修复版: 修复重定义错误/可手动解锁)     ==
 // =======================================================================================
 
 #include <Arduino.h>
@@ -36,7 +36,7 @@ const uint32_t MIN_PULSE_INTERVAL_US = 800;
 const int MAX_REASONABLE_RPM = 15000;
 
 // ============== 继电器与智能电源管理配置 ==============
-const float VOLTAGE_THRESHOLD = 3.0;
+const float VOLTAGE_THRESHOLD = 2.0;
 const float VOLTAGE_HIGH_THRESHOLD = 4.0;
 const long LOCKOUT_DURATION_MS = 3600000;
 
@@ -57,6 +57,7 @@ uint32_t lastRpmCalcMs = 0;
 int fanSliderValue = 0;
 int lastRpm = 0;
 float loadVoltage = 0, current_mA = 0, power_mW = 0;
+float lockoutTriggerVoltage = 0.0;
 bool ina219_ok = false;
 bool relayState = false;
 bool isLockedOut = false;
@@ -97,11 +98,17 @@ void sampleINA219() {
 }
 
 // ============== 继电器控制 ==============
-void setRelay(bool state) {
+void setRelay(bool state, bool manualOverride = false) {
+  if (isLockedOut && state == true && manualOverride) {
+    Serial.println("!!! 管理员手动覆盖低压锁定 !!!");
+    isLockedOut = false;
+  }
+  
   if (isLockedOut && state == true) {
-      Serial.println("继电器处于锁定状态，无法手动开启。");
+      Serial.println("继电器处于锁定状态，自动开启请求被拒绝。");
       return;
   }
+  
   relayState = state;
   digitalWrite(RELAY_PIN, relayState ? HIGH : LOW);
   Serial.printf("继电器 (Pin %d) 已设置为: %s\n", RELAY_PIN, relayState ? "ON (HIGH)" : "OFF (LOW)");
@@ -117,7 +124,7 @@ const spd=document.getElementById('spd'),rpm=document.getElementById('rpm'),slid
 function setLabel(v){const p=Math.round(v/255*100);spd.textContent=v+' ('+p+'%)'}
 function fetchJson(url,options){return fetch(url,options).then(r=>{if(!r.ok)throw new Error('Network error');return r.json()})}
 slider.addEventListener('input',()=>{const v=slider.value;setLabel(v);fetch('/setSpeed?value='+v).catch(e=>console.error(e))});
-relayBtn.addEventListener('click',()=>{const newState=!relayBtn.classList.contains('off');fetch('/setRelay?state='+(newState?'1':'0')).then(()=>{updateRelayBtn(!newState)})});
+relayBtn.addEventListener('click',()=>{const newState=!relayBtn.classList.contains('off');fetch('/setRelay?state='+(newState?'1':'0')).then(()=>{updateRelayBtn(newState)})});
 function updateRelayBtn(state){if(state){relayBtn.textContent='关闭继电器';relayBtn.classList.add('off')}else{relayBtn.textContent='开启继电器';relayBtn.classList.remove('off')}}
 function saveTimers(){
   const data=new FormData();
@@ -142,7 +149,7 @@ window.addEventListener('load',()=>{
 setInterval(()=>{
   fetchJson('/getData').then(data=>{
     rpm.textContent=data.rpm;v_el.textContent=data.voltage.toFixed(2);c_el.textContent=data.current.toFixed(1);p_el.textContent=data.power.toFixed(0);timeEl.textContent=data.time;
-    if(data.lockout){lockoutEl.style.display='block';lockoutEl.textContent='低压保护已触发! 继电器已锁定关闭。 剩余时间: '+data.lockout_rem+' 分钟'}
+    if(data.lockout){lockoutEl.style.display='block';lockoutEl.textContent='低压保护已触发 ('+data.lockout_trigger_v.toFixed(2)+'V)! 继电器已锁定关闭。 剩余时间: '+data.lockout_rem+' 分钟'}
     else{lockoutEl.style.display='none'}
     updateRelayBtn(data.relay);
   }).catch(e=>console.error(e));
@@ -163,6 +170,7 @@ void handleGetData() {
   json += "\"power\":" + String(power_mW) + ",";
   json += "\"relay\":" + String(relayState ? "true" : "false") + ",";
   json += "\"lockout\":" + String(isLockedOut ? "true" : "false") + ",";
+  json += "\"lockout_trigger_v\":" + String(lockoutTriggerVoltage) + ",";
   if(isLockedOut) {
     long remaining_ms = LOCKOUT_DURATION_MS - (millis() - lockoutStartTime);
     json += "\"lockout_rem\":" + String(remaining_ms / 60000) + ",";
@@ -174,7 +182,6 @@ void handleGetData() {
   server.send(200, "application/json", json);
 }
 
-// *** 关键修改： handleGetStatus 函数 ***
 void handleGetStatus() {
   String json = "{";
   json += "\"speed\":" + String(fanSliderValue) + ",";
@@ -187,8 +194,7 @@ void handleGetStatus() {
     json += ",\"action\":" + String(tasks[i].action?"true":"false") + "}";
     if(i==0) json += ",";
   }
-  json += "],"; // <-- 添加逗号
-  // 新增：将电压阈值发送给网页
+  json += "],";
   json += "\"low_voltage_threshold\":" + String(VOLTAGE_THRESHOLD) + ",";
   json += "\"high_voltage_threshold\":" + String(VOLTAGE_HIGH_THRESHOLD);
   json += "}";
@@ -209,7 +215,7 @@ void handleSetSpeed() {
 void handleSetRelay() {
   if (server.hasArg("state")) {
     bool newState = server.arg("state").toInt() == 1;
-    setRelay(newState);
+    setRelay(newState, true);
     server.send(200, "text/plain", "OK");
   } else { server.send(400, "text/plain", "Bad Request"); }
 }
@@ -311,6 +317,7 @@ void checkVoltageProtection() {
       Serial.println("!!! 继电器将关闭并锁定1小时。");
       isLockedOut = true;
       lockoutStartTime = millis();
+      lockoutTriggerVoltage = loadVoltage;
       setRelay(false);
     }
   }
@@ -320,7 +327,7 @@ void checkVoltageProtection() {
 void setup() {
   Serial.begin(115200);
   delay(100);
-  Serial.println("\n\n===== ESP32C3 智能风扇控制器 v3.3 (UI增强版) =====");
+  Serial.println("\n\n===== ESP32C3 智能风扇控制器 v3.4.1 (最终修复版) =====");
   
   Serial.println("--- 硬件初始化开始 ---");
   pinMode(RELAY_PIN, OUTPUT);
@@ -381,12 +388,12 @@ void setup() {
 }
 
 // ============== LOOP ==============
-unsigned long lastTimerCheck = 0;
-unsigned long lastVoltageCheck = 0;
-
 void loop() {
   server.handleClient();
   
+  unsigned long static lastTimerCheck = 0;
+  unsigned long static lastVoltageCheck = 0;
+
   if (millis() - lastVoltageCheck > 5000) {
     lastVoltageCheck = millis();
     checkVoltageProtection();
