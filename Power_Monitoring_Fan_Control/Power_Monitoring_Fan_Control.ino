@@ -1,5 +1,5 @@
 // =======================================================================================
-// ==     ESP32C3 智能风扇控制器 v3.6 (续航显示增强/七日电量统计)     ==
+// ==     ESP32C3 智能风扇控制器 v3.7 (IPv6 & 续航显示增强/七日电量统计)     ==
 // =======================================================================================
 
 #include <Arduino.h>
@@ -11,12 +11,15 @@
 #include <Adafruit_INA219.h>
 #include <NTPClient.h>
 #include <WiFiUdp.h>
-#include <Preferences.h> // 新增: 用于持久化存储
+#include <Preferences.h>
+#include <esp_netif.h> // 新增: 用于IPv6地址获取
+#include <arpa/inet.h> // 新增: 用于ntohl
 
 // ============== 用户配置 ==============
 const char* ssid       = "yang1234";
 const char* password   = "y123456789";
 const char* deviceName = "esp32-smart-fan";
+const int WEB_SERVER_PORT = 15715; // 新增: Web服务器端口
 
 // ============== 硬件引脚配置 ==============
 const int PWM_PIN    = 5;
@@ -53,9 +56,9 @@ TimerTask tasks[2] = { {0, 0, false, false}, {0, 0, false, false} };
 const int HISTORY_DAYS = 7; // 统计7天的数据
 
 // ============== 全局对象与变量 ==============
-WebServer server(80);
+WebServer server(WEB_SERVER_PORT);
 Adafruit_INA219 ina219;
-Preferences preferences; // 新增: 用于存储数据的对象
+Preferences preferences;
 volatile uint32_t pulseCount = 0;
 volatile uint32_t lastPulseMicros = 0;
 uint32_t lastRpmCalcMs = 0;
@@ -65,17 +68,17 @@ float loadVoltage = 0, current_mA = 0, power_mW = 0;
 float lockoutTriggerVoltage = 0.0;
 long lastRunDurationMinutes = 0;
 unsigned long lastRunStartTime = 0;
-char lockoutStopTime[6] = "--:--"; // 新增: 用于记录HH:MM格式的停止时间
+char lockoutStopTime[6] = "--:--";
 bool ina219_ok = false;
 bool relayState = false;
 bool isLockedOut = false;
 unsigned long lockoutStartTime = 0;
 
-// 新增: 电量统计相关变量
-float dailyEnergyWh[HISTORY_DAYS] = {0}; // 历史每日电量 (单位: Wh)
-float todayEnergyWh = 0;                 // 今天累积的电量 (单位: Wh)
+// 电量统计相关变量
+float dailyEnergyWh[HISTORY_DAYS] = {0};
+float todayEnergyWh = 0;
 unsigned long lastEnergyCalcMs = 0;
-int lastDayChecked = -1;                 // 用于跟踪日期变化
+int lastDayChecked = -1;
 
 // ============== 中断：测速脉冲计数 ==============
 void IRAM_ATTR tachISR() {
@@ -153,10 +156,72 @@ document.getElementById('saveTimerBtn').addEventListener('click',saveTimers);
 window.addEventListener('load',()=>{fetchJson('/getStatus').then(data=>{slider.value=data.speed;setLabel(data.speed);updateRelayBtn(data.relay);document.getElementById('t1_en').checked=data.tasks[0].enabled;document.getElementById('t1_time').value=String(data.tasks[0].hour).padStart(2,'0')+':'+String(data.tasks[0].minute).padStart(2,'0');document.getElementById('t1_act').value=data.tasks[0].action?'1':'0';document.getElementById('t2_en').checked=data.tasks[1].enabled;document.getElementById('t2_time').value=String(data.tasks[1].hour).padStart(2,'0')+':'+String(data.tasks[1].minute).padStart(2,'0');document.getElementById('t2_act').value=data.tasks[1].action?'1':'0';if(data.high_voltage_threshold>0){autoInfoEl.textContent=`自动模式: 低于 ${data.low_voltage_threshold.toFixed(1)}V 关闭，高于 ${data.high_voltage_threshold.toFixed(1)}V 开启 (保护后锁定1小时)。`}
 else{autoInfoEl.textContent=`自动启动已禁用。仅启用低于 ${data.low_voltage_threshold.toFixed(1)}V 的低压保护。`}}).catch(e=>console.error(e));updatePowerChart();});
 setInterval(()=>{fetchJson('/getData').then(data=>{rpm.textContent=data.rpm;v_el.textContent=data.voltage.toFixed(2);c_el.textContent=data.current.toFixed(1);p_el.textContent=data.power.toFixed(0);timeEl.textContent=data.time;if(data.lockout){lockoutEl.style.display='block';lockoutEl.textContent='低压保护 ('+data.lockout_trigger_v.toFixed(2)+'V)! 上次运行 '+data.last_run_duration+' 分钟 (停止于 '+data.lockout_stop_time+')。继电器已锁定, 剩余: '+data.lockout_rem+' 分钟';}else{lockoutEl.style.display='none';}
-updateRelayBtn(data.relay);}).catch(e=>console.error(e));fetchJson('/sysinfo').then(info=>{sys.innerHTML=`芯片: ${info.chip_model} (rev ${info.chip_rev})<br>CPU: ${info.cpu_freq_mhz} MHz<br>空闲内存: ${info.free_heap} B<br>IP: ${info.ip}`}).catch(e=>console.error(e));},1500);
+updateRelayBtn(data.relay);}).catch(e=>console.error(e));fetchJson('/sysinfo').then(info=>{sys.innerHTML=`芯片: ${info.chip_model} (rev ${info.chip_rev})<br>CPU: ${info.cpu_freq_mhz} MHz<br>空闲内存: ${info.free_heap} B<br>IPv4: ${info.ip}<br>IPv6: ${info.ipv6}`}).catch(e=>console.error(e));},1500);
 setInterval(updatePowerChart,60000);
 </script></body></html>
 )HTML";
+
+// ============== IPv6 地址获取函数 ==============
+/**
+ * @brief 手动将底层的 esp_ip6_addr_t 结构体格式化为人类可读的字符串。
+ * @param addr 指向IPv6地址结构体的指针。
+ * @return 格式化后的IPv6地址字符串。
+ */
+String formatIPv6(const esp_ip6_addr_t *addr) {
+  if (addr == nullptr) {
+    return String("::");
+  }
+  char buf[40];
+  
+  // ESP32是小端序，网络字节序是大端序，需要转换才能正确拼接。
+  uint32_t word0 = ntohl(addr->addr[0]);
+  uint32_t word1 = ntohl(addr->addr[1]);
+  uint32_t word2 = ntohl(addr->addr[2]);
+  uint32_t word3 = ntohl(addr->addr[3]);
+  
+  // 使用 snprintf 安全地将4个32位整数格式化为8个16位的十六进制数
+  snprintf(buf, sizeof(buf), "%04x:%04x:%04x:%04x:%04x:%04x:%04x:%04x",
+           (uint16_t)(word0 >> 16),
+           (uint16_t)(word0 & 0xFFFF),
+           (uint16_t)(word1 >> 16),
+           (uint16_t)(word1 & 0xFFFF),
+           (uint16_t)(word2 >> 16),
+           (uint16_t)(word2 & 0xFFFF),
+           (uint16_t)(word3 >> 16),
+           (uint16_t)(word3 & 0xFFFF)
+  );
+  
+  return String(buf);
+}
+
+/**
+ * @brief 获取设备的IPv6地址。
+ * @return 返回IPv6地址字符串。如果获取失败，则返回 "Not Available"。
+ */
+String getIPv6() {
+  // 获取WiFi STA网络接口的句柄
+  esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+  if (!netif) return String("Not Available");
+
+  esp_ip6_addr_t addr;
+  
+  // 优先尝试获取全局IPv6地址 (2000::/3)，这是公网可路由的
+  if (esp_netif_get_ip6_global(netif, &addr) == ESP_OK) {
+      // 检查地址是否不为全0
+      if (addr.addr[0] != 0 || addr.addr[1] != 0 || addr.addr[2] != 0 || addr.addr[3] != 0) {
+        return formatIPv6(&addr); // 使用我们的手动格式化函数
+      }
+  }
+  
+  // 如果没有全局地址，则获取本地链路地址 (fe80::/10)，仅在局域网内有效
+  if (esp_netif_get_ip6_linklocal(netif, &addr) == ESP_OK) {
+    if (addr.addr[0] != 0 || addr.addr[1] != 0 || addr.addr[2] != 0 || addr.addr[3] != 0) {
+        return formatIPv6(&addr); // 使用我们的手动格式化函数
+    }
+  }
+
+  return String("Not Available");
+}
 
 // ============== 路由处理函数 ==============
 void handleGetData() {
@@ -172,7 +237,7 @@ void handleGetData() {
   json += "\"lockout\":" + String(isLockedOut ? "true" : "false") + ",";
   json += "\"lockout_trigger_v\":" + String(lockoutTriggerVoltage) + ",";
   json += "\"last_run_duration\":" + String(lastRunDurationMinutes) + ",";
-  json += "\"lockout_stop_time\":\"" + String(lockoutStopTime) + "\","; // 新增
+  json += "\"lockout_stop_time\":\"" + String(lockoutStopTime) + "\",";
   if(isLockedOut) {
     long remaining_ms = LOCKOUT_DURATION_MS - (millis() - lockoutStartTime);
     json += "\"lockout_rem\":" + String(remaining_ms / 60000) + ",";
@@ -203,7 +268,6 @@ void handleGetStatus() {
   server.send(200, "application/json", json);
 }
 
-// 新增: 提供电量统计数据的API
 void handleGetPowerStats() {
   String json = "{\"today\": " + String(todayEnergyWh, 4) + ", \"history\": [";
   for(int i=0; i < HISTORY_DAYS; i++){
@@ -256,12 +320,19 @@ String getSystemInfoJSON() {
   j += "\"chip_rev\":" + String(ESP.getChipRevision()) + ",";
   j += "\"cpu_freq_mhz\":" + String(ESP.getCpuFreqMHz()) + ",";
   j += "\"free_heap\":" + String(ESP.getFreeHeap()) + ",";
-  j += "\"ip\":\"" + WiFi.localIP().toString() + "\"";
+  j += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
+  j += "\"ipv6\":\"" + getIPv6() + "\"";
   j += "}";
   return j;
 }
 
 void handleSysInfo() { server.send(200, "application/json", getSystemInfoJSON()); }
+
+// 新增: 处理IPv6地址请求的路由
+void handleGetIPv6() {
+  String json = "{\"ipv6\":\"" + getIPv6() + "\"}";
+  server.send(200, "application/json", json);
+}
 
 void handleUpdateUpload() {
   HTTPUpload& upload = server.upload();
@@ -345,7 +416,7 @@ void checkVoltageProtection() {
   }
 }
 
-// ============== 新增：电量计算与存储逻辑 ==============
+// ============== 电量计算与存储逻辑 ==============
 void accumulateEnergy() {
   if (!relayState || !ina219_ok) {
     lastEnergyCalcMs = millis();
@@ -401,7 +472,7 @@ void checkDailyRollover() {
 void setup() {
   Serial.begin(115200);
   delay(100);
-  Serial.println("\n\n===== ESP32C3 智能风扇控制器 v3.6 (续航显示增强/七日电量统计) =====");
+  Serial.println("\n\n===== ESP32C3 智能风扇控制器 v3.7 (IPv6 & 续航显示增强/七日电量统计) =====");
   
   preferences.begin("fan-stats", false);
 
@@ -431,23 +502,26 @@ void setup() {
 
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(deviceName);
+  WiFi.enableIPv6(); // 启用IPv6功能
   WiFi.begin(ssid, password);
   Serial.print("连接 Wi-Fi");
   while (WiFi.status() != WL_CONNECTED) { delay(400); Serial.print("."); }
   Serial.println("\n[OK] WiFi 已连接!");
-  Serial.print("IP 地址: "); Serial.println(WiFi.localIP());
+  Serial.print("IPv4 地址: "); Serial.println(WiFi.localIP());
+  Serial.print("IPv6 地址: "); Serial.println(getIPv6());
+
 
   timeClient.begin();
   timeClient.update();
   Serial.println("[OK] NTP 时间服务已启动。");
 
-  // 新增: 加载电量统计数据
+  // 加载电量统计数据
   lastDayChecked = preferences.getInt("lastDay", -1);
   int currentDay = timeClient.getDay();
   if (lastDayChecked == currentDay) {
     todayEnergyWh = preferences.getFloat("todayWh", 0.0);
   } else {
-    todayEnergyWh = 0.0; // 新的一天或首次启动
+    todayEnergyWh = 0.0;
   }
   char key[10];
   for (int i = 0; i < HISTORY_DAYS; i++) {
@@ -457,18 +531,19 @@ void setup() {
   Serial.println("[OK] 电量统计数据已加载。");
 
   if (MDNS.begin(deviceName)) {
-    MDNS.addService("http", "tcp", 80);
-    Serial.printf("[OK] mDNS 已启动，访问地址: http://%s.local\n", deviceName);
+    MDNS.addService("http", "tcp", WEB_SERVER_PORT);
+    Serial.printf("[OK] mDNS 已启动，访问地址: http://%s.local:%d\n", deviceName, WEB_SERVER_PORT);
   }
 
   server.on("/", HTTP_GET, handleRoot);
   server.on("/getData", HTTP_GET, handleGetData);
   server.on("/getStatus", HTTP_GET, handleGetStatus);
-  server.on("/getPowerStats", HTTP_GET, handleGetPowerStats); // 新增
+  server.on("/getPowerStats", HTTP_GET, handleGetPowerStats);
   server.on("/setSpeed", HTTP_GET, handleSetSpeed);
   server.on("/setRelay", HTTP_GET, handleSetRelay);
   server.on("/setTimers", HTTP_POST, handleSetTimers);
   server.on("/sysinfo", HTTP_GET, handleSysInfo);
+  server.on("/ipv6", HTTP_GET, handleGetIPv6); // 新增IPv6 API
   server.on("/update", HTTP_POST, []() {
       server.sendHeader("Connection", "close");
       server.send(200, "text/plain", (Update.hasError()) ? "更新失败" : "更新成功!");
@@ -477,7 +552,7 @@ void setup() {
     }, handleUpdateUpload);
   
   server.begin();
-  Serial.println("[OK] HTTP 服务器已启动。\n========================================\n");
+  Serial.printf("[OK] HTTP 服务器已在端口 %d 启动。\n========================================\n", WEB_SERVER_PORT);
   lastEnergyCalcMs = millis();
 }
 
