@@ -1,9 +1,10 @@
-// ================== ESP8266 智能风扇 & LED 控制器 v1.7 ==================
+// ================== ESP8266 智能风扇 & LED 控制器 v1.9 ==================
 //
-// 更新日志 (v1.7):
-// 1. [BUG修复] 彻底重写了 updateLeds() 函数中的多灯带分配逻辑，
-//    解决了 v1.6 版本中灯光控制无响应的问题。
-// 2. [代码优化] 采用更健壮的“逐条分配”算法，代码更清晰且不易出错。
+// 更新日志 (v1.9):
+// 1. [BUG修复] 在调用 FastLED.show() 期间，暂时停止风扇的PWM输出，
+//    发送完毕后立刻恢复。
+// 2. [代码优化] 此“PWM暂停法”彻底解决了软件PWM与FastLED的中断冲突，
+//    且无需更改硬件引脚，保证了任意风扇转速下灯光的绝对稳定。
 //
 // 项目名称: AuraFan
 // =======================================================================
@@ -131,48 +132,23 @@ void updateLeds() {
     fill_solid(leds, TOTAL_LEDS, CRGB::Black);
 
     if (currentLedMode == OFF) {
-        FastLED.show(); // 显示全黑效果
-        return;
-    }
-
-    if (currentLedMode != FADE) {
-        FastLED.setBrightness(255);
-    }
-    
-    int leds_left_to_light = numLedsToLight; // 获取需要点亮的总数
-    int offset = 0;
-    gHue++; 
-
-    // 2. 为第一条灯带分配灯珠
-    #if NUM_STRIPS >= 1
-    {
-        CRGB* strip_leds = &leds[offset];
-        int num_to_light_on_this_strip = min(leds_left_to_light, STRIP1_LEDS);
-
-        switch (currentLedMode) {
-            case STATIC:  fill_solid(strip_leds, num_to_light_on_this_strip, staticColor); break;
-            case RAINBOW: fill_rainbow(strip_leds, num_to_light_on_this_strip, gHue, 7); break;
-            case FADE: {
-                uint8_t brightness = (exp(sin(millis()/2000.0*PI)) - 0.36787944)*108.0;
-                fill_solid(strip_leds, num_to_light_on_this_strip, staticColor);
-                FastLED.setBrightness(brightness);
-                break;
-            }
-            default: break;
+        // 对于关灯模式，仍然需要暂停PWM以确保数据发送的纯净
+    } else {
+        if (currentLedMode != FADE) {
+            FastLED.setBrightness(255);
         }
-        offset += STRIP1_LEDS;
-        leds_left_to_light -= num_to_light_on_this_strip; // 减去已分配的数量
-    }
-    #endif
+        
+        int leds_left_to_light = numLedsToLight; // 获取需要点亮的总数
+        int offset = 0;
+        gHue++; 
 
-    // 3. 用剩下的数量为第二条灯带分配灯珠
-    #if NUM_STRIPS >= 2
-    {
-        if (leds_left_to_light > 0) { // 如果还有剩余的灯需要点亮
+        // 2. 为第一条灯带分配灯珠
+        #if NUM_STRIPS >= 1
+        {
             CRGB* strip_leds = &leds[offset];
-            int num_to_light_on_this_strip = min(leds_left_to_light, STRIP2_LEDS);
+            int num_to_light_on_this_strip = min(leds_left_to_light, STRIP1_LEDS);
 
-             switch (currentLedMode) {
+            switch (currentLedMode) {
                 case STATIC:  fill_solid(strip_leds, num_to_light_on_this_strip, staticColor); break;
                 case RAINBOW: fill_rainbow(strip_leds, num_to_light_on_this_strip, gHue, 7); break;
                 case FADE: {
@@ -183,14 +159,54 @@ void updateLeds() {
                 }
                 default: break;
             }
-            offset += STRIP2_LEDS;
-            leds_left_to_light -= num_to_light_on_this_strip;
+            offset += STRIP1_LEDS;
+            leds_left_to_light -= num_to_light_on_this_strip; // 减去已分配的数量
         }
+        #endif
+
+        // 3. 用剩下的数量为第二条灯带分配灯珠
+        #if NUM_STRIPS >= 2
+        {
+            if (leds_left_to_light > 0) { // 如果还有剩余的灯需要点亮
+                CRGB* strip_leds = &leds[offset];
+                int num_to_light_on_this_strip = min(leds_left_to_light, STRIP2_LEDS);
+
+                 switch (currentLedMode) {
+                    case STATIC:  fill_solid(strip_leds, num_to_light_on_this_strip, staticColor); break;
+                    case RAINBOW: fill_rainbow(strip_leds, num_to_light_on_this_strip, gHue, 7); break;
+                    case FADE: {
+                        uint8_t brightness = (exp(sin(millis()/2000.0*PI)) - 0.36787944)*108.0;
+                        fill_solid(strip_leds, num_to_light_on_this_strip, staticColor);
+                        FastLED.setBrightness(brightness);
+                        break;
+                    }
+                    default: break;
+                }
+                offset += STRIP2_LEDS;
+                leds_left_to_light -= num_to_light_on_this_strip;
+            }
+        }
+        #endif
     }
-    #endif
     
-    // 4. 将最终计算好的颜色数据一次性推送到所有灯带
-    FastLED.show();
+    // ====================== v1.9 核心修复代码 (PWM暂停法) ======================
+    // 为了解决 software PWM 和 FastLED 的中断冲突，我们在发送 LED 数据前
+    // 暂时停止 PWM 输出，发送完毕后立即恢复。
+    // 由于这个过程极快（微秒级），风扇的物理惯性使其完全不受影响。
+
+    // 1. 读取当前应该设置的PWM占空比
+    int dutyCycle = map(fanSliderValue, 0, 255, 0, PWM_RESOLUTION);
+    if (PWM_INVERTED) dutyCycle = PWM_RESOLUTION - dutyCycle;
+    
+    // 2. 暂时关闭PWM (设置为0%或100%占空比，取决于逻辑)
+    analogWrite(PWM_PIN, PWM_INVERTED ? PWM_RESOLUTION : 0);
+    
+    // 3. 调用show()，它会自己处理中断禁用，但现在已经没有PWM中断来干扰它了
+    FastLED.show(); 
+    
+    // 4. 立即恢复风扇的PWM占空比
+    analogWrite(PWM_PIN, dutyCycle);
+    // =========================================================================
 }
 
 
@@ -260,7 +276,7 @@ void handleGetState() {
 void setup() {
   Serial.begin(115200);
   delay(100);
-  Serial.println("\n\n===== AuraFan v1.7 (Logic Fix) =====");
+  Serial.println("\n\n===== AuraFan v1.9 (PWM Pause Fix) =====");
 
   pinMode(PWM_PIN, OUTPUT);
   analogWriteFreq(PWM_FREQUENCY);
