@@ -19,8 +19,8 @@ extern "C" {
 }
 
 // ===============================================================
-// ================ ESP8266 智能控制器 v4.9 ======================
-// ========= (精确分钟定时 & 界面精简 & 逻辑修复) ==========
+// ================ ESP8266 智能控制器 v5.8 ======================
+// ============= (唤醒原理统一 & 终极修复) =================
 // ===============================================================
 
 // ===============================================================
@@ -28,7 +28,7 @@ extern "C" {
 // ===============================================================
 const char* ssid = "yang1234";
 const char* password = "y123456789";
-unsigned long standbyDelay = 60000; // 60秒无操作进入待机 (仅在睡眠时段生效)
+unsigned long standbyDelay = 60000;
 const char* ha_host = "192.168.31.22";
 const int ha_port = 8123;
 const char* ha_token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiIwYjU4YTMwOWMzNmE0ZDE2ODBjOGI2MzI4YzAwMTlkZCIsImlhdCI6MTc1ODk3NDgwMCwiZXhwIjoyMDc0MzM0ODAwfQ.e1e_iE6iIpdB2EG0d0VXZcb5bjePSoI8m8qTDEFTJ-w";
@@ -53,13 +53,13 @@ bool logBufferFull = false;
 struct Settings {
   uint8_t sleepHour = 22, sleepMinute = 0;
   uint8_t wakeHour = 6, wakeMinute = 0;
-  int magic_key = 54321; // 新的key确保EEPROM更新
+  int magic_key = 54321;
 };
 Settings settings;
 const int EEPROM_ADDR = 0;
 
 // ===============================================================
-// ==================== 网页界面 (v4.9 精简版) ====================
+// ==================== 网页界面 (无改动) =========================
 // ===============================================================
 const char MAIN_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>ESP8266 高级控制器</title><style>body, html { margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; background-color: #0d1117; color: #c9d1d9; } .header { text-align: center; padding: 2rem 1rem; } .header h1 { font-size: 2rem; color: #58a6ff; display: flex; align-items: center; justify-content: center; gap: 10px; } .header .check-mark { color: #3fb950; font-size: 2rem; } .container { display: flex; flex-wrap: wrap; justify-content: center; gap: 1.5rem; padding: 0 1rem 2rem 1rem; } .card { background-color: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 1.5rem; width: 100%; max-width: 400px; box-sizing: border-box; } .card h2 { margin-top: 0; margin-bottom: 1.5rem; font-size: 1.25rem; color: #8b949e; display: flex; align-items: center; gap: 8px; } .btn-group { display: flex; gap: 10px; } .btn { text-decoration: none; display: inline-block; padding: 10px 20px; font-size: 1rem; font-weight: 500; border-radius: 6px; border: 1px solid #30363d; cursor: pointer; transition: all 0.2s ease-in-out; } .btn-primary { background-color: #238636; color: white; border-color: #3fb950; } .btn-primary:hover { background-color: #2ea043; } .btn-secondary { background-color: #21262d; color: #c9d1d9; } .btn-secondary:hover { border-color: #8b949e; } .form-group { margin-bottom: 1rem; } .form-group label { display: block; margin-bottom: 0.5rem; font-size: 0.9rem; color: #8b949e; } .input-field { width: 100%; background-color: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 10px; color: #c9d1d9; font-size: 1rem; box-sizing: border-box; } .schedule-display { font-size: 1.5rem; font-weight: bold; color: #58a6ff; text-align: center; margin: 1rem 0; } @media (min-width: 900px) { .container { max-width: 1200px; margin: 0 auto; } .card { width: calc(33.333% - 1.5rem * 2 / 3); } }</style></head><body><div class="header"><h1><span class="check-mark">✓</span> ESP8266 高级控制器</h1></div><div class="container"><div class="card"><h2>⚙️ 系统操作</h2><div class="btn-group"><a href="/update" class="btn btn-primary">固件更新 🚀</a><a href="/logs" class="btn btn-secondary">查看日志 📋</a></div></div><div class="card"><form action="/settings" method="post"><h2>🌙 夜间定时</h2><div class="form-group"><label>睡眠时间</label><input type="time" name="sleep" class="input-field" value="##SLEEP_TIME##" required></div><div class="form-group"><label>唤醒时间</label><input type="time" name="wake" class="input-field" value="##WAKE_TIME##" required></div><button type="submit" class="btn btn-primary">保存设置</button></form></div><div class="card"><h2>📝 当前计划</h2><div class="schedule-display">##CURRENT_SCHEDULE##</div></div></div></body></html>
@@ -76,13 +76,18 @@ WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP, "ntp.aliyun.com", 8 * 3600);
 
 bool haDeviceState = false, httpDeviceState = false, isInStandby = false;
-unsigned long lastActivityTime = 0, lastStatusUpdate = 0;
+unsigned long lastActivityTime = 0, lastStatusUpdate = 0, lastWakeupCheck = 0;
 
 void loadSettings();
 void saveSettings();
 void handleRoot();
 void handleSettings();
 void updateStatusLine();
+void enterStandby();
+void exitStandby();
+void setupWifiAndServices();
+void handleTouch();
+void drawButtons();
 
 // ===============================================================
 // ==================== 主程序逻辑 (Setup & Loop) =================
@@ -95,48 +100,83 @@ void setup() {
   tft.begin();
   ts.begin();
   tft.setRotation(0);
-  exitStandby();
-  addLog("✅ 系统启动 (v4.9 - 精简优化版)。");
+  // 开机即调用统一的唤醒函数
+  exitStandby(); 
+  addLog("✅ 系统启动 (v5.8 - 统一唤醒修复)。");
 }
 
 void loop() {
   handleTouch();
+
   if (!isInStandby) {
     server.handleClient();
     ArduinoOTA.handle();
 
     if (millis() - lastStatusUpdate > 1000) {
+      if(WiFi.status() == WL_CONNECTED) timeClient.update();
       updateStatusLine();
       lastStatusUpdate = millis();
     }
 
-    // ⭐【核心睡眠逻辑重构】
     bool inSleepWindow = false;
     if (WiFi.status() == WL_CONNECTED) {
-      timeClient.update();
       int sleepTimeInMinutes = settings.sleepHour * 60 + settings.sleepMinute;
       int wakeTimeInMinutes = settings.wakeHour * 60 + settings.wakeMinute;
       int currentTimeInMinutes = timeClient.getHours() * 60 + timeClient.getMinutes();
 
-      if (wakeTimeInMinutes > sleepTimeInMinutes) { // 当天睡眠 (e.g., 01:00-05:00)
-        if (currentTimeInMinutes >= sleepTimeInMinutes && currentTimeInMinutes < wakeTimeInMinutes) {
-          inSleepWindow = true;
-        }
-      } else { // 跨天睡眠 (e.g., 22:30-06:45)
-        if (currentTimeInMinutes >= sleepTimeInMinutes || currentTimeInMinutes < wakeTimeInMinutes) {
-          inSleepWindow = true;
-        }
+      if (wakeTimeInMinutes > sleepTimeInMinutes) {
+        if (currentTimeInMinutes >= sleepTimeInMinutes && currentTimeInMinutes < wakeTimeInMinutes) inSleepWindow = true;
+      } else {
+        if (currentTimeInMinutes >= sleepTimeInMinutes || currentTimeInMinutes < wakeTimeInMinutes) inSleepWindow = true;
       }
     }
     
-    // 只有在睡眠时间段内，无操作超时才会触发待机
     if (inSleepWindow && (millis() - lastActivityTime > standbyDelay)) {
         addLog("🌙 在预设睡眠时段内无操作，进入待机。");
         enterStandby();
     }
 
   } else {
-    delay(20);
+    // ⭐【核心逻辑重构】待机检查现在只判断，不执行唤醒
+    if (millis() - lastWakeupCheck > 30000) {
+      bool shouldWakeUp = false;
+      WiFi.mode(WIFI_STA);
+      WiFi.begin(ssid, password);
+      int retries = 0;
+      while (WiFi.status() != WL_CONNECTED && retries < 10) {
+        delay(500); retries++;
+      }
+      
+      if (WiFi.status() == WL_CONNECTED) {
+        timeClient.forceUpdate();
+        int sleepTimeInMinutes = settings.sleepHour * 60 + settings.sleepMinute;
+        int wakeTimeInMinutes = settings.wakeHour * 60 + settings.wakeMinute;
+        int currentTimeInMinutes = timeClient.getHours() * 60 + timeClient.getMinutes();
+        bool shouldBeAsleep = false;
+        
+        if (wakeTimeInMinutes > sleepTimeInMinutes) {
+          if(currentTimeInMinutes >= sleepTimeInMinutes && currentTimeInMinutes < wakeTimeInMinutes) shouldBeAsleep = true;
+        } else {
+          if(currentTimeInMinutes >= sleepTimeInMinutes || currentTimeInMinutes < wakeTimeInMinutes) shouldBeAsleep = true;
+        }
+        if (!shouldBeAsleep) {
+          shouldWakeUp = true;
+        }
+      }
+      
+      // 关键：检查完毕后，立即无条件关闭WiFi，确保硬件状态干净
+      WiFi.disconnect(true);
+      WiFi.mode(WIFI_OFF);
+      
+      // 在WiFi完全关闭后，再根据刚才的判断结果决定是否唤醒
+      if(shouldWakeUp){
+        addLog("⏰ 到达唤醒时间，执行唤醒流程...");
+        exitStandby();
+      }
+      
+      lastWakeupCheck = millis();
+    }
+    delay(200);
   }
 }
 
@@ -146,28 +186,34 @@ void loop() {
 void enterStandby() {
   if (isInStandby) return;
   isInStandby = true;
+  
+  tft.fillScreen(ILI9341_BLACK);
+  delay(50);
+  analogWrite(TFT_LED, 0);
+  tft.writeCommand(ILI9341_SLPIN);
+
+  server.stop();
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
-  tft.writeCommand(ILI9341_SLPIN);
-  analogWrite(TFT_LED, 0);
   system_update_cpu_freq(80);
-  addLog("  - WiFi, Backlight & Display OFF, CPU @ 80MHz.");
+  addLog("  - 进入低功耗待机模式。");
 }
 
 void exitStandby() {
-  addLog("☀️ 触摸唤醒，退出待机模式。");
   system_update_cpu_freq(160);
   tft.writeCommand(ILI9341_SLPOUT);
   delay(120);
   analogWrite(TFT_LED, 1023);
+  
   isInStandby = false;
   lastActivityTime = millis();
+  
+  // 任何形式的唤醒，都调用这唯一的、统一的初始化函数
   setupWifiAndServices();
-  drawButtons();
 }
 
 // ===============================================================
-// ==================== 网络 & 网页服务 ==========================
+// ==================== 网络 & 网页服务 (核心修复区) ==============
 // ===============================================================
 void setupWifiAndServices() {
   tft.fillScreen(ILI9341_BLACK);
@@ -175,25 +221,48 @@ void setupWifiAndServices() {
   tft.setTextColor(ILI9341_WHITE);
   tft.setTextSize(2);
   tft.print(F("Connecting WiFi..."));
+  
+  // ⭐【核心修复1】无论何种情况，都先执行硬复位，确保WiFi模块处于干净状态
+  WiFi.disconnect(true);
+  delay(100);
+
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
+  
   int retries = 0;
   while (WiFi.status() != WL_CONNECTED && retries < 20) {
     delay(500); Serial.print(F(".")); retries++;
   }
+  
   if (WiFi.status() == WL_CONNECTED) {
     addLog("📡 WiFi 已连接, IP: " + WiFi.localIP().toString());
+    
+    // ⭐【核心修复2】连接成功后，立刻进行阻塞式时间同步，杜绝“8点”问题
+    tft.fillScreen(ILI9341_BLACK);
+    tft.setCursor(20, 150);
+    tft.print(F("Syncing Time..."));
     timeClient.begin();
-    // ⭐【路由简化和修复】
+    if (timeClient.forceUpdate()) {
+       addLog("🕒 时间同步完成: " + timeClient.getFormattedTime());
+    } else {
+       addLog("⚠️ 时间同步失败!");
+    }
+
+    // 时间同步后，再设置Web服务
     server.on("/", HTTP_GET, handleRoot);
-    server.on("/logs", HTTP_GET, handleLogs); // 确保日志路由被正确注册
+    server.on("/logs", HTTP_GET, handleLogs);
     server.on("/settings", HTTP_POST, handleSettings);
     httpUpdater.setup(&server);
     server.begin();
     ArduinoOTA.begin();
+
   } else {
     addLog("❌ WiFi 连接失败。");
   }
+  
+  // 最终，无论连接成功与否，都绘制UI界面
+  drawButtons();
+  updateStatusLine();
 }
 
 void handleRoot() {
@@ -229,13 +298,9 @@ void handleSettings() {
   server.send(302, "text/plain", "");
 }
 
-// ===============================================================
-// ==================== 屏幕绘制 & UI ============================
-// ===============================================================
 void drawButtons() {
   if (isInStandby) return;
   tft.fillScreen(ILI9341_BLACK);
-  // (此函数内容无改动)
   tft.setTextColor(ILI9341_CYAN);
   tft.setTextSize(2);
   tft.setCursor(40, 30); tft.print(F("Home Assistant"));
@@ -261,7 +326,6 @@ void drawButtons() {
 }
 
 void updateStatusLine() {
-  if (isInStandby) return;
   tft.fillRect(0, 305, 240, 15, ILI9341_BLACK);
   tft.setTextSize(1);
   tft.setTextColor(ILI9341_YELLOW);
@@ -279,18 +343,19 @@ void updateStatusLine() {
   }
 }
 
-// ===============================================================
-// ==================== 触摸 & 设备控制 ==========================
-// ===============================================================
 void handleTouch() {
   if (ts.touched()) {
     static unsigned long lastTouchDebounce = 0;
     if (millis() - lastTouchDebounce < 500) return;
     lastTouchDebounce = millis();
-    lastActivityTime = millis();
     
-    if (isInStandby) { exitStandby(); return; }
+    if (isInStandby) { 
+      addLog("☀️ 触摸唤醒，退出待机模式。");
+      exitStandby(); 
+      return; 
+    }
 
+    lastActivityTime = millis();
     TS_Point p = ts.getPoint();
     int screen_x = map(p.y, 295, 3750, 0, 240); 
     int screen_y = map(p.x, 358, 3810, 0, 320); 
@@ -335,23 +400,18 @@ void controlHA(bool state) {
   }
 }
 
-// ===============================================================
-// ==================== 日志 & EEPROM 管理 =======================
-// ===============================================================
 void addLog(String message) {
-  // (此函数无改动)
+  // 在记录日志时，如果WiFi未连接，则不尝试获取网络时间
   if (WiFi.status() != WL_CONNECTED) {
     logBuffer[currentLogIndex].timestamp = "N/A";
     logBuffer[currentLogIndex].epochTime = 0;
   } else {
-    timeClient.update();
-    unsigned long epochTime = timeClient.getEpochTime();
-    logBuffer[currentLogIndex].epochTime = epochTime;
-    time_t rawTime = epochTime;
+    time_t rawTime = timeClient.getEpochTime();
     struct tm * timeinfo = localtime(&rawTime);
     char buffer[30];
     strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", timeinfo);
     logBuffer[currentLogIndex].timestamp = String(buffer);
+    logBuffer[currentLogIndex].epochTime = rawTime;
   }
   logBuffer[currentLogIndex].message = message;
   Serial.println("[LOG] " + logBuffer[currentLogIndex].timestamp + " - " + message);
@@ -360,7 +420,6 @@ void addLog(String message) {
 }
 
 void handleLogs() {
-  // (此函数无改动)
   String html = "<!DOCTYPE html><html lang='zh-CN'><head><title>事件日志</title><meta http-equiv='refresh' content='10'><style>body{font-family: monospace; background-color: #0d1117; color: #c9d1d9; padding: 1rem;} h1{color:#58a6ff;} table{width: 100%; border-collapse: collapse; margin-top: 1rem;} th, td{border: 1px solid #30363d; padding: 10px; text-align: left;} th{background-color: #161b22;} a{color: #58a6ff; text-decoration:none;}</style></head><body><h1>📋 设备事件日志 (仅显示最近24小时)</h1><p><a href='/'>&larr; 返回主页</a></p><table><tr><th>时间戳</th><th>事件</th></tr>";
   int count = logBufferFull ? MAX_LOG_ENTRIES : currentLogIndex;
   unsigned long currentTime = timeClient.getEpochTime();
