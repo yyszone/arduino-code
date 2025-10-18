@@ -418,7 +418,7 @@ void checkVoltageProtection() {
 
 // ============== 电量计算与存储逻辑 ==============
 void accumulateEnergy() {
-  if (!relayState || !ina219_ok) {
+  if ( !ina219_ok) {
     lastEnergyCalcMs = millis();
     return;
   }
