@@ -40,7 +40,7 @@ const uint32_t MIN_PULSE_INTERVAL_US = 800;
 const int MAX_REASONABLE_RPM = 15000;
 
 // ============== 继电器与智能电源管理配置 ==============
-const float VOLTAGE_THRESHOLD = 2.9;
+const float VOLTAGE_THRESHOLD = 3.0;
 const float VOLTAGE_HIGH_THRESHOLD = 4.2;
 const long LOCKOUT_DURATION_MS = 3600000;
 
