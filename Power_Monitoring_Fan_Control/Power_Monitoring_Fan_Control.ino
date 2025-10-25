@@ -1,10 +1,11 @@
 // =================================================================================================
-// ==     ESP32C3 智能风扇 & 双路定时插座控制器 v4.5 (含用法说明)     ==
+// ==     ESP32C3 智能风扇 & 双路定时插座控制器 v4.7 (通电即开版)     ==
 // =================================================================================================
-// 描述: 此版本在 v4.4 的基础上，在 /socket 页面底部增加了详细的 API 用法说明。
-// 新增功能:
-// 1. 在插座控制页面新增一个 "API & 用法说明" 卡片。
-// 2. 详细文档化了通过 URL 添加任务、删除所有任务和手动控制插座的 API 接口。
+// 描述: 此版本在 v4.6 的基础上，根据用户反馈重构了启动逻辑。
+// 新功能:
+// 1. 移除了 "首次启动" 逻辑。
+// 2. 现在，设备每次断电后重新通电，两个插座继电器都会默认开启。
+// 3. 在每次启动时，会自动创建一个30分钟后关闭两个插座的临时定时任务（此任务不保存到闪存）。
 // =================================================================================================
 
 #include <Arduino.h>
@@ -19,6 +20,7 @@
 #include <Preferences.h>
 #include <esp_netif.h> 
 #include <arpa/inet.h> 
+#include <time.h>
 
 // ============== 用户配置 ==============
 const char* ssid       = "yang1234";
@@ -100,6 +102,7 @@ int lastDayChecked = -1;
 // --- 插座相关变量 ---
 bool relay2State = false; // 插座1继电器状态
 bool relay3State = false; // 插座2继电器状态
+
 
 // ===============================================
 // ============== 网页 (HTML+CSS+JS) ==============
@@ -893,19 +896,17 @@ void saveSocketSchedules() {
 void setup() {
   Serial.begin(115200);
   delay(100);
-  Serial.println("\n\n===== ESP32C3 智能风扇 & 双路定时插座控制器 v4.5 =====");
+  Serial.println("\n\n===== ESP32C3 智能风扇 & 双路定时插座控制器 v4.7 =====");
   
   Serial.println("--- 硬件初始化开始 ---");
   pinMode(RELAY_PIN, OUTPUT);
-  setRelay(false);
-  Serial.printf("[OK] 风扇继电器引脚 %d 初始化完成。\n", RELAY_PIN);
+  digitalWrite(RELAY_PIN, LOW); // 默认关闭
   pinMode(RELAY2_PIN, OUTPUT);
   pinMode(RELAY3_PIN, OUTPUT);
-  setSocketRelay(2, false);
-  setSocketRelay(3, false);
-  Serial.printf("[OK] 插座继电器引脚 %d, %d 初始化完成。\n", RELAY2_PIN, RELAY3_PIN);
-
-
+  digitalWrite(RELAY2_PIN, LOW); // 默认先关闭
+  digitalWrite(RELAY3_PIN, LOW); // 默认先关闭
+  Serial.printf("[OK] 所有继电器引脚初始化完成。\n");
+  
   ledcAttach(PWM_PIN, LEDC_FREQUENCY, LEDC_RES_BITS);
   ledcWrite(PWM_PIN, PWM_INVERTED ? PWM_MAX : 0);
   Serial.printf("[OK] PWM 引脚 %d 初始化完成。\n", PWM_PIN);
@@ -935,11 +936,47 @@ void setup() {
   Serial.print("IPv4 地址: "); Serial.println(WiFi.localIP());
   Serial.print("IPv6 地址: "); Serial.println(getIPv6());
 
-
   timeClient.begin();
-  timeClient.update();
-  Serial.println("[OK] NTP 时间服务已启动。");
+  Serial.print("正在同步NTP时间...");
+  while (!timeClient.update()) {
+    timeClient.forceUpdate();
+    Serial.print(".");
+    delay(500);
+  }
+  Serial.println("\n[OK] NTP 时间服务已同步。");
 
+  // 加载永久保存的定时任务
+  loadSocketSchedules();
+
+  // --- 新增: 通电默认开启半小时逻辑 ---
+  Serial.println("[OK] 执行通电启动逻辑: 默认开启插座并创建30分钟后关闭的临时任务。");
+  time_t offTimeEpoch = timeClient.getEpochTime() + (30 * 60);
+  struct tm *offTimeInfo;
+  offTimeInfo = localtime(&offTimeEpoch);
+
+  // 创建临时关闭任务
+  SocketSchedule tempOffTask;
+  tempOffTask.hour = offTimeInfo->tm_hour;
+  tempOffTask.minute = offTimeInfo->tm_min;
+  tempOffTask.second = offTimeInfo->tm_sec;
+  tempOffTask.action = false; // 关闭动作
+  tempOffTask.enabled = true;
+
+  // 为插座1添加临时任务 (如果列表未满)
+  if (relay2_schedule_count < MAX_SOCKET_SCHEDULES) {
+    relay2_schedules[relay2_schedule_count++] = tempOffTask;
+    Serial.printf("  -> 已为插座1创建临时关闭任务于 %02d:%02d:%02d\n", tempOffTask.hour, tempOffTask.minute, tempOffTask.second);
+  }
+  // 为插座2添加临时任务 (如果列表未满)
+  if (relay3_schedule_count < MAX_SOCKET_SCHEDULES) {
+    relay3_schedules[relay3_schedule_count++] = tempOffTask;
+     Serial.printf("  -> 已为插座2创建临时关闭任务于 %02d:%02d:%02d\n", tempOffTask.hour, tempOffTask.minute, tempOffTask.second);
+  }
+  
+  // 立即开启两个插座
+  setSocketRelay(2, true);
+  setSocketRelay(3, true);
+  
   preferences.begin("fan-stats", true);
   lastDayChecked = preferences.getInt("lastDay", -1);
   int currentDay = timeClient.getDay();
@@ -955,9 +992,6 @@ void setup() {
   }
   preferences.end();
   Serial.println("[OK] 风扇电量统计数据已加载。");
-
-  loadSocketSchedules();
-
 
   if (MDNS.begin(deviceName)) {
     MDNS.addService("http", "tcp", WEB_SERVER_PORT);
