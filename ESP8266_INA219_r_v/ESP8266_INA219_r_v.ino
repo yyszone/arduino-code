@@ -1,8 +1,11 @@
 // =================================================================================================
-// ==   ESP8266 智能继电器 & INA219 v6.15 (Chart UI Hotfix)                       ==
+// ==   ESP8266 智能继电器 & INA219 v6.16 (Inverted Relay Logic)                  ==
 // =================================================================================================
-// 描述: 此版本为最终UI修正版。修正了图表Y轴标签因添加单位'V'而可能导致显示不全的问题。
-//       通过移除刻度标签的formatter，并依赖Y轴名称来表示单位，确保了数值的完整显示。
+// 描述: 此版本为最终功能版。根据用户要求，将继电器的控制逻辑进行了反转，
+//       以适配低电平触发的继电器模块。
+//       - `setRelay(true)` (开启) -> `digitalWrite(LOW)`
+//       - `setRelay(false)` (关闭) -> `digitalWrite(HIGH)`
+//       所有其他功能保持不变。
 // =================================================================================================
 
 #include <ESP8266WiFi.h>
@@ -335,7 +338,7 @@ void recordVoltageHistory() {
   float voltage = 0.0;
   if (ina219_ok) {
     voltage = ina219.getBusVoltage_V();
-    if (voltage < 0.1) voltage = 0.0; // 过滤掉无效的小读数
+    if (voltage < 0.1) voltage = 0.0;
   }
   
   File vlogFile = LittleFS.open(VLOG_FILE_PATH, "r+");
@@ -355,10 +358,12 @@ void recordVoltageHistory() {
   vlogFile.close();
 }
 
+// v6.16 修正: 反转继电器逻辑
 void setRelay(bool state) {
   relayState = state;
-  digitalWrite(RELAY_PIN, relayState ? HIGH : LOW);
-  Serial.printf("继电器 (Pin %d) 已设置为: %s\n", RELAY_PIN, relayState ? "ON" : "OFF");
+  // 低电平触发: true (ON) -> LOW, false (OFF) -> HIGH
+  digitalWrite(RELAY_PIN, relayState ? LOW : HIGH);
+  Serial.printf("继电器 (Pin %d) 已设置为: %s (输出电平: %s)\n", RELAY_PIN, relayState ? "ON" : "OFF", relayState ? "LOW" : "HIGH");
 }
 
 void checkVoltageProtection() {
@@ -410,7 +415,7 @@ void checkVoltageProtection() {
     Serial.printf("!!! 触发低压保护 (%.2fV < %.2fV)，自动关闭继电器并锁定1小时。\n", busVoltage, lowVoltageThreshold);
     if (millis() - lastLockoutNoticeTime > NOTIFICATION_COOLDOWN_MS || lastLockoutNoticeTime == 0) {
       #if defined(ENABLE_EMAIL_NOTIFICATION)
-          String subject = "[严重] 低压保护已触发! " + String(deviceName);a
+          String subject = "[严重] 低压保护已触发! " + String(deviceName);
           String message = "设备当前电压为 " + String(busVoltage, 2) + "V，已触发低压保护 (" + String(lowVoltageThreshold, 2) + "V)。继电器已关闭并锁定1小时。";
           sendEmailNotification(subject, message);
       #elif defined(ENABLE_IFTTT_NOTIFICATION)
@@ -558,7 +563,7 @@ void handleGetChartData() {
     vlogFile.seek(sizeof(int) + (currentIndex * sizeof(float)), SeekSet);
     vlogFile.read((byte*)&voltage, sizeof(float));
 
-    if (isnan(voltage) || voltage < 0.1) { // 优化：小于0.1V也视为空
+    if (isnan(voltage) || voltage < 0.1) {
       server.sendContent("null");
     } else {
       server.sendContent(String(voltage, 2));
@@ -579,7 +584,7 @@ void handleGetChartData() {
 void setup() {
   Serial.begin(115200);
   delay(100);
-  Serial.println("\n\n===== ESP8266 智能继电器 & INA219 v6.15 (Chart UI Hotfix) =====");
+  Serial.println("\n\n===== ESP8266 智能继电器 & INA219 v6.16 (Inverted Relay Logic) =====");
 
   // 初始化文件系统
   if (!LittleFS.begin()) {
@@ -610,9 +615,10 @@ void setup() {
   }
 
   pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, LOW);
+  // v6.16 修正: 默认关闭状态，对于低电平触发模块，是输出HIGH
+  digitalWrite(RELAY_PIN, HIGH);
   relayState = false;
-  Serial.println("[OK] 继电器已设置为默认关闭状态。");
+  Serial.println("[OK] 继电器已设置为默认关闭状态 (输出电平: HIGH)。");
 
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
   if (!ina219.begin()) {
@@ -706,7 +712,7 @@ void loop() {
      }
      if (millis() > 3000 && maxIdleCountsPerSecond == 0) {
         maxIdleCountsPerSecond = cpuIdleCounter;
-        if (maxIdleCountsPerSecond < 1000) maxIdleCountsPerSecond = 2000000; // 安全值
+        if (maxIdleCountsPerSecond < 1000) maxIdleCountsPerSecond = 2000000;
         Serial.printf("[校准] CPU最大空闲计数值: %lu\n", maxIdleCountsPerSecond);
         cpuIdleCounter = 0;
         lastCpuMeasureTime = millis();
