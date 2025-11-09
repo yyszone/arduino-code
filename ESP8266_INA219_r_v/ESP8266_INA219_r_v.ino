@@ -410,7 +410,7 @@ void checkVoltageProtection() {
     Serial.printf("!!! 触发低压保护 (%.2fV < %.2fV)，自动关闭继电器并锁定1小时。\n", busVoltage, lowVoltageThreshold);
     if (millis() - lastLockoutNoticeTime > NOTIFICATION_COOLDOWN_MS || lastLockoutNoticeTime == 0) {
       #if defined(ENABLE_EMAIL_NOTIFICATION)
-          String subject = "[严重] 低压保护已触发! " + String(deviceName);
+          String subject = "[严重] 低压保护已触发! " + String(deviceName);a
           String message = "设备当前电压为 " + String(busVoltage, 2) + "V，已触发低压保护 (" + String(lowVoltageThreshold, 2) + "V)。继电器已关闭并锁定1小时。";
           sendEmailNotification(subject, message);
       #elif defined(ENABLE_IFTTT_NOTIFICATION)
