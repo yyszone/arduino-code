@@ -1,11 +1,12 @@
 // =================================================================================================
-// ==     ESP32C3 智能风扇 & 双路定时插座控制器 v4.7 (通电即开版)     ==
+// ==     ESP32C3 智能风扇 & 双路定时插座控制器 v4.7.1 (电压阈值可配置版)     ==
 // =================================================================================================
-// 描述: 此版本在 v4.6 的基础上，根据用户反馈重构了启动逻辑。
+// 描述: 此版本在 v4.7 的基础上，将风扇智能电源管理的电压阈值改为可由用户通过网页配置。
 // 新功能:
 // 1. 移除了 "首次启动" 逻辑。
 // 2. 现在，设备每次断电后重新通电，两个插座继电器都会默认开启。
 // 3. 在每次启动时，会自动创建一个30分钟后关闭两个插座的临时定时任务（此任务不保存到闪存）。
+// 4. (v4.7.1) 用户现在可以通过网页界面设置并永久保存“低压保护阈值”和“高压恢复阈值”。
 // =================================================================================================
 
 #include <Arduino.h>
@@ -51,8 +52,10 @@ const uint32_t MIN_PULSE_INTERVAL_US = 800;
 const int MAX_REASONABLE_RPM = 15000;
 
 // ============== 继电器与智能电源管理配置 (风扇) ==============
-const float VOLTAGE_THRESHOLD = 3.5;
-const float VOLTAGE_HIGH_THRESHOLD = 4.2;
+// ===== 修改部分开始: 将 const 改为变量, 允许动态修改 =====
+float VOLTAGE_THRESHOLD = 3.5;
+float VOLTAGE_HIGH_THRESHOLD = 4.2;
+// ===== 修改部分结束 =====
 const long LOCKOUT_DURATION_MS = 3600000;
 
 // ============== 时间与定时任务配置 ==============
@@ -110,9 +113,13 @@ bool relay3State = false; // 插座2继电器状态
 
 // ---------- 主页面：风扇控制器 ----------
 const char MAIN_HTML[] PROGMEM = R"HTML(
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ESP32 智能风扇控制</title><style>:root{--bg:#0f172a;--card:#111827;--text:#e5e7eb;--accent:#22c55e;--muted:#94a3b8;--red:#ef4444;--blue:#3b82f6;}*{box-sizing:border-box}body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,'Helvetica Neue',Arial}.wrapper{min-height:100vh;background:linear-gradient(135deg,#0f172a,#1f2937);color:var(--text);display:flex;align-items:center;justify-content:center;padding:18px}.container{width:100%;max-width:600px}.card{background:linear-gradient(180deg,#0b1220,#0b1220) padding-box,linear-gradient(135deg,#22c55e33,#06b6d433) border-box;border:1px solid transparent;border-radius:16px;padding:20px;margin:14px 0;box-shadow:0 10px 30px rgba(0,0,0,.35)}h1,h2{margin:0 0 12px}h1{text-align:center;font-weight:700;font-size:22px}h2{font-size:18px;color:#d1d5db}.label{margin:8px 0 6px;font-weight:600}.value{font-feature-settings:'tnum' 1;letter-spacing:.3px}.slider{width:100%}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:12px;text-align:center}.data-box{padding:10px;border-radius:8px;background-color:rgba(0,0,0,.2)}.data-box .val{font-size:1.8em;color:var(--accent)}.data-box .unit{color:var(--muted);font-size:0.9em}small{color:var(--muted)}.btn{background:var(--accent);border:none;color:#052e13;padding:12px 18px;border-radius:10px;font-weight:700;cursor:pointer;box-shadow:0 6px 16px rgba(34,197,94,.35)}.btn.off{background:var(--red);color:#fff}.btn:hover{filter:brightness(1.05)}input[type=file]{color:var(--text)}pre{white-space:pre-wrap;word-break:break-word}.timer-row{display:flex;align-items:center;gap:10px;margin:10px 0}input[type=time],input[type=checkbox]{margin-right:5px}.chart-container{padding-top:10px}.chart{display:flex;justify-content:space-around;align-items:flex-end;height:120px;border-bottom:1px solid var(--muted)}.chart-bar{width:11%;background:linear-gradient(to top,var(--accent),#6ee7b7);border-radius:4px 4px 0 0;position:relative;transition:height .3s ease-in-out}.chart-bar .value{position:absolute;top:-20px;left:50%;transform:translateX(-50%);font-size:.8em;color:var(--text)}.chart-labels{display:flex;justify-content:space-around;font-size:.8em;color:var(--muted);margin-top:5px}.chart-labels div{width:11%;text-align:center}a.nav-link{display:inline-block;margin-top:15px;color:var(--accent);text-decoration:none;font-weight:bold;}</style></head><body><div class="wrapper"><div class="container"><div class="card"><h1>ESP32 智能风扇控制面板</h1><div class="label">当前时间: <span id="currentTime">--:--:--</span></div><div id="lockoutStatus" style="color:var(--red);margin-bottom:10px;display:none"></div><div class="grid"><div class="data-box"><div>转速 (RPM)</div><div class="val" id="rpm">--</div><div class="unit">&nbsp;</div></div><div class="data-box"><div>电压 (V)</div><div class="val" id="v">--</div><div class="unit">&nbsp;</div></div><div class="data-box"><div>电流 (mA)</div><div class="val" id="c">--</div><div class="unit">&nbsp;</div></div><div class="data-box"><div>功率 (mW)</div><div class="val" id="p">--</div><div class="unit">&nbsp;</div></div></div></div><div class="card"><h2>手动控制</h2><div class="label">风扇调速: <span id="spd" class="value">--</span></div><input id="speed" class="slider" type="range" min="0" max="255" value="0"/>
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ESP32 智能风扇控制</title><style>:root{--bg:#0f172a;--card:#111827;--text:#e5e7eb;--accent:#22c55e;--muted:#94a3b8;--red:#ef4444;--blue:#3b82f6;}*{box-sizing:border-box}body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,'Helvetica Neue',Arial}.wrapper{min-height:100vh;background:linear-gradient(135deg,#0f172a,#1f2937);color:var(--text);display:flex;align-items:center;justify-content:center;padding:18px}.container{width:100%;max-width:600px}.card{background:linear-gradient(180deg,#0b1220,#0b1220) padding-box,linear-gradient(135deg,#22c55e33,#06b6d433) border-box;border:1px solid transparent;border-radius:16px;padding:20px;margin:14px 0;box-shadow:0 10px 30px rgba(0,0,0,.35)}h1,h2{margin:0 0 12px}h1{text-align:center;font-weight:700;font-size:22px}h2{font-size:18px;color:#d1d5db}.label{margin:8px 0 6px;font-weight:600}.value{font-feature-settings:'tnum' 1;letter-spacing:.3px}.slider{width:100%}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:12px;text-align:center}.data-box{padding:10px;border-radius:8px;background-color:rgba(0,0,0,.2)}.data-box .val{font-size:1.8em;color:var(--accent)}.data-box .unit{color:var(--muted);font-size:0.9em}small{color:var(--muted)}.btn{background:var(--accent);border:none;color:#052e13;padding:12px 18px;border-radius:10px;font-weight:700;cursor:pointer;box-shadow:0 6px 16px rgba(34,197,94,.35)}.btn.off{background:var(--red);color:#fff}.btn:hover{filter:brightness(1.05)}input[type=file]{color:var(--text)}pre{white-space:pre-wrap;word-break:break-word}.timer-row{display:flex;align-items:center;gap:10px;margin:10px 0}input[type=time],input[type=checkbox]{margin-right:5px}.chart-container{padding-top:10px}.chart{display:flex;justify-content:space-around;align-items:flex-end;height:120px;border-bottom:1px solid var(--muted)}.chart-bar{width:11%;background:linear-gradient(to top,var(--accent),#6ee7b7);border-radius:4px 4px 0 0;position:relative;transition:height .3s ease-in-out}.chart-bar .value{position:absolute;top:-20px;left:50%;transform:translateX(-50%);font-size:.8em;color:var(--text)}.chart-labels{display:flex;justify-content:space-around;font-size:.8em;color:var(--muted);margin-top:5px}.chart-labels div{width:11%;text-align:center}a.nav-link{display:inline-block;margin-top:15px;color:var(--accent);text-decoration:none;font-weight:bold;}input[type=number]{background-color:rgba(0,0,0,.2);color:var(--text);border:1px solid var(--muted);border-radius:8px;padding:8px;font-size:1em;}</style></head><body><div class="wrapper"><div class="container"><div class="card"><h1>ESP32 智能风扇控制面板</h1><div class="label">当前时间: <span id="currentTime">--:--:--</span></div><div id="lockoutStatus" style="color:var(--red);margin-bottom:10px;display:none"></div><div class="grid"><div class="data-box"><div>转速 (RPM)</div><div class="val" id="rpm">--</div><div class="unit">&nbsp;</div></div><div class="data-box"><div>电压 (V)</div><div class="val" id="v">--</div><div class="unit">&nbsp;</div></div><div class="data-box"><div>电流 (mA)</div><div class="val" id="c">--</div><div class="unit">&nbsp;</div></div><div class="data-box"><div>功率 (mW)</div><div class="val" id="p">--</div><div class="unit">&nbsp;</div></div></div></div><div class="card"><h2>手动控制</h2><div class="label">风扇调速: <span id="spd" class="value">--</span></div><input id="speed" class="slider" type="range" min="0" max="255" value="0"/>
 <small id="auto_relay_info" style="display:block; text-align:center; margin-top:10px;">读取设定值...</small>
-<div style="margin-top:20px;display:flex;justify-content:center;gap:15px"><button id="relayBtn" class="btn">读取状态...</button></div></div><div class="card"><h2>定时任务 (风扇)</h2><div class="timer-row"><input type="checkbox" id="t1_en"><input type="time" id="t1_time"><select id="t1_act"><option value="1">开启</option><option value="0">关闭</option></select></div><div class="timer-row"><input type="checkbox" id="t2_en"><input type="time" id="t2_time"><select id="t2_act"><option value="1">开启</option><option value="0">关闭</option></select></div><button id="saveTimerBtn" class="btn" style="background:var(--blue);margin-top:10px">保存定时设置</button></div><div class="card"><h2>系统信息与导航</h2><div id="sys">加载中...</div><a href="/socket" class="nav-link">>> 前往双路插座控制页面</a></div><div class="card"><h2>固件在线更新 OTA</h2><form method="POST" action="/update" enctype="multipart/form-data"><input type="file" name="update" accept=".bin,.bin.gz"/><br/><br/><button class="btn" type="submit">上传并更新</button></form></div>
+<div style="margin-top:20px;display:flex;justify-content:center;gap:15px"><button id="relayBtn" class="btn">读取状态...</button></div></div><div class="card"><h2>定时任务 (风扇)</h2><div class="timer-row"><input type="checkbox" id="t1_en"><input type="time" id="t1_time"><select id="t1_act"><option value="1">开启</option><option value="0">关闭</option></select></div><div class="timer-row"><input type="checkbox" id="t2_en"><input type="time" id="t2_time"><select id="t2_act"><option value="1">开启</option><option value="0">关闭</option></select></div><button id="saveTimerBtn" class="btn" style="background:var(--blue);margin-top:10px">保存定时设置</button></div>
+<!-- ===== 新增部分开始 ===== -->
+<div class="card"><h2>智能电源管理</h2><div class="label">低压保护阈值 (V):</div><input type="number" id="lowV" step="0.1" style="width:100%"><div class="label" style="margin-top:10px">高压恢复阈值 (V):</div><input type="number" id="highV" step="0.1" style="width:100%"><button id="saveVoltageBtn" class="btn" style="background:var(--blue);margin-top:15px">保存电压设置</button></div>
+<!-- ===== 新增部分结束 ===== -->
+<div class="card"><h2>系统信息与导航</h2><div id="sys">加载中...</div><a href="/socket" class="nav-link">>> 前往双路插座控制页面</a></div><div class="card"><h2>固件在线更新 OTA</h2><form method="POST" action="/update" enctype="multipart/form-data"><input type="file" name="update" accept=".bin,.bin.gz"/><br/><br/><button class="btn" type="submit">上传并更新</button></form></div>
 <div class="card"><h2>七天电量统计 (Wh)</h2><div class="chart-container"><div class="chart" id="powerChart"></div><div class="chart-labels" id="powerChartLabels"></div></div></div></div></div>
 <script>
 const spd=document.getElementById('spd'),rpm=document.getElementById('rpm'),slider=document.getElementById('speed'),sys=document.getElementById('sys'),v_el=document.getElementById('v'),c_el=document.getElementById('c'),p_el=document.getElementById('p'),relayBtn=document.getElementById('relayBtn'),lockoutEl=document.getElementById('lockoutStatus'),timeEl=document.getElementById('currentTime'),autoInfoEl=document.getElementById('auto_relay_info'),powerChartEl=document.getElementById('powerChart'),powerChartLabelsEl=document.getElementById('powerChartLabels');
@@ -126,8 +133,16 @@ relayBtn.addEventListener('click',()=>{const newState=!relayBtn.classList.contai
 function updateRelayBtn(state){if(state){relayBtn.textContent='关闭继电器';relayBtn.classList.add('off')}else{relayBtn.textContent='开启继电器';relayBtn.classList.remove('off')}}
 function saveTimers(){const data=new FormData();data.append('t1_en',document.getElementById('t1_en').checked?'1':'0');data.append('t1_time',document.getElementById('t1_time').value);data.append('t1_act',document.getElementById('t1_act').value);data.append('t2_en',document.getElementById('t2_en').checked?'1':'0');data.append('t2_time',document.getElementById('t2_time').value);data.append('t2_act',document.getElementById('t2_act').value);fetch('/setTimers',{method:'POST',body:data}).then(r=>alert(r.ok?'定时任务已保存':'保存失败')).catch(e=>alert('保存出错'));}
 document.getElementById('saveTimerBtn').addEventListener('click',saveTimers);
-window.addEventListener('load',()=>{fetchJson('/getStatus').then(data=>{slider.value=data.speed;setLabel(data.speed);updateRelayBtn(data.relay);document.getElementById('t1_en').checked=data.tasks[0].enabled;document.getElementById('t1_time').value=String(data.tasks[0].hour).padStart(2,'0')+':'+String(data.tasks[0].minute).padStart(2,'0');document.getElementById('t1_act').value=data.tasks[0].action?'1':'0';document.getElementById('t2_en').checked=data.tasks[1].enabled;document.getElementById('t2_time').value=String(data.tasks[1].hour).padStart(2,'0')+':'+String(data.tasks[1].minute).padStart(2,'0');document.getElementById('t2_act').value=data.tasks[1].action?'1':'0';if(data.high_voltage_threshold>0){autoInfoEl.textContent=`自动模式: 低于 ${data.low_voltage_threshold.toFixed(1)}V 关闭，高于 ${data.high_voltage_threshold.toFixed(1)}V 开启 (保护后锁定1小时)。`}
-else{autoInfoEl.textContent=`自动启动已禁用。仅启用低于 ${data.low_voltage_threshold.toFixed(1)}V 的低压保护。`}}).catch(e=>console.error(e));updatePowerChart();});
+// ===== 新增部分开始 =====
+document.getElementById('saveVoltageBtn').addEventListener('click',()=>{const lowV=document.getElementById('lowV').value;const highV=document.getElementById('highV').value;fetch(`/setVoltageThresholds?low=${lowV}&high=${highV}`).then(r=>{if(r.ok)alert('电压阈值已保存！');else alert('保存失败！');}).catch(e=>alert('保存出错: '+e));});
+// ===== 新增部分结束 =====
+window.addEventListener('load',()=>{fetchJson('/getStatus').then(data=>{slider.value=data.speed;setLabel(data.speed);updateRelayBtn(data.relay);document.getElementById('t1_en').checked=data.tasks[0].enabled;document.getElementById('t1_time').value=String(data.tasks[0].hour).padStart(2,'0')+':'+String(data.tasks[0].minute).padStart(2,'0');document.getElementById('t1_act').value=data.tasks[0].action?'1':'0';document.getElementById('t2_en').checked=data.tasks[1].enabled;document.getElementById('t2_time').value=String(data.tasks[1].hour).padStart(2,'0')+':'+String(data.tasks[1].minute).padStart(2,'0');document.getElementById('t2_act').value=data.tasks[1].action?'1':'0';
+// ===== 修改部分开始 =====
+document.getElementById('lowV').value=data.low_voltage_threshold.toFixed(2);document.getElementById('highV').value=data.high_voltage_threshold.toFixed(2);
+if(data.high_voltage_threshold>0){autoInfoEl.textContent=`自动模式: 低于 ${data.low_voltage_threshold.toFixed(2)}V 关闭，高于 ${data.high_voltage_threshold.toFixed(2)}V 开启 (保护后锁定1小时)。`}
+else{autoInfoEl.textContent=`自动启动已禁用。仅启用低于 ${data.low_voltage_threshold.toFixed(2)}V 的低压保护。`}
+// ===== 修改部分结束 =====
+}).catch(e=>console.error(e));updatePowerChart();});
 setInterval(()=>{fetchJson('/getData').then(data=>{rpm.textContent=data.rpm;v_el.textContent=data.voltage.toFixed(2);c_el.textContent=data.current.toFixed(1);p_el.textContent=data.power.toFixed(0);timeEl.textContent=data.time;if(data.lockout){lockoutEl.style.display='block';lockoutEl.textContent='低压保护 ('+data.lockout_trigger_v.toFixed(2)+'V)! 上次运行 '+data.last_run_duration+' 分钟 (停止于 '+data.lockout_stop_time+')。继电器已锁定, 剩余: '+data.lockout_rem+' 分钟';}else{lockoutEl.style.display='none';}
 updateRelayBtn(data.relay);}).catch(e=>console.error(e));fetchJson('/sysinfo').then(info=>{sys.innerHTML=`芯片: ${info.chip_model} (rev ${info.chip_rev})<br>CPU: ${info.cpu_freq_mhz} MHz<br>空闲内存: ${info.free_heap} B<br>IPv4: ${info.ip}<br>IPv6: ${info.ipv6}`}).catch(e=>console.error(e));},1500);
 setInterval(updatePowerChart,60000);
@@ -507,6 +522,29 @@ void handleSetTimers() {
   }
   server.send(200, "text/plain", "Timers Saved");
 }
+
+// ===== 新增部分开始 =====
+void saveVoltageConfig() {
+    preferences.begin("fan-config", false);
+    preferences.putFloat("lowV_thresh", VOLTAGE_THRESHOLD);
+    preferences.putFloat("highV_thresh", VOLTAGE_HIGH_THRESHOLD);
+    preferences.end();
+    Serial.println("[OK] 电压阈值已保存到闪存。");
+}
+void handleSetVoltageThresholds() {
+  if (server.hasArg("low") && server.hasArg("high")) {
+    VOLTAGE_THRESHOLD = server.arg("low").toFloat();
+    VOLTAGE_HIGH_THRESHOLD = server.arg("high").toFloat();
+    saveVoltageConfig();
+    server.send(200, "text/plain", "OK");
+    // 更新一下网页上的提示信息
+    // 实际上这个信息是定时刷新的，这里可以不做，但为了立即响应，可以触发一次更新
+  } else {
+    server.send(400, "text/plain", "Bad Request");
+  }
+}
+// ===== 新增部分结束 =====
+
 
 // ---------- 插座页面 Handlers ----------
 void saveSocketSchedules(); // 前向声明
@@ -896,7 +934,7 @@ void saveSocketSchedules() {
 void setup() {
   Serial.begin(115200);
   delay(100);
-  Serial.println("\n\n===== ESP32C3 智能风扇 & 双路定时插座控制器 v4.7 =====");
+  Serial.println("\n\n===== ESP32C3 智能风扇 & 双路定时插座控制器 v4.7.1 =====");
   
   Serial.println("--- 硬件初始化开始 ---");
   pinMode(RELAY_PIN, OUTPUT);
@@ -925,6 +963,15 @@ void setup() {
     ina219_ok = true;
   }
   Serial.println("--- 硬件初始化结束 ---\n");
+  
+  // ===== 新增部分开始 =====
+  // 从闪存加载电压阈值配置
+  preferences.begin("fan-config", true); // 以只读模式打开
+  VOLTAGE_THRESHOLD = preferences.getFloat("lowV_thresh", 3.5); // 如果找不到key，则使用默认值3.5
+  VOLTAGE_HIGH_THRESHOLD = preferences.getFloat("highV_thresh", 4.2); // 如果找不到key，则使用默认值4.2
+  preferences.end();
+  Serial.printf("[OK] 已加载电压阈值: 低压 %.2fV, 高压 %.2fV\n", VOLTAGE_THRESHOLD, VOLTAGE_HIGH_THRESHOLD);
+  // ===== 新增部分结束 =====
 
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(deviceName);
@@ -1006,6 +1053,10 @@ void setup() {
   server.on("/setSpeed", HTTP_GET, handleSetSpeed);
   server.on("/setRelay", HTTP_GET, handleSetRelay);
   server.on("/setTimers", HTTP_POST, handleSetTimers);
+  // ===== 新增部分开始 =====
+  server.on("/setVoltageThresholds", HTTP_GET, handleSetVoltageThresholds);
+  // ===== 新增部分结束 =====
+  
   // 插座页面路由
   server.on("/socket", HTTP_GET, handleSocketPage);
   server.on("/getSocketData", HTTP_GET, handleGetSocketData);
