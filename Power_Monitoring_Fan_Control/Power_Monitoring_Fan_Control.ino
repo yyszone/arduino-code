@@ -118,6 +118,11 @@ const char MAIN_HTML[] PROGMEM = R"HTML(
 <div style="margin-top:20px;display:flex;justify-content:center;gap:15px">
     <button id="relayBtn" class="btn">读取状态...</button>
 </div>
+<!-- ===== 新增部分开始 ===== -->
+<hr>
+<h2>智能电源管理</h2><div class="label">低压保护阈值 (V):</div><input type="number" id="lowV" step="0.1" style="width:100%"><div class="label" style="margin-top:10px">高压恢复阈值 (V):</div><input type="number" id="highV" step="0.1" style="width:100%"><button id="saveVoltageBtn" class="btn" style="background:var(--blue);margin-top:15px">保存电压设置</button>
+
+<!-- ===== 新增部分结束 ===== -->
 
 </div>
 <div class="card"><h2>手动控制</h2><div class="label">风扇调速: <span id="spd" class="value">--</span></div><input id="speed" class="slider" type="range" min="0" max="255" value="0"/>
@@ -130,9 +135,7 @@ const char MAIN_HTML[] PROGMEM = R"HTML(
 </div>
 
 <div class="card"><h2>定时任务 (风扇)</h2><div class="timer-row"><input type="checkbox" id="t1_en"><input type="time" id="t1_time"><select id="t1_act"><option value="1">开启</option><option value="0">关闭</option></select></div><div class="timer-row"><input type="checkbox" id="t2_en"><input type="time" id="t2_time"><select id="t2_act"><option value="1">开启</option><option value="0">关闭</option></select></div><button id="saveTimerBtn" class="btn" style="background:var(--blue);margin-top:10px">保存定时设置</button></div>
-<!-- ===== 新增部分开始 ===== -->
-<div class="card"><h2>智能电源管理</h2><div class="label">低压保护阈值 (V):</div><input type="number" id="lowV" step="0.1" style="width:100%"><div class="label" style="margin-top:10px">高压恢复阈值 (V):</div><input type="number" id="highV" step="0.1" style="width:100%"><button id="saveVoltageBtn" class="btn" style="background:var(--blue);margin-top:15px">保存电压设置</button></div>
-<!-- ===== 新增部分结束 ===== -->
+
 <div class="card"><h2>系统信息与导航</h2><div id="sys">加载中...</div><a href="/socket" class="nav-link">>> 前往双路插座控制页面</a></div><div class="card"><h2>固件在线更新 OTA</h2><form method="POST" action="/update" enctype="multipart/form-data"><input type="file" name="update" accept=".bin,.bin.gz"/><br/><br/><button class="btn" type="submit">上传并更新</button></form></div>
 <div class="card"><h2>七天电量统计 (Wh)</h2><div class="chart-container"><div class="chart" id="powerChart"></div><div class="chart-labels" id="powerChartLabels"></div></div></div></div></div>
 <script>
