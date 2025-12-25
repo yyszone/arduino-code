@@ -1,12 +1,16 @@
 // =================================================================================================
-// ==   ESP8266 智能继电器 & INA219 v6.19 (Memory Display Fixed)                  ==
+// ==   ESP8266 智能继电器 & INA219 v6.20 (Tooltip Time Restored)                 ==
 // =================================================================================================
 // 描述: 
 // 1. 继电器逻辑 (反转): 
 //    - setRelay(true)  -> digitalWrite(LOW)  -> 开启
 //    - setRelay(false) -> digitalWrite(HIGH) -> 关闭
-// 2. 邮件配置安全化: 代码中默认留空，需在网页端配置并保存到 LittleFS。
-// 3. 系统信息显示修正: 恢复显示 "剩余 / 总共" 的格式 (RAM & Flash)。
+// 2. 图表功能增强: 
+//    - 恢复了 ECharts 悬停提示框的时间计算功能，现在可以显示具体的“日期 时间”和“电压”。
+// 3. 内存显示: 
+//    - 格式为 "剩余 / 总共 KB"。
+// 4. 邮件配置: 
+//    - 安全存储在 LittleFS，代码中无明文密码。
 // =================================================================================================
 
 #include <ESP8266WiFi.h>
@@ -22,14 +26,13 @@
 #include <WiFiClientSecure.h>
 #include <LittleFS.h>
 
-// ============== 用户 WiFi 配置 (根据需要修改) ==============
+// ============== 用户 WiFi 配置 (请修改此处) ==============
 const char* ssid       = "yang1234";
 const char* password   = "y123456789";
 const char* deviceName = "esp8266-smart-relay";
 const int WEB_SERVER_PORT = 80;
 
-// ============== 邮件配置 (默认留空，去网页设置) ==============
-// 这些变量在启动时会尝试从文件系统加载
+// ============== 邮件配置 (默认留空，请去网页设置) ==============
 String smtp_host     = "smtp.qq.com";
 int    smtp_port     = 465;
 String author_email  = "";
@@ -51,7 +54,7 @@ const long  WEB_UI_GMT_OFFSET_SEC = 8 * 3600;
 WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP, WEB_UI_NTP_SERVER, WEB_UI_GMT_OFFSET_SEC);
 
-// ============== EEPROM 存储地址定义 (仅存电压阈值) ==============
+// ============== EEPROM 存储地址定义 ==============
 const int EEPROM_SIZE = 64; 
 const int ADDR_MAGIC_NUM   = 0;
 const int ADDR_LOW_V       = 2;
@@ -105,7 +108,7 @@ void ICACHE_RAM_ATTR countCpuIdle() {
 }
 
 // =====================================================
-// ============== 网页 (HTML+CSS+JS) v6.19 ==============
+// ============== 网页 (HTML+CSS+JS) v6.20 ==============
 // =====================================================
 const char MAIN_HTML_PART1[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ESP8266 智能继电器</title><script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script><style>:root{--bg-color:#111827;--card-color:#1f2937;--text-color:#d1d5db;--accent-color:#38bdf8;--green-color:#22c55e;--red-color:#ef4444;--warning-color:#f59e0b;--muted-text:#9ca3af}body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif,"Apple Color Emoji","Segoe UI Emoji";background-color:var(--bg-color);color:var(--text-color);margin:0;padding:15px;display:flex;justify-content:center}h1,h2,h4{margin-top:0;color:#fff;text-align:center}h2{border-top:1px solid #374151;padding-top:15px;margin-top:20px}.container{width:100%;max-width:500px}.card{background-color:var(--card-color);border-radius:12px;padding:20px;margin-bottom:15px;box-shadow:0 4px 6px -1px rgba(0,0,0,.1),0 2px 4px -1px rgba(0,0,0,.06)}.chart-card{padding:20px 0 10px 0;}.chart-card h2{padding:0 20px 15px;margin:0;border:none;}.data-box{text-align:center;padding:10px}.data-box .val{font-size:2.5em;font-weight:700;color:var(--accent-color);line-height:1.2;transition:color .3s ease}.data-box .unit{color:var(--muted-text)}.btn{width:100%;padding:15px;font-size:1.2em;font-weight:bold;border:none;border-radius:8px;cursor:pointer;transition:background-color .2s ease}.btn.on{background-color:var(--green-color);color:#fff}.btn.off{background-color:var(--red-color);color:#fff}.status-light{width:12px;height:12px;border-radius:50%;display:inline-block;margin-right:8px;background-color:#6b7280}.status-light.on{background-color:var(--green-color)}.input-group{display:flex;align-items:center;gap:10px;margin-bottom:10px}.input-group label{flex-basis:120px;flex-shrink:0;font-size:0.9em}input[type=number],input[type=text],input[type=password]{width:100%;padding:8px;background-color:#374151;border:1px solid #4b5563;border-radius:6px;color:var(--text-color);font-size:1em}.btn-save{padding:10px 15px;background-color:var(--accent-color);color:#fff;border:none;border-radius:6px;cursor:pointer}#sysinfo{font-size:.8em;color:var(--muted-text);word-break:break-all}#lockoutStatus{color:var(--red-color);text-align:center;margin-bottom:10px;font-weight:bold;}.toggle-section{cursor:pointer;color:var(--accent-color);text-align:center;font-size:0.9em;margin-top:10px;}</style></head><body><div class="container"><h1>ESP8266 智能继电器</h1><p style="text-align:center;color:var(--muted-text);">当前时间: <span id="currentTime">--:--:--</span></p><div class="card"><div class="data-box"><div>电池电压</div><div class="val" id="v">--</div><div class="unit">V</div></div></div><div class="card"><h2>手动控制</h2><div id="lockoutStatus" style="display:none;"></div><p><span id="relayStatusLight" class="status-light"></span>继电器状态: <strong id="relayStatusText">读取中...</strong></p><button id="relayBtn" class="btn">读取中...</button></div><div class="card"><h2>参数设置</h2><div class="input-group"><label for="highV">高压开启 (V)</label><input type="number" id="highV" step="0.1"></div><div class="input-group"><label for="warnV">电压警告 (V)</label><input type="number" id="warnV" step="0.1"></div><div class="input-group"><label for="lowV">低压关闭 (V)</label><input type="number" id="lowV" step="0.1"></div><p style="font-size:0.85em;color:var(--muted-text);text-align:right;">邮件通知将发送至: <span id="dispRecvEmail" style="color:var(--accent-color)">未设置</span></p><div style="text-align:right;margin-top:10px;"><button class="btn-save" onclick="saveSettings()">保存电压设置</button></div></div>
@@ -141,7 +144,6 @@ function fetchInitialState(){fetchJson('/getStatus').then(data=>{
   $('warnV').value=data.warn_v;
   $('highV').value=data.high_v;
   $('sysinfo').innerHTML=`IPv4: ${data.ip}<br>芯片ID: ${data.chip_id}<br>CPU繁忙度: ${data.cpu_usage}%<br>内存(RAM): ${data.free_heap} / ${data.total_heap} KB<br>存储(Flash): ${data.fs_free} / ${data.fs_total} KB`;
-  // 填充邮件配置
   $('smtpHost').value = data.mail_host;
   $('smtpPort').value = data.mail_port;
   $('authEmail').value = data.mail_user;
@@ -160,15 +162,12 @@ function saveEmailConfig(){
   const pass=$('authPass').value;
   const to=$('recvEmail').value;
   const url = `/setEmail?host=${encodeURIComponent(host)}&port=${port}&user=${encodeURIComponent(user)}&pass=${encodeURIComponent(pass)}&to=${encodeURIComponent(to)}`;
-  fetch(url).then(r=>{
-    if(r.ok){
-      alert('邮件配置已保存! 以后将发送通知至: '+to);
-      $('dispRecvEmail').textContent = to;
-    } else { alert('保存失败!'); }
-  }).catch(e=>alert('请求出错: '+e));
+  fetch(url).then(r=>{if(r.ok){alert('邮件配置已保存! 以后将发送通知至: '+to);$('dispRecvEmail').textContent = to;} else { alert('保存失败!'); }}).catch(e=>alert('请求出错: '+e));
 }
 $('relayBtn').addEventListener('click',()=>{const newState=$('relayBtn').classList.contains('on');fetch('/setRelay?state='+(newState?'1':'0')).then(()=>setTimeout(fetchData,200))});
 $('otaForm').addEventListener('submit', function(e){$('otaUi').style.display='none';$('otaStatus').innerHTML='<h4>正在上传并更新...</h4><p>请勿关闭此页面或断开设备电源。设备将在大约一分钟后自动重启。</p>';});
+
+// --- 重点: 恢复图表详细提示框功能 ---
 async function initChart(){
   const chartDom = $('voltageChart');
   echartInstance = echarts.init(chartDom);
@@ -176,11 +175,31 @@ async function initChart(){
   try {
     const chartData = await fetchJson('/getChartData');
     const option={
-      tooltip:{trigger:'axis'},
+      tooltip:{
+        trigger:'axis',
+        formatter: function(params){
+          const point = params[0];
+          if (point.value === null || point.value === '-') return null;
+          const dataIndex = point.dataIndex;
+          const voltage = parseFloat(point.value).toFixed(2);
+          const minutesAgo = (chartData.data.length - 1 - dataIndex) * DATA_INTERVAL_MIN;
+          
+          let now = new Date();
+          if (latestDeviceTimeStr !== "--:--:--") {
+            const timeParts = latestDeviceTimeStr.split(':');
+            now.setHours(timeParts[0], timeParts[1], timeParts[2]);
+          }
+          now.setMinutes(now.getMinutes() - minutesAgo);
+          const historicalDate = `${now.getFullYear()}-${(now.getMonth()+1).toString().padStart(2,'0')}-${now.getDate().toString().padStart(2,'0')}`;
+          const historicalTime = `${now.getHours().toString().padStart(2,'0')}:${now.getMinutes().toString().padStart(2,'0')}`;
+          
+          return `${historicalDate} ${historicalTime}<br/>电压: <strong>${voltage} V</strong>`;
+        }
+      },
       grid:{left:'8%',right:'4%',bottom:'10%',containLabel:false},
       xAxis:{type:'category',boundaryGap:false,data:chartData.labels,axisLine:{lineStyle:{color:'var(--muted-text)'}},axisTick:{show:false}},
       yAxis:{type:'value',name:'电压 (V)',nameTextStyle:{color:'var(--muted-text)',padding:[0,0,0,35]},min:'dataMin',max:'dataMax',axisLine:{show:true,lineStyle:{color:'var(--muted-text)'}},splitLine:{lineStyle:{color:'rgba(255,255,255,0.1)'}}},
-      series:[{name:'电压',type:'line',smooth:true,data:chartData.data,symbol:'none',areaStyle:{color:new echarts.graphic.LinearGradient(0,0,0,1,[{offset:0,color:'rgba(56,189,248,0.5)'},{offset:1,color:'rgba(56,189,248,0.1)'}])},lineStyle:{color:'var(--accent-color)'}}]
+      series:[{name:'电压',type:'line',smooth:true,connectNulls:false,data:chartData.data,symbol:'none',areaStyle:{color:new echarts.graphic.LinearGradient(0,0,0,1,[{offset:0,color:'rgba(56,189,248,0.5)'},{offset:1,color:'rgba(56,189,248,0.1)'}])},lineStyle:{color:'var(--accent-color)'}}]
     };
     echartInstance.hideLoading();
     echartInstance.setOption(option);
@@ -214,8 +233,6 @@ void sendEmailNotification(String subject, String message) {
     Serial.println("[!!] 无法发送邮件，WiFi未连接。");
     return;
   }
-
-  // 关键检查：如果未配置邮箱，直接返回
   if (author_email.length() < 5 || recipient_email.length() < 5) {
      Serial.println("[!!] 邮件功能未配置 (请在网页端设置)，跳过发送。");
      return;
@@ -227,7 +244,6 @@ void sendEmailNotification(String subject, String message) {
   config.login.email = author_email.c_str();
   config.login.password = author_pass.c_str();
   config.login.user_domain = F("127.0.0.1");
-
   config.time.ntp_server = NTP_SERVERS;
   config.time.gmt_offset = GMT_OFFSET;
   config.time.day_light_offset = DAYLIGHT_OFFSET;
@@ -244,18 +260,16 @@ void sendEmailNotification(String subject, String message) {
 
   Serial.printf("准备发送邮件至 %s ...\n", recipient_email.c_str());
   if (!smtp.connect(&config)) {
-    MailClient.printf("Connection error, Status Code: %d, Error Code: %d, Reason: %s\n", smtp.statusCode(), smtp.errorCode(), smtp.errorReason().c_str());
+    MailClient.printf("SMTP Error: %d, %s\n", smtp.statusCode(), smtp.errorReason().c_str());
     return;
   }
-
   if (!MailClient.sendMail(&smtp, &email)) {
-    MailClient.printf("Error, Status Code: %d, Error Code: %d, Reason: %s\n", smtp.statusCode(), smtp.errorCode(), smtp.errorReason().c_str());
+    MailClient.printf("Send Error: %d, %s\n", smtp.statusCode(), smtp.errorReason().c_str());
   }
 }
 
 // ============== 数据存储函数 ==============
 void loadSettings() {
-  // 1. 加载电压阈值 (EEPROM)
   EEPROM.begin(EEPROM_SIZE);
   uint16_t magic; EEPROM.get(ADDR_MAGIC_NUM, magic);
   if (magic == EEPROM_MAGIC_NUMBER) {
@@ -271,7 +285,6 @@ void loadSettings() {
   }
   EEPROM.end();
 
-  // 2. 加载邮件配置 (LittleFS)
   if (LittleFS.exists(EMAIL_CFG_PATH)) {
     File cfgFile = LittleFS.open(EMAIL_CFG_PATH, "r");
     if (cfgFile) {
@@ -282,11 +295,10 @@ void loadSettings() {
       if(cfgFile.available()) { line = cfgFile.readStringUntil('\n'); line.trim(); if(line.length()>0) author_pass = line; }
       if(cfgFile.available()) { line = cfgFile.readStringUntil('\n'); line.trim(); if(line.length()>0) recipient_email = line; }
       cfgFile.close();
-      Serial.println("[OK] 邮件配置已从文件系统加载。");
-      Serial.printf("  - SMTP: %s\n  - User: %s\n", smtp_host.c_str(), author_email.c_str());
+      Serial.println("[OK] 邮件配置已加载。");
     }
   } else {
-    Serial.println("[INFO] 未找到邮件配置文件，请在网页端进行设置。");
+    Serial.println("[INFO] 未找到邮件配置。");
   }
 }
 
@@ -308,9 +320,7 @@ void saveEmailConfigToFile() {
     cfgFile.println(author_pass);
     cfgFile.println(recipient_email);
     cfgFile.close();
-    Serial.println("[OK] 邮件配置已保存到 LittleFS。");
-  } else {
-    Serial.println("[Error] 无法写入邮件配置文件。");
+    Serial.println("[OK] 邮件配置已保存。");
   }
 }
 
@@ -333,9 +343,8 @@ void recordVoltageHistory() {
 
 void setRelay(bool state) {
   relayState = state;
-  // 反转逻辑: true=开启=LOW, false=关闭=HIGH
   digitalWrite(RELAY_PIN, relayState ? LOW : HIGH);
-  Serial.printf("继电器 (Pin %d) -> %s (LOW trigger)\n", RELAY_PIN, relayState ? "ON" : "OFF");
+  Serial.printf("继电器 -> %s\n", relayState ? "ON" : "OFF");
 }
 
 void checkVoltageProtection() {
@@ -343,7 +352,6 @@ void checkVoltageProtection() {
   busVoltage = ina219.getBusVoltage_V();
   bool voltageIsDecreasing = (busVoltage < (lastBusVoltage - 0.02));
 
-  // 警告逻辑
   if (relayState && busVoltage <= warningVoltageThreshold && voltageIsDecreasing) {
       isVoltageWarning = true;
       if (millis() - lastWarningNoticeTime > NOTIFICATION_COOLDOWN_MS || lastWarningNoticeTime == 0) {
@@ -356,7 +364,6 @@ void checkVoltageProtection() {
       isVoltageWarning = false;
   }
 
-  // 恢复逻辑
   if (isLockedOut) {
     if (millis() - lockoutStartTime >= LOCKOUT_DURATION_MS) {
       isLockedOut = false;
@@ -366,17 +373,15 @@ void checkVoltageProtection() {
     }
   }
 
-  // 高压自动恢复
   if (!relayState && !isLockedOut && busVoltage >= highVoltageThreshold) {
     setRelay(true);
   }
   
-  // 低压切断
   if (relayState && busVoltage > 0.1 && busVoltage < lowVoltageThreshold) {
     Serial.printf("!!! 低压切断 (%.2fV)\n", busVoltage);
     if (millis() - lastLockoutNoticeTime > NOTIFICATION_COOLDOWN_MS || lastLockoutNoticeTime == 0) {
       sendEmailNotification("[低压切断] " + String(deviceName), 
-        "电压 " + String(busVoltage, 2) + "V 低于阈值 " + String(lowVoltageThreshold, 2) + "V，已切断输出并锁定1小时。");
+        "电压 " + String(busVoltage, 2) + "V 低于阈值 " + String(lowVoltageThreshold, 2) + "V，已切断。");
       lastLockoutNoticeTime = millis();
     }
     isLockedOut = true; 
@@ -384,7 +389,6 @@ void checkVoltageProtection() {
     setRelay(false);
   }
 
-  // 持续极低电压重启
   if (busVoltage > 0.1 && busVoltage < REBOOT_VOLTAGE_THRESHOLD) {
     if (lowVoltageRebootTimer == 0) lowVoltageRebootTimer = millis();
     else if (millis() - lowVoltageRebootTimer > REBOOT_TIMER_DURATION_MS) {
@@ -423,7 +427,6 @@ void handleGetData() {
 }
 
 void handleGetStatus() {
-  // 增加邮件配置信息回传给前端显示
   String json = "{";
   json += "\"relay\":" + String(relayState ? "true" : "false") + ",";
   json += "\"low_v\":" + String(lowVoltageThreshold, 2) + ",";
@@ -434,18 +437,15 @@ void handleGetStatus() {
   
   FSInfo fs_info; LittleFS.info(fs_info);
   json += "\"free_heap\":" + String(ESP.getFreeHeap() / 1024) + ",";
-  json += "\"total_heap\":" + String(81920 / 1024) + ","; // 恢复 Total Heap
+  json += "\"total_heap\":" + String(81920 / 1024) + ",";
   json += "\"fs_free\":" + String((fs_info.totalBytes - fs_info.usedBytes) / 1024) + ",";
-  json += "\"fs_total\":" + String(fs_info.totalBytes / 1024) + ","; // 恢复 Total FS
+  json += "\"fs_total\":" + String(fs_info.totalBytes / 1024) + ",";
   json += "\"cpu_usage\":" + String(cpuUsage, 1) + ",";
-  
-  // 邮件配置字段
   json += "\"mail_host\":\"" + smtp_host + "\",";
   json += "\"mail_port\":" + String(smtp_port) + ",";
   json += "\"mail_user\":\"" + author_email + "\",";
   json += "\"mail_pass\":\"" + author_pass + "\",";
   json += "\"mail_to\":\"" + recipient_email + "\"";
-  
   json += "}";
   server.send(200, "application/json", json);
 }
@@ -453,7 +453,7 @@ void handleGetStatus() {
 void handleSetRelay() {
   if (server.hasArg("state")) {
     bool newState = server.arg("state").toInt() == 1;
-    if (newState && isLockedOut) isLockedOut = false; // 手动强制开启解锁
+    if (newState && isLockedOut) isLockedOut = false;
     setRelay(newState);
     server.send(200, "text/plain", "OK");
   } else { server.send(400, "text/plain", "Bad Request"); }
@@ -513,9 +513,8 @@ void handleGetChartData() {
 void setup() {
   Serial.begin(115200);
   delay(100);
-  Serial.println("\n\n===== ESP8266 Relay v6.19 (Memory Display Fixed) =====");
+  Serial.println("\n\n===== ESP8266 Relay v6.20 (Tooltip Restored) =====");
 
-  // 初始化FS
   if (LittleFS.begin()) {
     File vlogFile = LittleFS.open(VLOG_FILE_PATH, "r+");
     if (!vlogFile) {
@@ -528,11 +527,9 @@ void setup() {
       vlogFile.read((byte*)&historyIndex, sizeof(int));
       vlogFile.close();
     }
-    // 加载配置
     loadSettings(); 
   }
 
-  // 默认关闭 (LOW Trigger -> HIGH is OFF)
   pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, HIGH);
   relayState = false;
@@ -592,7 +589,6 @@ void loop() {
     recordVoltageHistory();
   }
 
-  // CPU 统计
   if (millis() < 5000) {
      if (millis() > 3000 && maxIdleCountsPerSecond == 0) {
         maxIdleCountsPerSecond = cpuIdleCounter;
