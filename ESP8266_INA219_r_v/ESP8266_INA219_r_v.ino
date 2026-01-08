@@ -531,7 +531,7 @@ void setup() {
   }
 
   pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, HIGH);
+  digitalWrite(RELAY_PIN, LOW);   // 默认low开启
   relayState = false;
 
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
