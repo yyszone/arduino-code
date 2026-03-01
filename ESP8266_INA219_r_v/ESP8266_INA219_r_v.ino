@@ -1,5 +1,5 @@
 // =================================================================================================
-// ==   ESP8266 智能继电器 & INA219 v6.20 (Tooltip Time Restored)                 ==
+// ==   ESP8266 智能继电器 & INA219 v6.30 (Tooltip Time Restored， 87a换87，承受更大电流)                 ==
 // =================================================================================================
 // 描述: 
 // 1. 继电器逻辑 (反转): 
@@ -343,7 +343,7 @@ void recordVoltageHistory() {
 
 void setRelay(bool state) {
   relayState = state;
-  digitalWrite(RELAY_PIN, relayState ? LOW : HIGH);
+  digitalWrite(RELAY_PIN, relayState ?  HIGH: LOW);
   Serial.printf("继电器 -> %s\n", relayState ? "ON" : "OFF");
 }
 
@@ -531,7 +531,7 @@ void setup() {
   }
 
   pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, LOW);   // 默认low开启
+  digitalWrite(RELAY_PIN, LOW);   // 默认low关闭
   relayState = false;
 
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
