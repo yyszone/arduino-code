@@ -25,6 +25,7 @@
 #include <ESP_Mail_Client.h>
 #include <WiFiClientSecure.h>
 #include <LittleFS.h>
+#include "MatrixClock.h" // 【新增：引入时钟库】
 
 // ============== 用户 WiFi 配置 (请修改此处) ==============
 const char* ssid       = "yang1234";
@@ -68,6 +69,8 @@ const char* EMAIL_CFG_PATH = "/email_cfg.txt";
 
 // ============== 全局对象与变量 ==============
 ESP8266WebServer server(WEB_SERVER_PORT);
+SmartMatrixClock myClock(12, server); // 【新增：初始化时钟，接线为 D6引脚】
+
 Adafruit_INA219 ina219;
 SMTPSession smtp;
 
@@ -115,7 +118,8 @@ const char MAIN_HTML_PART1[] PROGMEM = R"HTML(
 )HTML";
 
 const char MAIN_HTML_PART2[] PROGMEM = R"HTML(
-<div class="card"><h2>邮件通知设置</h2><div class="input-group"><label>SMTP服务器</label><input type="text" id="smtpHost" placeholder="如: smtp.qq.com"></div><div class="input-group"><label>SMTP端口</label><input type="number" id="smtpPort" placeholder="465"></div><div class="input-group"><label>发件邮箱</label><input type="text" id="authEmail" placeholder="xxxx@qq.com"></div><div class="input-group"><label>授权码/密码</label><input type="password" id="authPass"></div><div class="input-group"><label>收件邮箱</label><input type="text" id="recvEmail" placeholder="接收通知的邮箱"></div><div style="text-align:right;margin-top:10px;"><button class="btn-save" onclick="saveEmailConfig()">保存邮件配置</button></div></div><div class="card"><h2>系统信息与更新</h2><div id="sysinfo">加载中...</div><h4>固件更新 (OTA)</h4><div id="otaUi"><form id="otaForm" method="POST" action="/update" enctype="multipart/form-data"><input type="file" name="update" accept=".bin,.bin.gz" required><button type="submit" class="btn-save" style="margin-top:10px;">上传并更新</button></form></div><div id="otaStatus"></div></div><div class="card chart-card"><h2>24小时电压曲线</h2><div id="voltageChart" style="width: 100%; height: 250px;"></div></div></div>
+<div class="card"><h2>邮件通知设置</h2><div class="input-group"><label>SMTP服务器</label><input type="text" id="smtpHost" placeholder="如: smtp.qq.com"></div><div class="input-group"><label>SMTP端口</label><input type="number" id="smtpPort" placeholder="465"></div><div class="input-group"><label>发件邮箱</label><input type="text" id="authEmail" placeholder="xxxx@qq.com"></div><div class="input-group"><label>授权码/密码</label><input type="password" id="authPass"></div><div class="input-group"><label>收件邮箱</label><input type="text" id="recvEmail" placeholder="接收通知的邮箱"></div><div style="text-align:right;margin-top:10px;"><button class="btn-save" onclick="saveEmailConfig()">保存邮件配置</button></div></div><div class="card"><h2>系统信息与更新</h2><!-- === 这行就是你加的入口按钮 === -->
+<a href="/clock" style="display:block; text-align:center; background:linear-gradient(90deg, #ff007f, #7f00ff); color:#fff; padding:12px; border-radius:8px; text-decoration:none; margin-bottom:15px; font-weight:bold; box-shadow: 0 4px 10px rgba(255,0,127,0.3);">✨ 进入矩阵时钟控制台</a><div id="sysinfo">加载中...</div><h4>固件更新 (OTA)</h4><div id="otaUi"><form id="otaForm" method="POST" action="/update" enctype="multipart/form-data"><input type="file" name="update" accept=".bin,.bin.gz" required><button type="submit" class="btn-save" style="margin-top:10px;">上传并更新</button></form></div><div id="otaStatus"></div></div><div class="card chart-card"><h2>24小时电压曲线</h2><div id="voltageChart" style="width: 100%; height: 250px;"></div></div></div>
 <script>
 var echartInstance;
 var latestDeviceTimeStr = "--:--:--";
@@ -570,11 +574,13 @@ void setup() {
   });
   
   server.begin();
+  myClock.begin(); 
 }
 
 void loop() {
   countCpuIdle();
   server.handleClient();
+  myClock.loop(); // 【新增：刷新点阵时钟】
   MDNS.update();
 
   static unsigned long lastVoltageCheck = 0;
