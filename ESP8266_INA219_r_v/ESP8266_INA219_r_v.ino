@@ -580,6 +580,7 @@ void setup() {
 void loop() {
   countCpuIdle();
   server.handleClient();
+  myClock.setBatteryVoltage(busVoltage);  // ← 加这一行
   myClock.loop(); // 【新增：刷新点阵时钟】
   MDNS.update();
 
