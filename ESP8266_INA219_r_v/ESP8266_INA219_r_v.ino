@@ -347,8 +347,12 @@ void recordVoltageHistory() {
 
 void setRelay(bool state) {
   relayState = state;
-  digitalWrite(RELAY_PIN, relayState ?  HIGH: LOW);
+  digitalWrite(RELAY_PIN, relayState ? HIGH : LOW);
   Serial.printf("继电器 -> %s\n", relayState ? "ON" : "OFF");
+
+  // 新增：写入 LittleFS
+  File f = LittleFS.open("/relay.txt", "w");
+  if (f) { f.print(state ? "1" : "0"); f.close(); }
 }
 
 void checkVoltageProtection() {
@@ -534,9 +538,17 @@ void setup() {
     loadSettings(); 
   }
 
-  pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, LOW);   // 默认low关闭
-  relayState = false;
+ pinMode(RELAY_PIN, OUTPUT);
+
+  bool savedRelay = false;
+  if (LittleFS.exists("/relay.txt")) {
+    File f = LittleFS.open("/relay.txt", "r");
+    if (f) { savedRelay = (f.read() == '1'); f.close(); }
+  }
+  relayState = savedRelay;
+  digitalWrite(RELAY_PIN, savedRelay ? HIGH : LOW);
+  Serial.printf("[OK] 继电器状态已恢复: %s\n", savedRelay ? "ON" : "OFF");
+
 
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
   if (ina219.begin()) { ina219_ok = true; Serial.println("[OK] INA219 Ready."); }

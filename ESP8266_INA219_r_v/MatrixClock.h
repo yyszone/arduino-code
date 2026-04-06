@@ -440,7 +440,7 @@ public:
   }
 
   void loop() {
-    if (millis() - lastRefresh >= 30) {
+    if (millis() - lastRefresh >= 100) {
       lastRefresh = millis();
       updateDisplay();
     }
