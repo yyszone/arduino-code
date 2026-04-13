@@ -1,11 +1,13 @@
 #include "fl/file_system.h"
 #include "fl/unused.h"
 #include "fl/warn.h"
+#include "fl/compiler_control.h"
+#include "fl/has_include.h"
 
 #ifdef __EMSCRIPTEN__
 #include "platforms/wasm/fs_wasm.h"
 #define FASTLED_HAS_SDCARD 1
-#elif __has_include(<SD.h>) && __has_include(<fs.h>)
+#elif FL_HAS_INCLUDE(<SD.h>) && FL_HAS_INCLUDE(<fs.h>)
 // Include Arduino SD card implementation when SD library is available
 #include "platforms/fs_sdcard_arduino.hpp"
 #define FASTLED_HAS_SDCARD 1
@@ -193,7 +195,7 @@ bool FileSystem::readText(const char *path, fl::string *out) {
 namespace fl {
 #if !FASTLED_HAS_SDCARD
 // Weak fallback implementation when SD library is not available
-__attribute__((weak)) FsImplPtr make_sdcard_filesystem(int cs_pin) {
+FL_LINK_WEAK FsImplPtr make_sdcard_filesystem(int cs_pin) {
     FASTLED_UNUSED(cs_pin);
     fl::shared_ptr<NullFileSystem> ptr = fl::make_shared<NullFileSystem>();
     FsImplPtr out = ptr;

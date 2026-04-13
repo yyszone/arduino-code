@@ -1,3 +1,5 @@
+/// <reference path="../types.d.ts" />
+
 /* eslint-disable no-console */
 /* eslint-disable guard-for-in */
 /* eslint-disable no-restricted-syntax */
@@ -19,19 +21,18 @@
 
 /**
  * @typedef {Object} ScreenMapData
- * @property {{ [key: string]: StripData }} strips
- * @property {number[]} [min]
- * @property {number[]} [max]
+ * @property {number[]} absMax - Maximum coordinates array
+ * @property {number[]} absMin - Minimum coordinates array
+ * @property {{ [key: string]: any }} strips - Strip configuration data
  */
 
 /**
- * @typedef {Object} FrameData
- * @property {ScreenMapData} screenMap
+ * @typedef {Array & {screenMap?: ScreenMapData}} FrameData
  */
 
 /**
  * Determines if the LED layout represents a dense grid
- * @param {FrameData} frameData - The frame data containing screen mapping information
+ * @param {FrameData | (Array & {screenMap?: ScreenMapData})} frameData - The frame data containing screen mapping information
  * @returns {boolean} - True if the layout is a dense grid (pixel density close to 1)
  */
 export function isDenseGrid(frameData) {
@@ -40,15 +41,15 @@ export function isDenseGrid(frameData) {
     console.warn('isDenseGrid: frameData is not a valid object');
     return false;
   }
-  
+
   const { screenMap } = frameData;
-  
+
   // Defensive programming: ensure screenMap exists and has expected structure
   if (!screenMap || typeof screenMap !== 'object') {
     console.warn('isDenseGrid: screenMap is not a valid object');
     return false;
   }
-  
+
   if (!screenMap.strips || typeof screenMap.strips !== 'object') {
     console.warn('isDenseGrid: screenMap.strips is not a valid object');
     return false;
@@ -75,23 +76,23 @@ export function isDenseGrid(frameData) {
 
   // Calculate total pixels and screen area
   let totalPixels = 0;
-  
+
   // Defensive programming: ensure frameData is iterable (array-like)
   if (!Array.isArray(frameData)) {
     console.warn('isDenseGrid: frameData is not an array, cannot iterate strips');
     return false;
   }
-  
+
   for (const strip of frameData) {
     if (!strip || typeof strip !== 'object' || typeof strip.strip_id === 'undefined') {
       console.warn('isDenseGrid: Invalid strip object or missing strip_id');
       continue;
     }
-    
+
     // Check if this strip exists in screenMap.strips
     const stripIdStr = String(strip.strip_id);
     const stripIdNum = strip.strip_id;
-    
+
     // Handle both string and numeric keys for compatibility
     let stripMap = null;
     if (stripIdStr in screenMap.strips) {
@@ -99,7 +100,7 @@ export function isDenseGrid(frameData) {
     } else if (stripIdNum in screenMap.strips) {
       stripMap = screenMap.strips[stripIdNum];
     }
-    
+
     if (stripMap && stripMap.map && stripMap.map.x && stripMap.map.y) {
       const len = Math.min(stripMap.map.x.length, stripMap.map.y.length);
       totalPixels += len;
@@ -107,9 +108,9 @@ export function isDenseGrid(frameData) {
   }
 
   // Defensive programming: ensure absMax and absMin exist
-  if (!screenMap.absMax || !screenMap.absMin || 
-      !Array.isArray(screenMap.absMax) || !Array.isArray(screenMap.absMin) ||
-      screenMap.absMax.length < 2 || screenMap.absMin.length < 2) {
+  if (!screenMap.absMax || !screenMap.absMin
+      || !Array.isArray(screenMap.absMax) || !Array.isArray(screenMap.absMin)
+      || screenMap.absMax.length < 2 || screenMap.absMin.length < 2) {
     console.warn('isDenseGrid: screenMap missing absMax/absMin arrays');
     return false;
   }
@@ -117,13 +118,13 @@ export function isDenseGrid(frameData) {
   const width = 1 + (screenMap.absMax[0] - screenMap.absMin[0]);
   const height = 1 + (screenMap.absMax[1] - screenMap.absMin[1]);
   const screenArea = width * height;
-  
+
   // Avoid division by zero
   if (screenArea <= 0) {
     console.warn('isDenseGrid: Invalid screen area calculation');
     return false;
   }
-  
+
   const pixelDensity = totalPixels / screenArea;
 
   // Return true if density is close to 1 (indicating a grid)
@@ -146,7 +147,7 @@ export function makePositionCalculators(frameData, screenWidth, screenHeight) {
       calcYPosition: (y) => y,
     };
   }
-  
+
   const { screenMap } = frameData;
   if (!screenMap || typeof screenMap !== 'object') {
     console.warn('makePositionCalculators: screenMap is not a valid object, using default calculations');
@@ -155,21 +156,21 @@ export function makePositionCalculators(frameData, screenWidth, screenHeight) {
       calcYPosition: (y) => y,
     };
   }
-  
+
   // Defensive programming: ensure absMax and absMin exist
-  if (!screenMap.absMax || !screenMap.absMin || 
-      !Array.isArray(screenMap.absMax) || !Array.isArray(screenMap.absMin) ||
-      screenMap.absMax.length < 2 || screenMap.absMin.length < 2) {
+  if (!screenMap.absMax || !screenMap.absMin
+      || !Array.isArray(screenMap.absMax) || !Array.isArray(screenMap.absMin)
+      || screenMap.absMax.length < 2 || screenMap.absMin.length < 2) {
     console.warn('makePositionCalculators: screenMap missing absMax/absMin arrays, using default calculations');
     return {
       calcXPosition: (x) => x,
       calcYPosition: (y) => y,
     };
   }
-  
+
   const width = screenMap.absMax[0] - screenMap.absMin[0];
   const height = screenMap.absMax[1] - screenMap.absMin[1];
-  
+
   // Avoid division by zero
   if (width <= 0 || height <= 0) {
     console.warn('makePositionCalculators: Invalid width/height calculated, using default calculations');
@@ -180,9 +181,7 @@ export function makePositionCalculators(frameData, screenWidth, screenHeight) {
   }
 
   return {
-    calcXPosition: (x) => {
-      return (((x - screenMap.absMin[0]) / width) * screenWidth) - (screenWidth / 2);
-    },
+    calcXPosition: (x) => (((x - screenMap.absMin[0]) / width) * screenWidth) - (screenWidth / 2),
     calcYPosition: (y) => {
       const negY = (((y - screenMap.absMin[1]) / height) * screenHeight) - (screenHeight / 2);
       return negY; // Remove negative sign to fix Y-axis orientation
@@ -201,7 +200,7 @@ function allPixelDensitiesUndefined(frameData) {
     console.warn('allPixelDensitiesUndefined: frameData is not a valid object');
     return true;
   }
-  
+
   const { screenMap } = frameData;
   if (!screenMap || !screenMap.strips || typeof screenMap.strips !== 'object') {
     console.warn('allPixelDensitiesUndefined: screenMap or screenMap.strips not found');
@@ -256,7 +255,7 @@ function createScreenBoundsCalculation(frameData) {
       calcYPosition: (y) => y,
     };
   }
-  
+
   const { screenMap } = frameData;
   if (!screenMap || !screenMap.strips || typeof screenMap.strips !== 'object') {
     console.warn('createScreenBoundsCalculation: Invalid frameData - missing screenMap or strips, returning default functions');
@@ -272,17 +271,14 @@ function createScreenBoundsCalculation(frameData) {
      * @param {number} x - X coordinate
      * @returns {number} Calculated X position
      */
-    calcXPosition: (x) => {
-      return x; // Placeholder implementation
-    },
+    calcXPosition: (x) => x, // Placeholder implementation
     /**
      * Calculate Y position
      * @param {number} y - Y coordinate
      * @returns {number} Calculated Y position
      */
-    calcYPosition: (y) => {
-      return y; // Placeholder implementation
-    },
+    calcYPosition: (y) => y // Placeholder implementation
+    ,
   };
 }
 

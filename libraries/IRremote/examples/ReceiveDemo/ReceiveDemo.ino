@@ -10,7 +10,7 @@
  ************************************************************************************
  * MIT License
  *
- * Copyright (c) 2020-2025 Armin Joachimsmeyer
+ * Copyright (c) 2020-2026 Armin Joachimsmeyer
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -34,69 +34,82 @@
 
 #include <Arduino.h>
 
-#include "PinDefinitionsAndMore.h" // Define macros for input and output pin etc.
+#include "PinDefinitionsAndMore.h" // Define macros for input and output pin etc. Sets FLASHEND and RAMSIZE and evaluates value of SEND_PWM_BY_TIMER.
 
 //#define LOCAL_DEBUG // If defined, print timing for each received data set (the same as if DEBUG_BUTTON_PIN was connected to low)
 
 /*
  * Specify which protocol(s) should be used for decoding.
- * If no protocol is defined, all protocols (except Bang&Olufsen) are active.
+ * If no protocol is defined, all protocols (except BEO / Bang&Olufsen) are active.
  * This must be done before the #include <IRremote.hpp>
+ * In alphabetic order
  */
-//#define DECODE_DENON        // Includes Sharp
-//#define DECODE_JVC
-//#define DECODE_KASEIKYO
-//#define DECODE_PANASONIC    // alias for DECODE_KASEIKYO
-//#define DECODE_LG
-//#define DECODE_NEC          // Includes Apple and Onkyo
-//#define DECODE_SAMSUNG
-//#define DECODE_SONY
-//#define DECODE_RC5
-//#define DECODE_RC6
-//#define DECODE_BOSEWAVE
-//#define DECODE_LEGO_PF
-//#define DECODE_MAGIQUEST
-//#define DECODE_WHYNTER
-//#define DECODE_FAST
-//#define DECODE_DISTANCE_WIDTH // Universal decoder for pulse distance width protocols
-//#define DECODE_HASH         // special decoder for all protocols
-//#define DECODE_ONKYO        // Disables NEC and Apple
-//#define DECODE_BEO          // This protocol must always be enabled manually, i.e. it is NOT enabled if no protocol is defined. It prevents decoding of SONY!
-#if FLASHEND >= 0x3FFF  // For 16k flash or more, like ATtiny1604. Code does not fit in program memory of ATtiny85 etc.
+//#define DECODE_DENON        // Includes Sharp - requires around 250 bytes of program memory on ATmega328
+//#define DECODE_JVC          // ~ 200 bytes
+//#define DECODE_KASEIKYO     // Includes Panasonic ~ 300 bytes
+//#define DECODE_LG           // ~ 400 bytes
+//#define DECODE_NEC          // Includes Apple and Onkyo ~ 250 bytes
+//#define DECODE_SAMSUNG      // ~ 300 bytes
+//#define DECODE_SONY         // ~ 175 bytes
+//#define DECODE_RC5          // RC5 + MARANTZ: ~ 425 bytes
+//#define DECODE_RC6          // ~ 375 bytes
+
+// Universal protocol decoder
+//#define DECODE_DISTANCE_WIDTH // Universal decoder for pulse distance width protocols ~ 2275 bytes
+//#define DECODE_HASH         // special decoder for all protocols ~ 250 bytes
+
+// Exotic protocol decoder
+//#define DECODE_BOSEWAVE     // ~ 140 bytes
+//#define DECODE_FAST         // ~ 135 bytes
+//#define DECODE_LEGO_PF      // ~ 300 bytes
+//#define DECODE_MAGIQUEST    // ~ 270 bytes
+//#define DECODE_MARANTZ      // RC5 + MARANTZ: ~ 425 bytes
+//#define DECODE_OPENLASIR    // Modified NEC with 8-bit validated address + 16-bit command. ~ 175 bytes
+//#define DECODE_WHYNTER      // ~ 90 bytes
+
+//#define DECODE_ONKYO        // Decodes NEC and Apple as Onkyo - saves around 90 bytes of program memory, if activated
+//#define DECODE_BEO          // This protocol must always be enabled manually, i.e. it is NOT enabled if no protocol is defined. It prevents decoding of SONY! ~ 430 bytes
+#if FLASHEND >= 0x7FFF  // For 16k flash or more, like ATtiny1604. Code does not fit in program memory of ATtiny85 etc.
+// Do not enable any protocol explicitly => all protocols are enabled automatically.
 // !!! Enabling B&O disables detection of Sony, because the repeat gap for SONY is smaller than the B&O frame gap :-( !!!
-//#define DECODE_BEO // Bang & Olufsen protocol always must be enabled explicitly. It has an IR transmit frequency of 455 kHz! It prevents decoding of SONY!
+//#define DECODE_BEO // Bang & Olufsen protocol always must be enabled explicitly. It has an IR transmit frequency of 455 kHz! It prevents decoding of SONY! ~ 430 bytes
 #else
 // for 8k flash
-//#define DECODE_DENON        // Includes Sharp
-#define DECODE_JVC
-#define DECODE_KASEIKYO
-#define DECODE_PANASONIC    // alias for DECODE_KASEIKYO
-#define DECODE_LG
-#define DECODE_NEC          // Includes Apple and Onkyo
-#define DECODE_SAMSUNG
-//#define DECODE_SONY
-//#define DECODE_RC5
-//#define DECODE_RC6
-#define DECODE_DISTANCE_WIDTH // Universal decoder for pulse distance width protocols
-#define DECODE_HASH         // special decoder for all protocols
+//#define DECODE_DENON        // Includes Sharp - requires around 250 bytes of program memory on ATmega328
+//#define DECODE_JVC          // ~ 200 bytes
+#define DECODE_KASEIKYO     // Includes Panasonic ~ 300 bytes
+#define DECODE_LG           // ~ 400 bytes
+#define DECODE_NEC          // Includes Apple and Onkyo ~ 250 bytes
+#define DECODE_SAMSUNG      // ~ 300 bytes
+//#define DECODE_SONY         // ~ 175 bytes
+//#define DECODE_RC5          // RC5 + MARANTZ: ~ 425 bytes
+//#define DECODE_RC6          // ~ 375 bytes
+#define DECODE_DISTANCE_WIDTH // Universal decoder for pulse distance width protocols ~ 2275 bytes
+#define DECODE_HASH         // special decoder for all protocols ~ 250 bytes
 
-#define EXCLUDE_EXOTIC_PROTOCOLS
+#define EXCLUDE_EXOTIC_PROTOCOLS // Saves around 90 bytes of program memory, if activated
 #endif
 // etc. see IRremote.hpp
 //
 
 #if !defined(RAW_BUFFER_LENGTH)
-// For air condition remotes it may require up to 750. Default is 200.
-#  if !((defined(RAMEND) && RAMEND <= 0x4FF) || (defined(RAMSIZE) && RAMSIZE < 0x4FF))
-#define RAW_BUFFER_LENGTH  750
+// Use more than the default values of 100 for 512 bytes RAM, 200 for 2k RAM and 750 for more than 2k RAM
+#  if RAMSIZE <= 0x400
+// Here we have 1 k RAM or less
+#define RAW_BUFFER_LENGTH  360
+#  elif RAMSIZE <= 0x800
+// Here we have 2 k RAM or less, otherwise use default of 750
+#define RAW_BUFFER_LENGTH  600 // 400 is OK with Pronto and 1000 is OK without Pronto. 1200 is too much here, because then variables are overwritten.
 #  endif
 #endif
 
-//#define NO_LED_FEEDBACK_CODE // saves 92 bytes program memory
+//#define NO_LED_FEEDBACK_CODE        // saves 92 bytes program memory
 //#define EXCLUDE_UNIVERSAL_PROTOCOLS // Saves up to 1000 bytes program memory.
-//#define EXCLUDE_EXOTIC_PROTOCOLS // saves around 650 bytes program memory if all other protocols are active
-//#define USE_THRESHOLD_DECODER   // May give slightly better results especially for jittering signals and protocols with short 1 pulses / pauses. Requires additional 1 bytes program memory.
+//#define EXCLUDE_EXOTIC_PROTOCOLS    // saves around 650 bytes program memory if all other protocols are active
+//#define USE_THRESHOLD_DECODER       // May give slightly better results especially for jittering signals and protocols with short 1 pulses / pauses. Requires additional 1 bytes program memory.
 //#define IR_REMOTE_DISABLE_RECEIVE_COMPLETE_CALLBACK // saves 32 bytes program memory
+//#define USE_16_BIT_TIMING_BUFFER    // Use a 16-bit buffer to preserve values above 12750 us
+#define SHOW_DISTANCE_WIDTH_DECODER_ERRORS  // Prints the reason which prevents data to be decoded as distance width data
 
 // MARK_EXCESS_MICROS is subtracted from all marks and added to all spaces before decoding,
 // to compensate for the signal forming of different IR receiver modules. See also IRremote.hpp line 135.
@@ -122,6 +135,13 @@
 #undef DEBUG_BUTTON_PIN // DEBUG_BUTTON_PIN number is not valid, so delete definition to disable further usage
 #  endif
 #endif
+
+/*
+ * Using the function printActiveIRProtocols() requires additional 314 bytes program memory
+ * Using the function printIRResultShort() requires additional 1450 bytes program memory
+ * Using the function printIRSendUsage() requires additional 2736 bytes program memory
+ * Because these 3 functions all share common code, using all 3 functions requires only additional 3016 bytes program memory
+ */
 
 void generateTone();
 void handleOverflow();
@@ -244,15 +264,19 @@ void loop() {
             }
             if (IrReceiver.decodedIRData.protocol == UNKNOWN) {
                 auto tDecodedRawData = IrReceiver.decodedIRData.decodedRawData; // uint32_t on 8 and 16 bit CPUs and uint64_t on 32 and 64 bit CPUs
-                Serial.print(F("Raw data received are 0x"));
+                Serial.print(F("Raw data from hash decoder is 0x"));
+#    if (__INT_WIDTH__ < 32)
                 Serial.println(tDecodedRawData);
+#    else
+                PrintULL::println(&Serial, tDecodedRawData, BIN);
+#    endif
 
             } else {
                 /*
                  * The info output for a successful receive
                  */
                 IrReceiver.printIRResultShort(&Serial);
-                IrReceiver.printIRSendUsage(&Serial);
+                IrReceiver.printIRSendUsage(&Serial); // Calls printIRResultShort() and other functions, if protocol is UNKNOWN
             }
         }
 #endif // #if FLASHEND >= 0x3FFF
@@ -303,7 +327,7 @@ void loop() {
  * Stop receiver, generate a single beep and start receiver again
  */
 void generateTone() {
-#  if !defined(ESP8266) && !defined(NRF5) // tone on esp8266 works only once, then it disables IrReceiver.restartTimer() / timerConfigForReceive().
+#  if !defined(ESP8266) && !defined(NRF5) && defined(TONE_PIN) // tone on esp8266 works only once, then it disables IrReceiver.restartTimer() / timerConfigForReceive().
 #    if defined(ESP32) // ESP32 uses another timer for tone(), maybe other platforms (not tested yet) too.
     tone(TONE_PIN, 2200, 8);
 #    else
@@ -321,7 +345,7 @@ void handleOverflow() {
     Serial.println(F("Try to increase the \"RAW_BUFFER_LENGTH\" value of " STR(RAW_BUFFER_LENGTH) " in " __FILE__));
     // see also https://github.com/Arduino-IRremote/Arduino-IRremote#compile-options--macros-for-this-library
 
-#if !defined(ESP8266) && !defined(NRF5) && FLASHEND >= 0x3FFF // tone on esp8266 works once, then it disables IrReceiver.restartTimer() / timerConfigForReceive().
+#if !defined(ESP8266) && !defined(NRF5) && FLASHEND >= 0x3FFF && defined(TONE_PIN) // tone on esp8266 works once, then it disables IrReceiver.restartTimer() / timerConfigForReceive().
     /*
      * Stop timer, generate a double beep and start timer again
      */

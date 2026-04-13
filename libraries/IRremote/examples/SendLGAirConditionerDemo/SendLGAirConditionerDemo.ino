@@ -35,13 +35,12 @@
 //#define NO_LED_FEEDBACK_CODE          // Saves 276 bytes program memory
 
 /*
- * LG2 has different header timing and a shorter bit time
- * Known LG remote controls, which uses LG2 protocol are:
+ * LG has different header timing and a shorter bit time
+ * Known LG remote controls, which uses LG protocol are:
  * AKB75215403
  * AKB74955603
  * AKB73757604:
  */
-//#define USE_LG2_PROTOCOL // Try it if you do not have success with the default LG protocol
 #define NUMBER_OF_COMMANDS_BETWEEN_PRINT_OF_MENU 5
 
 #if !defined(ARDUINO_ESP32C3_DEV) // This is due to a bug in RISC-V compiler, which requires unused function sections :-(.
@@ -53,7 +52,7 @@
 #define INFO // Deactivate this to save program memory and suppress info output from the LG-AC driver.
 //#define DEBUG // Activate this for more output from the LG-AC driver.
 
-#include "PinDefinitionsAndMore.h" // Define macros for input and output pin etc.
+#include "PinDefinitionsAndMore.h" // Define macros for input and output pin etc. Sets FLASHEND and RAMSIZE and evaluates value of SEND_PWM_BY_TIMER.
 #include <IRremote.hpp>
 
 #if defined(__AVR_ATtiny25__) || defined(__AVR_ATtiny45__) || defined(__AVR_ATtiny85__) || defined(__AVR_ATtiny87__) || defined(__AVR_ATtiny167__)

@@ -3,6 +3,7 @@
 
 /// Disables pragma messages and warnings
 #define FASTLED_INTERNAL
+#include "fl/compiler_control.h"
 
 // Removed duplicate weak definition of timer_millis for ATtiny1604.
 // The variable is already defined in avr_millis_timer_null_counter.hpp when needed,
@@ -16,7 +17,7 @@
 #    ifdef __cplusplus
 extern "C" {
 #    endif
-__attribute__((weak)) volatile unsigned long timer_millis = 0;
+FL_LINK_WEAK volatile unsigned long timer_millis = 0;
 #    ifdef __cplusplus
 }
 #    endif
@@ -29,6 +30,7 @@ __attribute__((weak)) volatile unsigned long timer_millis = 0;
 // override any default weak definition.
 #if defined(NRF52_SERIES)
 
+    #include "platforms/arm/is_arm.h"
     #include "platforms/arm/nrf52/led_sysdefs_arm_nrf52.h"
     #include "platforms/arm/nrf52/arbiter_nrf52.h"
 

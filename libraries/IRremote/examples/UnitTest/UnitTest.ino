@@ -9,7 +9,7 @@
  ************************************************************************************
  * MIT License
  *
- * Copyright (c) 2020-2025 Armin Joachimsmeyer
+ * Copyright (c) 2020-2026 Armin Joachimsmeyer
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -33,17 +33,6 @@
 
 #include <Arduino.h>
 
-#include "PinDefinitionsAndMore.h" // Define macros for input and output pin etc.
-
-#if !defined(RAW_BUFFER_LENGTH)
-// For air condition remotes it requires 600 (maximum for 2k RAM) to 750. Default is 112 if DECODE_MAGIQUEST is enabled, otherwise 100.
-#  if (defined(RAMEND) && RAMEND <= 0x4FF) || (defined(RAMSIZE) && RAMSIZE < 0x4FF)
-#define RAW_BUFFER_LENGTH  360
-#  elif (defined(RAMEND) && RAMEND <= 0x8FF) || (defined(RAMSIZE) && RAMSIZE < 0x8FF)
-#define RAW_BUFFER_LENGTH  400 // 400 is OK with Pronto and 1000 is OK without Pronto. 1200 is too much here, because then variables are overwritten.
-#  endif
-#endif
-
 //#define EXCLUDE_UNIVERSAL_PROTOCOLS // Saves up to 1000 bytes program memory.
 //#define EXCLUDE_EXOTIC_PROTOCOLS  // Saves around 240 bytes program memory if IrSender.write is used
 //#define USE_THRESHOLD_DECODER   // May give slightly better results especially for jittering signals and protocols with short 1 pulses / pauses. Requires additional 24 bytes program memory.
@@ -56,13 +45,27 @@
 #define NO_LED_FEEDBACK_CODE          // Saves 270 bytes program memory
 //#define NO_LED_RECEIVE_FEEDBACK_CODE  // Saves 176 bytes program memory
 //#define NO_LED_SEND_FEEDBACK_CODE     // Saves 38 bytes program memory
+//#define USE_16_BIT_TIMING_BUFFER      // Use a 16-bit buffer to preserve values above 12750 us
+
+#include "PinDefinitionsAndMore.h" // Define macros for input and output pin etc. Sets FLASHEND and RAMSIZE and evaluates value of SEND_PWM_BY_TIMER.
+
+#if !defined(RAW_BUFFER_LENGTH)
+// Use more than the default values of 100 for 512 bytes RAM, 200 for 2k RAM and 750 for more than 2k RAM
+#  if RAMSIZE <= 0x400
+// Here we have 1 k RAM or less
+#define RAW_BUFFER_LENGTH  360
+#  elif RAMSIZE <= 0x800
+// Here we have 2 k RAM or less, otherwise use default of 750
+#define RAW_BUFFER_LENGTH  400 // 400 is OK with Pronto and 1000 is OK without Pronto. 1200 is too much here, because then variables are overwritten.
+#  endif
+#endif
 
 //#define USE_MSB_DECODING_FOR_DISTANCE_DECODER
 
 // MARK_EXCESS_MICROS is subtracted from all marks and added to all spaces before decoding,
 // to compensate for the signal forming of different IR receiver modules. See also IRremote.hpp line 135.
 // 20 is taken as default if not otherwise specified / defined.
-//#define MARK_EXCESS_MICROS    40    // Adapt it to your IR receiver module. 40 is recommended for the cheap VS1838 modules at high intensity.
+//#define MARK_EXCESS_MICROS    40    // 40 inhibits the decoding of the short B&O marks of 250 us.
 
 //#define RECORD_GAP_MICROS 12000 // Default is 8000. Activate it for some LG air conditioner protocols.
 
@@ -71,17 +74,17 @@
 
 #if FLASHEND >= 0x1FFF      // For 8k flash or more, like ATtiny85
 #define DECODE_DENON        // Includes Sharp
-#define DECODE_KASEIKYO
-#define DECODE_PANASONIC    // alias for DECODE_KASEIKYO
-#define DECODE_NEC          // Includes Apple and Onkyo
+#define DECODE_KASEIKYO     // Includes Panasonic ~ 640 bytes
+#define DECODE_NEC          // Includes Apple and Onkyo ~ 1050 bytes
 #endif
 
 #if FLASHEND >= 0x3FFF      // For 16k flash or more, like ATtiny1604
 #define DECODE_JVC
-#define DECODE_RC5
-#define DECODE_RC6
+#define DECODE_RC5 // with DECODE_MARANTZ ~ 1270
+#define DECODE_MARANTZ
+#define DECODE_RC6 // ~ 940 bytes
 
-#define DECODE_DISTANCE_WIDTH // Universal decoder for pulse distance width protocols
+#define DECODE_DISTANCE_WIDTH // Universal decoder for pulse distance width protocols ~ 2430 bytes
 #define DECODE_HASH         // special decoder for all protocols
 #endif
 
@@ -90,26 +93,29 @@
 #define DECODE_SAMSUNG
 #define DECODE_LG
 #define DECODE_LEGO_PF // LEGO is skipped, since it is difficult to receive because of its short marks and spaces
-#endif
 
-#define DECODE_BEO // It prevents decoding of SONY (default repeats), which we are not using here.
+#define DECODE_BEO // It prevents decoding of SONY (default repeats), which we are not using here. ~ 1340 bytes
 //#define ENABLE_BEO_WITHOUT_FRAME_GAP // !!!For successful unit testing we must see the warning at ir_BangOlufsen.hpp:100:2!!!
-#if defined(DECODE_BEO)
+#  if defined(DECODE_BEO)
 #define RECORD_GAP_MICROS 16000 // Force to get the complete frame including the 3. space of 15 ms in the receive buffer
 #define SUPPRESS_BEO_RECORD_GAP_MICROS_WARNING // We know, what we do here :-)
-#define BEO_KHZ         38  // We send and receive Bang&Olufsen with 38 kHz here (instead of 455 kHz).
+#define BEO_KHZ         38  // We send and receive Bang&Olufsen with 38 kHz instead of 455 kHz in order to be able to test it
+#  endif
 #endif
 
-#define DECODE_BOSEWAVE
-#define DECODE_MAGIQUEST
-#define DECODE_FAST
+#define DECODE_BOSEWAVE     // ~ 250 bytes
+#define DECODE_MAGIQUEST    // ~ 460 bytes
+#define DECODE_OPENLASIR    // ~ 330 bytes
+#define DECODE_FAST         // ~ 210 bytes
 
 //#define DECODE_WHYNTER
 
 //#undef IR_SEND_PIN // enable this, if you need to set send pin programmatically using uint8_t tSendPin below
 
-#define SHOW_DISTANCE_WIDTH_DECODER_ERRORS  // Prints errors which prevents data to be decoded as distance width data
+#define SHOW_DISTANCE_WIDTH_DECODER_ERRORS  // Prints the reason which prevents data to be decoded as distance width data
 #include <IRremote.hpp>
+
+#include "TinyIRSender.hpp"
 
 #if defined(APPLICATION_PIN) && !defined(DEBUG_BUTTON_PIN)
 #define DEBUG_BUTTON_PIN    APPLICATION_PIN // if held low, print timing for each received data
@@ -136,13 +142,16 @@ volatile bool sDataJustReceived = false;
 void ReceiveCompleteCallbackHandler();
 
 #if __INT_WIDTH__ < 32
-//IRRawDataType const tRawDataPGM[] PROGMEM = { 0xB02002, 0xA010 }; // LSB of tRawData[0] is sent first
+//IRDecodedRawDataType const tRawDataPGM[] PROGMEM = { 0xB02002, 0xA010 }; // LSB of tRawData[0] is sent first
 uint8_t const tRawDataPGM[] PROGMEM = { 0x02, 0x20, 0xB0, 0x00, /*0xB02002*/
 0x10, 0xA0, 0x0, 0x0, /*0xA010*/}; // Define tRawDataPGM as byte array of same size with same content as { 0xB02002, 0xA010}
 #endif
 
 // if this definition is contained in a function, the address, the compiler uses is wrong :-(
-const uint16_t rawIRTimingsNEC[] PROGMEM
+const uint16_t rawIRTimingsNEC[]
+#if defined(__AVR__)
+PROGMEM // this crashes on ESP8266
+#endif
 = { 9000, 4500/*Start bit*/, 560, 560, 560, 560, 560, 1690, 560, 560/*0010 0x4 of 16 bit address LSB first*/, 560, 560, 560, 560,
         560, 560, 560, 560/*0000*/, 560, 1690, 560, 1690, 560, 560, 560, 1690/*1101 0xB*/, 560, 1690, 560, 1690, 560, 1690, 560,
         1690/*1111*/, 560, 560, 560, 560, 560, 560, 560, 1690/*0001 0x08 of command LSB first*/, 560, 560, 560, 560, 560, 560, 560,
@@ -249,7 +258,7 @@ void setup() {
 
 }
 
-void checkReceivedRawData(IRRawDataType aRawData) {
+void checkReceivedRawData(IRDecodedRawDataType aRawData) {
     // wait until signal has received
     while (!sDataJustReceived) {
     };
@@ -301,7 +310,7 @@ void checkReceivedRawData(IRRawDataType aRawData) {
 }
 
 #if defined(DECODE_DISTANCE_WIDTH)
-void checkReceivedArray(IRRawDataType *aRawDataArrayPointer, uint8_t aArraySize) {
+void checkReceivedArray(IRDecodedRawDataType *aRawDataArrayPointer, uint8_t aArraySize) {
     // wait until signal has received
     while (!sDataJustReceived) {
     };
@@ -358,9 +367,21 @@ void ReceiveCompleteCallbackHandler() {
     sDataJustReceived = true;
 }
 
-void checkReceive(uint16_t aSentAddress, uint16_t aSentCommand) {
+/*
+ * Must be called after checkReceive, because it does not wait for signal to be received and does not call decode()
+ */
+void checkReceivedExtra(uint16_t aSentExtra) {
+    if (IrReceiver.decodedIRData.extra != aSentExtra) {
+        Serial.print(F("ERROR: Received extra=0x"));
+        Serial.print(IrReceiver.decodedIRData.extra, HEX);
+        Serial.print(F(" != sent extra=0x"));
+        Serial.println(aSentExtra, HEX);
+    }
+}
+
+void waitForReceived() {
     // wait until signal has received
-    uint16_t tTimeoutCounter = 1000; // gives 10 seconds timeout
+    uint16_t tTimeoutCounter = 500; // gives 5 seconds timeout
     while (!sDataJustReceived) {
         delay(10);
         if (tTimeoutCounter == 0) {
@@ -370,6 +391,15 @@ void checkReceive(uint16_t aSentAddress, uint16_t aSentCommand) {
         tTimeoutCounter--;
     }
     sDataJustReceived = false;
+}
+
+/*
+ * @return true if NO error, false if error
+ */
+bool checkReceive(uint16_t aSentAddress, uint16_t aSentCommand) {
+    bool tReturnValueIsSuccess = true;
+
+    waitForReceived();
 
     if (IrReceiver.decode()) {
 // Print a short summary of received data
@@ -399,6 +429,7 @@ void checkReceive(uint16_t aSentAddress, uint16_t aSentCommand) {
 
         if (IrReceiver.decodedIRData.protocol == UNKNOWN) {
             Serial.println(F("ERROR: Unknown protocol"));
+            tReturnValueIsSuccess = false;
         } else {
             /*
              * Check address
@@ -408,6 +439,7 @@ void checkReceive(uint16_t aSentAddress, uint16_t aSentCommand) {
                 Serial.print(IrReceiver.decodedIRData.address, HEX);
                 Serial.print(F(" != sent address=0x"));
                 Serial.println(aSentAddress, HEX);
+                tReturnValueIsSuccess = false;
             }
             /*
              * Check command
@@ -417,14 +449,17 @@ void checkReceive(uint16_t aSentAddress, uint16_t aSentCommand) {
                 Serial.print(IrReceiver.decodedIRData.command, HEX);
                 Serial.print(F(" != sent command=0x"));
                 Serial.println(aSentCommand, HEX);
+                tReturnValueIsSuccess = false;
             }
         }
 
     } else {
         Serial.println(F("No data received"));
+        tReturnValueIsSuccess = false;
         IrReceiver.resume();
     }
     Serial.println();
+    return tReturnValueIsSuccess;
 }
 
 /*
@@ -492,19 +527,70 @@ void loop() {
     checkReceive(sAddress, sCommand);
     delay(DELAY_AFTER_SEND);
 
-    Serial.println(F("Send NEC2 with 16 bit address"));
+    Serial.println(F("Send NEC2 with 16 bit address")); // The only difference is the repeat
     Serial.flush();
     IrSender.sendNEC2(sAddress, sCommand, sRepeats);
     checkReceive(sAddress, sCommand);
     delay(DELAY_AFTER_SEND);
 #endif // defined(DECODE_NEC)
 
-#if FLASHEND >= 0x7FFF && ((!defined(RAMEND) && !defined(RAMSIZE)) || (defined(RAMEND) && RAMEND > 0x6FF) || (defined(RAMSIZE) && RAMSIZE > 0x6FF)) // For 32k flash or more, like Uno. Code does not fit in program memory of ATtiny1604 etc.
+#if FLASHEND >= 0x7FFF && RAMSIZE >= 0x600 // For 32k flash or more, like Uno. Code does not fit in program memory of ATtiny1604 etc.
     if (sCommand == 0x76) {
         /*
          * Do this only once at the first loop
          */
-        IRRawDataType tRawData[4];
+
+#if defined(DECODE_RC5)
+        /*
+         * Test minimal RC5X and maximal RC5 length
+         */
+        Serial.println(F("Send RC5 minimal length")); // 14
+        Serial.flush();
+        IrSender.setNextToggleBitValueForRC5AndRC6(1); // To get minimal length
+        IrSender.sendRC5(0x0A, 0x6A, sRepeats, true); // use RC5X
+        checkReceive(0x0A, 0x6A);
+        delay(DELAY_AFTER_SEND / 2);
+
+        Serial.println(F("Send RC5 maximal length")); // 28
+        Serial.flush();
+        IrSender.setNextToggleBitValueForRC5AndRC6(1); // To get maximal length
+        IrSender.sendRC5(0x1F, 0x3F, sRepeats, true);
+        checkReceive(0x1F, 0x3F);
+        delay(DELAY_AFTER_SEND / 2);
+
+        Serial.println(F("Send Marantz maximal length")); // 34
+        Serial.flush();
+        IrSender.setNextToggleBitValueForRC5AndRC6(1); // To get maximal length
+        IrSender.sendRC5Marantz(0x1F, 0x3F, sRepeats, 0x3F, true);
+        if (checkReceive(0x1F, 0x3F)) {
+            checkReceivedExtra(0x3F);
+        }
+
+        delay(DELAY_AFTER_SEND);
+#endif // defined(DECODE_RC5)
+
+#if defined(DECODE_RC6)
+        /*
+         * Test minimal RC6 and maximal RC6A length
+         * Toggle bit does not make any difference for RC6A, because it is located between a 0 and a 1 bit
+         */
+        Serial.println(F("Send RC6 minimal length")); // 26
+        Serial.flush();
+        IrSender.setNextToggleBitValueForRC5AndRC6(1); // To get minimal length
+        IrSender.sendRC6(0x55, 0x55, 0, true);
+        checkReceive(0x55, 0x55);
+        delay(DELAY_AFTER_SEND / 2);
+
+        Serial.println(F("Send RC6A maximal length")); // 72
+        Serial.flush();
+        IrSender.sendRC6A(0xFF, 0xFF, 0, 0x3FFF, true);
+        if (checkReceive(0xFF, 0xFF)) {
+            checkReceivedExtra(0x3FFF);
+        }
+        delay(DELAY_AFTER_SEND);
+#endif // defined(DECODE_RC6)
+
+        IRDecodedRawDataType tRawData[4];
 
         /*
          * Test send usage for UNKNOWN protocol
@@ -514,7 +600,9 @@ void loop() {
         Serial.println(F("Send arbitrary raw data with 1 repeat and exact timing (16 bit array format) with sendRaw()"));
         Serial.flush();
         IrSender.sendRaw(rawIRTimings, sizeof(rawIRTimings) / sizeof(rawIRTimings[0]), NEC_KHZ, 80, 1); // Note the approach used to automatically calculate the size of the array.
-        checkReceive(0xFB04 & 0xFF, 0x08);
+        waitForReceived();
+        IrReceiver.printIRResultRawFormatted(&Serial, true);
+        IrReceiver.resume();
         delay(DELAY_AFTER_SEND);
 
 #  if defined(DECODE_NEC)
@@ -567,11 +655,12 @@ void loop() {
         delay(DELAY_AFTER_SEND);
 #  endif // defined(DECODE_NEC)
 
-#  if defined(DECODE_PANASONIC) || defined(DECODE_KASEIKYO)
+#  if defined(DECODE_KASEIKYO)
         Serial.println(F("Send Panasonic 0xB, 0x10 as 48 bit PulseDistance PGM using ProtocolConstants 1=432|1296, 0=432|432"));
         Serial.flush();
 #    if __INT_WIDTH__ < 32
-        IrSender.sendPulseDistanceWidthFromPGMArray_P(&KaseikyoProtocolConstants, (IRRawDataType*) &tRawDataPGM[0], 48, NO_REPEATS); // Panasonic is a Kaseikyo variant
+        IrSender.sendPulseDistanceWidthFromPGMArray_P(&KaseikyoProtocolConstants, (IRDecodedRawDataType*) &tRawDataPGM[0], 48,
+        NO_REPEATS); // Panasonic is a Kaseikyo variant
         checkReceive(0x0B, 0x10);
 #    else
         IrSender.sendPulseDistanceWidth_P(&KaseikyoProtocolConstants, 0xA010B02002, 48, NO_REPEATS); // Panasonic is a Kaseikyo variant
@@ -586,7 +675,7 @@ void loop() {
         Serial.println(F("-LSB first"));
         Serial.flush();
 #    if __INT_WIDTH__ < 32
-        IrSender.sendPulseDistanceWidthFromPGMArray(38, 3450, 1700, 450, 1250, 450, 400, (IRRawDataType*) tRawDataPGM, 48,
+        IrSender.sendPulseDistanceWidthFromPGMArray(38, 3450, 1700, 450, 1250, 450, 400, (IRDecodedRawDataType*) tRawDataPGM, 48,
         PROTOCOL_IS_LSB_FIRST, 0, NO_REPEATS);
         checkReceive(0x0B, 0x10);
 #    else
@@ -611,7 +700,7 @@ void loop() {
 #    endif
 
         delay(DELAY_AFTER_SEND);
-#  endif // defined(DECODE_PANASONIC) || defined(DECODE_KASEIKYO)
+#  endif // defined(DECODE_KASEIKYO)
 
 #  if defined(DECODE_DISTANCE_WIDTH)
 #    if defined(USE_MSB_DECODING_FOR_DISTANCE_DECODER)
@@ -666,6 +755,31 @@ void loop() {
 #      endif
         delay(DELAY_AFTER_SEND);
 
+        /*
+         * This one can be interpreted as 52 bit PulseDistance or 53 bit PulseWidth with inverted bits and bit timing.
+         Protocol=PulseWidth, Raw-Data=0x123456, 53 bits, LSB first, Gap=789450us, Duration=49100us
+         Send on a 8 bit platform with:
+         uint32_t tRawData[]={0x789ABCDE, 0x123456};
+         IrSender.sendPulseDistanceWidthFromArray(38, 300, 650, 600, 450, 300, 450, &tRawData[0], 53, PROTOCOL_IS_LSB_FIRST, <RepeatPeriodMillis>, <numberOfRepeats>);
+         rawIRTimings[108]:
+         -789450
+         + 300,- 650
+         + 300,- 600 + 600,- 300 + 650,- 450 + 500,- 250
+         + 600,- 300 + 300,- 650 + 650,- 250 + 600,- 350
+         + 250,- 650 + 300,- 600 + 650,- 250 + 650,- 300
+         + 600,- 350 + 550,- 300 + 350,- 550 + 650,- 300
+         + 300,- 650 + 550,- 300 + 350,- 550 + 650,- 300
+         + 600,- 300 + 350,- 550 + 300,- 600 + 650,- 350
+         + 300,- 600 + 250,- 600 + 350,- 600 + 600,- 300
+         + 650,- 300 + 600,- 250 + 600,- 300 + 350,- 600
+         + 300,- 650 + 600,- 300 + 650,- 250 + 350,- 550
+         + 550,- 350 + 300,- 650 + 600,- 300 + 300,- 600
+         + 300,- 600 + 350,- 600 + 650,- 250 + 350,- 550
+         + 650,- 300 + 650,- 250 + 300,- 600 + 350,- 550
+         + 350,- 600 + 650,- 250 + 350,- 550 + 350,- 550
+         + 650
+         Duration=49100us
+         */
         Serial.println(F("Send 52 bit PulseDistanceWidth 0xDCBA9 87654321 LSB first 1=300|600, 0=600|300"));
         Serial.flush();
         // Real PulseDistanceWidth (constant bit length) does theoretically not require a stop bit, but we know the stop bit from serial transmission
@@ -680,7 +794,8 @@ void loop() {
         delay(DELAY_AFTER_SEND);
 
         Serial.println(
-                F("Send 52 bit PulseDistanceWidth 0xDCBA9 87654321 LSB first with inverse timing and data 1=600|300, 0=300|600"));
+                F(
+                        "Send the same 52 bit PulseDistanceWidth but with inverse of 0xDCBA9 87654321 and with inverse timing 1=600|300, 0=300|600"));
         Serial.flush();
 #      if __INT_WIDTH__ < 32
         tRawData[2] = ~tRawData[0];
@@ -741,7 +856,7 @@ void loop() {
         Serial.println(F("Send MagiQuest 0x6BCDFF00, 0x176 as 55 bit PulseDistanceWidth MSB first 1=576|576, 0=287|864"));
         Serial.flush();
 #    if __INT_WIDTH__ < 32
-        IRRawDataType tRawData1[2];
+        IRDecodedRawDataType tRawData1[2];
         tRawData1[0] = 0x01AF37FC; // We have 1 header (start) bit and 7 start bits and 31 address bits for MagiQuest, so 0x6BCDFF00 is shifted 2 left
         tRawData1[1] = 0x017619; // We send only 23 bits here! 0x19 is the checksum
         IrSender.sendPulseDistanceWidthFromArray(38, 287, 864, 576, 576, 287, 864, &tRawData1[0], 55,
@@ -764,6 +879,23 @@ void loop() {
         delay(DELAY_AFTER_SEND);
 #  endif // defined(DECODE_MAGIQUEST)
     } // end of once at first loop
+
+#  if defined(DECODE_NEC)
+    Serial.println(F("Send NEC with TinyIRSender"));
+    Serial.flush();
+    sendNEC(IR_SEND_PIN, (uint8_t) sAddress, sCommand, sRepeats); // Casting saves 18 bytes
+    checkReceive(sAddress & 0xFF, sCommand);
+    delay(DELAY_AFTER_SEND);
+#  endif
+
+#  if defined(DECODE_FAST)
+    Serial.println(F("Send FAST with TinyIRSender"));
+    Serial.flush();
+    sendFAST(IR_SEND_PIN, sCommand, sRepeats);
+    checkReceive(0, sCommand);
+    delay(DELAY_AFTER_SEND);
+#  endif
+
 #endif // if FLASHEND >= 0x7FFF
 
 #if defined(DECODE_NEC)
@@ -780,17 +912,19 @@ void loop() {
     delay(DELAY_AFTER_SEND);
 #endif
 
-#if defined(DECODE_PANASONIC) || defined(DECODE_KASEIKYO)
+#if defined(DECODE_KASEIKYO)
     Serial.println(F("Send Panasonic"));
     Serial.flush();
     IrSender.sendPanasonic(sAddress & 0xFFF, sCommand, sRepeats);
     checkReceive(sAddress & 0xFFF, sCommand);
     delay(DELAY_AFTER_SEND);
 
-    Serial.println(F("Send Kaseikyo with 0x4711 as Vendor ID"));
+    Serial.println(F("Send Kaseikyo with extra=0x4711 as Vendor ID"));
     Serial.flush();
     IrSender.sendKaseikyo(sAddress & 0xFFF, sCommand, sRepeats, 0x4711);
-    checkReceive(sAddress & 0xFFF, sCommand);
+    if (checkReceive(sAddress & 0xFFF, sCommand)) {
+        checkReceivedExtra(0x4711);
+    }
     delay(DELAY_AFTER_SEND);
 
     Serial.println(F("Send Kaseikyo_Denon variant"));
@@ -801,13 +935,13 @@ void loop() {
 #endif
 
 #if defined(DECODE_DENON)
-    Serial.println(F("Send Denon with repeats"));
+    Serial.println(F("Send Denon with 2 autorepeats after 45 ms")); // Only first frame is received!
     Serial.flush();
     IrSender.sendDenon(sAddress & 0x1F, sCommand, sRepeats);
     checkReceive(sAddress & 0x1F, sCommand);
     delay(DELAY_AFTER_SEND);
 
-    Serial.println(F("Send Denon/Sharp variant with repeats"));
+    Serial.println(F("Send Denon/Sharp variant with 2 autorepeats after 45 ms"));
     Serial.flush();
     IrSender.sendSharp(sAddress & 0x1F, sCommand, sRepeats);
     checkReceive(sAddress & 0x1F, sCommand);
@@ -827,9 +961,16 @@ void loop() {
     checkReceive(sAddress & 0xFF, sCommand & 0x7F);
     delay(DELAY_AFTER_SEND);
 
+#  if defined(DECODE_BEO)
+    // BEO sets RECORD_GAP_MICROS 16000 which leads to concatenating the Sony repeats
+    Serial.println(F("Send Sony/SIRCS with 7 command and 13 address bits and no repeats"));
+    Serial.flush();
+    IrSender.sendSony(sAddress & 0x1FFF, sCommand, 0, SIRCS_20_PROTOCOL);
+#  else
     Serial.println(F("Send Sony/SIRCS with 7 command and 13 address bits"));
     Serial.flush();
     IrSender.sendSony(sAddress & 0x1FFF, sCommand, sRepeats, SIRCS_20_PROTOCOL);
+#  endif
     checkReceive(sAddress & 0x1FFF, sCommand & 0x7F);
     delay(DELAY_AFTER_SEND);
 #endif
@@ -839,6 +980,12 @@ void loop() {
     Serial.flush();
     IrSender.sendSamsung(sAddress & 0xFF, sCommand, sRepeats);
     checkReceive(sAddress & 0xFF, sCommand);
+    delay(DELAY_AFTER_SEND);
+
+    Serial.println(F("Send Samsung 8 bit command and 16 bit address"));
+    Serial.flush();
+    IrSender.sendSamsung16BitAddressAnd8BitCommand(sAddress, sCommand, sRepeats);
+    checkReceive(sAddress, sCommand);
     delay(DELAY_AFTER_SEND);
 
     Serial.println(F("Send Samsung 16 bit command and address"));
@@ -852,6 +999,10 @@ void loop() {
     IrSender.sendSamsung48(sAddress, s16BitCommand, sRepeats);
     checkReceive(sAddress, s16BitCommand);
     delay(DELAY_AFTER_SEND);
+#endif
+
+#if defined(DECODE_RC5) || defined(DECODE_MARANTZ) || defined(DECODE_RC6)
+    IrSender.setNextToggleBitValueForRC5AndRC6(sCommand); // To modify start value of toggling for each loop. Only LSB is taken :-).
 #endif
 
 #if defined(DECODE_RC5)
@@ -868,19 +1019,40 @@ void loop() {
     delay(DELAY_AFTER_SEND);
 #endif
 
+#if defined(DECODE_MARANTZ)
+    Serial.print(F("Send Marantz with RC5 and extra=0x"));
+    Serial.println(~sCommand & 0x3F, HEX);
+    Serial.flush();
+    IrSender.sendRC5Marantz(sAddress & 0x1F, sCommand & 0x3F, sRepeats, ~sCommand & 0x3F, true);  // 5 address, 6 command bits
+    if (checkReceive(sAddress & 0x1F, sCommand & 0x3F)) {
+        checkReceivedExtra(~sCommand & 0x3F);
+    }
+    delay(DELAY_AFTER_SEND);
+
+    Serial.print(F("Send Marantz with RC5A and extra=0x"));
+    Serial.println(~sCommand & 0x3F, HEX);
+    Serial.flush();
+    IrSender.sendRC5Marantz(sAddress & 0x1F, (sCommand & 0x3F) + 0x40, sRepeats, ~sCommand & 0x3F, true); // 5 address, 7 command bits
+    if (checkReceive(sAddress & 0x1F, (sCommand & 0x3F) + 0x40)) {
+        checkReceivedExtra(~sCommand & 0x3F);
+    }
+    delay(DELAY_AFTER_SEND);
+#endif
+
 #if defined(DECODE_RC6)
     Serial.println(F("Send RC6"));
     Serial.flush();
-    sLastSendToggleValue = sAddress & 0x01; // to modify toggling at each loop
 
     IrSender.sendRC6(sAddress & 0xFF, sCommand, sRepeats, true);
     checkReceive(sAddress & 0xFF, sCommand);
     delay(DELAY_AFTER_SEND);
 
-    Serial.println(F("Send RC6A with 14 bit 0x2711 as extra"));
+    Serial.println(F("Send RC6A with 14 bit and extra=0x2711"));
     Serial.flush();
     IrSender.sendRC6A(sAddress & 0xFF, sCommand, sRepeats, 0x2711, true);
-    checkReceive(sAddress & 0xFF, sCommand);
+    if (checkReceive(sAddress & 0xFF, sCommand)) {
+        checkReceivedExtra(0x2711);
+    }
     delay(DELAY_AFTER_SEND);
 #endif
 
@@ -890,7 +1062,18 @@ void loop() {
     Serial.println(tWandId, HEX);
     Serial.flush();
     IrSender.sendMagiQuest(tWandId, s16BitCommand); // we have 31 bit address
-    checkReceive(sAddress, s16BitCommand & 0x1FF); // we have 9 bit command
+    if (checkReceive(sAddress, s16BitCommand & 0x1FF)) { // we have 9 bit command
+        checkReceivedExtra(0x6BCD);
+    }
+    delay(DELAY_AFTER_SEND);
+#endif
+
+#if defined(DECODE_OPENLASIR)
+    Serial.println(F("Send OpenLASIR mode fire and color orange, detected as ONKYO"));
+    Serial.flush();
+    IrSender.sendOpenLASIR(sAddress & 0xFF, sCommand, OPENLASIR_MODE_LASER_TAG_FIRE, OPENLASIR_COLOR_ORANGE, sRepeats);
+    checkReceive(sAddress & 0xFF,
+            IrSender.computeOpenLASIRRawCommand(sCommand, OPENLASIR_MODE_LASER_TAG_FIRE, OPENLASIR_COLOR_ORANGE));
     delay(DELAY_AFTER_SEND);
 #endif
 
@@ -903,9 +1086,9 @@ void loop() {
 #endif
 
 #if defined(DECODE_BEO)
-    Serial.println(F("Send Bang&Olufsen / originally with 455 kHz"));
+    Serial.println(F("Send 16 bit Bang&Olufsen - requires originally 455 kHz"));
     Serial.flush();
-    IrSender.sendBangOlufsen(sAddress & 0x0FF, sCommand, sRepeats);
+    IrSender.sendBangOlufsen(sAddress, sCommand, sRepeats, 8); // send 8 bit command and 8 bit address / header
 #  if defined(ENABLE_BEO_WITHOUT_FRAME_GAP)
     delay((RECORD_GAP_MICROS / 1000) + 1);
     Serial.println(F("- ENABLE_BEO_WITHOUT_FRAME_GAP is enabled"));
@@ -920,19 +1103,21 @@ void loop() {
     IrReceiver.decode();
     IrReceiver.printIRResultShort(&Serial); // -> Protocol=Bang&Olufsen Address=0x0 Command=0x0 Raw-Data=0x0 0 bits MSB first
 
-    // Remove trailing 6 entries for second decode try
-    Serial.println();
-    Serial.println(
-            F(
-                    "- Remove trailing 6 entries, which is equivalent to define RECORD_GAP_MICROS < 15000, to enable successful B&O decode"));
-    IrReceiver.decodedIRData.rawlen = tOriginalRawlen - 6;
-    IrReceiver.irparams.rawlen = tOriginalRawlen - 6;
-    for (uint_fast8_t i = 0; i < IrReceiver.decodedIRData.rawlen; ++i) {
-        IrReceiver.irparams.rawbuf[i] = IrReceiver.irparams.rawbuf[i + 6];
+    if (tOriginalRawlen > 30) {
+        // Remove trailing 6 entries for second decode try
+        Serial.println();
+        Serial.println(
+                F(
+                        "- Remove trailing 6 entries, which is equivalent to define RECORD_GAP_MICROS < 15000, to enable successful B&O decode"));
+        IrReceiver.decodedIRData.rawlen = tOriginalRawlen - 6;
+        IrReceiver.irparams.rawlen = tOriginalRawlen - 6;
+        for (uint_fast8_t i = 0; i < IrReceiver.decodedIRData.rawlen; ++i) {
+            IrReceiver.irparams.rawbuf[i] = IrReceiver.irparams.rawbuf[i + 6];
+        }
+        IrReceiver.decodedIRData.initialGapTicks = IrReceiver.irparams.rawbuf[0];
+        checkReceive(sAddress & 0xFF, sCommand); // only 8 bit of address is sent
     }
-    IrReceiver.decodedIRData.initialGapTicks = IrReceiver.irparams.rawbuf[0];
 #  endif
-    checkReceive(sAddress & 0x0FF, sCommand);
     delay(DELAY_AFTER_SEND);
 #endif
 
@@ -1002,7 +1187,9 @@ void loop() {
         IrSender.mark(210);         // 8 pulses at 38 kHz
         IrSender.space(540);        // to fill up to 750 us
     }
-    checkReceive(sAddress, sCommand);
+    waitForReceived();
+    IrReceiver.printIRResultRawFormatted(&Serial, true);
+    IrReceiver.resume();
     delay(DELAY_AFTER_SEND);
 
     /*
@@ -1017,6 +1204,9 @@ void loop() {
     if (sRepeats > 4) {
         sRepeats = 4;
     }
+
+    Serial.println(F("Invert toggle value for next loop"));
+    sLastSendToggleValue = !sLastSendToggleValue;
 
     /*
      * Test stop and start of 50 us receiver timer

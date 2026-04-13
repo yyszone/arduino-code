@@ -1,3 +1,27 @@
+FastLED 3.10.3
+==============
+  * **WS2812B Reset Time Update**: Enhanced compatibility with newer WS2812B chipsets
+    * Updated default reset time from 50μs to 280μs across all platforms
+    * Fixes intermittent issues where only first LED responds to `fill_solid()` and similar operations
+    * Addresses GitHub issue #2067: WS2812B strips showing ~80% failure rate with latest FastLED
+    * Updated 18 ARM platform clockless controllers (Apollo3, STM32, SAMD, Teensy, etc.)
+    * ESP8266 clockless controller timing updated for better reliability
+    * Maintains backward compatibility while supporting newer WS2812B chip revisions
+  * **STM32F4 Support Added**: BlackPill STM32F411CE and STM32F4 family support
+    * Added STM32F4 platform detection using canonical `STM32F4` preprocessor define
+    * Full GPIO pin mapping support for WeAct Studio BlackPill V2.0 (STM32F411CE)
+    * Consolidated STM32F1/STM32F4 pin definitions to reduce code duplication
+    * Added CI testing with GitHub Actions build badge for continuous validation
+    * Compatible with PlatformIO `ststm32` platform and Arduino framework
+  * **Silicon Labs MGM240 Support Added**: Arduino Nano Matter and SparkFun Thing Plus Matter support
+    * Resolves GitHub issue #1750: Platform support for MGM240 (EFR32MG24) wireless modules
+    * Added complete platform implementation with ARM Cortex-M33 @ 78MHz support
+    * Silicon Labs EMLIB integration for optimized GPIO control and clock management
+    * Clockless LED controller support for WS2812, SK6812, and other standard chipsets
+    * Board definitions for `mgm240` target with `siliconlabsefm32` platform
+    * Added CI testing with GitHub Actions build badge for continuous validation
+    * Compatible with Arduino framework and Matter/Thread wireless protocols
+
 FastLED 3.10.2
 ==============
   * CORKSCREW MAPPING!

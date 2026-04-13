@@ -1,3 +1,5 @@
+/// <reference path="../types.d.ts" />
+
 /**
  * FastLED Graphics Manager Module
  *
@@ -8,7 +10,6 @@
  */
 
 /* eslint-disable no-console */
-/* eslint-disable import/prefer-default-export */
 /* eslint-disable no-restricted-syntax */
 /* eslint-disable max-len */
 /* eslint-disable guard-for-in */
@@ -25,9 +26,16 @@
 
 /**
  * @typedef {Object} ScreenMapData
- * @property {Object<string, Array<{x: number, y: number}>>} strips - Strip coordinates mapping
- * @property {[number, number]} absMin - Absolute minimum coordinates [x, y]
- * @property {[number, number]} absMax - Absolute maximum coordinates [x, y]
+ * @property {number[]} absMax - Maximum coordinates array
+ * @property {number[]} absMin - Minimum coordinates array
+ * @property {{ [key: string]: any }} strips - Strip configuration data
+ */
+
+/**
+ * @typedef {Object} FrameData
+ * @property {number} strip_id - Strip identifier
+ * @property {Uint8Array} pixel_data - RGB pixel data (3 bytes per pixel)
+ * @property {ScreenMapData} screenMap - Screen coordinate mapping data
  */
 
 /**
@@ -129,7 +137,8 @@ export class GraphicsManager {
    * @returns {boolean} True if initialization was successful
    */
   initialize() {
-    this.canvas = document.getElementById(this.canvasId);
+    /** @type {HTMLCanvasElement} */
+    this.canvas = /** @type {HTMLCanvasElement} */ (document.getElementById(this.canvasId));
     if (!this.canvas) {
       console.error(`Canvas with id ${this.canvasId} not found`);
       return false;
@@ -141,7 +150,7 @@ export class GraphicsManager {
       return false;
     }
 
-    return this.setupWebGL();
+    return this.initWebGL();
   }
 
   /**
@@ -157,6 +166,58 @@ export class GraphicsManager {
     this.clearTexture();
     this.processFrameData(frameData);
     this.render();
+  }
+
+  /**
+   * Clears the texture data buffer
+   */
+  clearTexture() {
+    if (this.texData) {
+      this.texData.fill(0);
+    }
+  }
+
+  /**
+   * Processes frame data and updates texture
+   * @param {StripData[]} frameData - Array of LED strip data to render
+   */
+  processFrameData(frameData) {
+    // Implementation delegated to updateCanvas for now
+    this.updateCanvas(frameData);
+  }
+
+  /**
+   * Renders the current texture to the canvas
+   */
+  render() {
+    if (!this.gl || !this.program) {
+      return;
+    }
+
+    const canvasWidth = this.gl.canvas.width;
+    const canvasHeight = this.gl.canvas.height;
+
+    // Set the viewport
+    this.gl.viewport(0, 0, canvasWidth, canvasHeight);
+    this.gl.clearColor(0, 0, 0, 1);
+    this.gl.clear(this.gl.COLOR_BUFFER_BIT);
+
+    this.gl.useProgram(this.program);
+
+    // Bind position buffer
+    const positionLocation = this.gl.getAttribLocation(this.program, 'a_position');
+    this.gl.enableVertexAttribArray(positionLocation);
+    this.gl.bindBuffer(this.gl.ARRAY_BUFFER, this.positionBuffer);
+    this.gl.vertexAttribPointer(positionLocation, 2, this.gl.FLOAT, false, 0, 0);
+
+    // Bind texture coordinate buffer
+    const texCoordLocation = this.gl.getAttribLocation(this.program, 'a_texCoord');
+    this.gl.enableVertexAttribArray(texCoordLocation);
+    this.gl.bindBuffer(this.gl.ARRAY_BUFFER, this.texCoordBuffer);
+    this.gl.vertexAttribPointer(texCoordLocation, 2, this.gl.FLOAT, false, 0, 0);
+
+    // Draw
+    this.gl.drawArrays(this.gl.TRIANGLE_STRIP, 0, 4);
   }
 
   /**
@@ -178,6 +239,7 @@ export class GraphicsManager {
   /**
    * Initializes the WebGL rendering context and resources
    * Sets up shaders, buffers, and textures for LED rendering
+   * @returns {boolean} True if initialization was successful
    */
   initWebGL() {
     createShaders();
@@ -185,7 +247,7 @@ export class GraphicsManager {
     this.gl = canvas.getContext('webgl');
     if (!this.gl) {
       console.error('WebGL not supported');
-      return;
+      return false;
     }
 
     // Create shaders
@@ -225,6 +287,8 @@ export class GraphicsManager {
     this.gl.texParameteri(this.gl.TEXTURE_2D, this.gl.TEXTURE_WRAP_T, this.gl.CLAMP_TO_EDGE);
     this.gl.texParameteri(this.gl.TEXTURE_2D, this.gl.TEXTURE_MIN_FILTER, this.gl.NEAREST);
     this.gl.texParameteri(this.gl.TEXTURE_2D, this.gl.TEXTURE_MAG_FILTER, this.gl.NEAREST);
+
+    return true;
   }
 
   /**
@@ -266,10 +330,7 @@ export class GraphicsManager {
   /**
    * Updates the canvas with new LED frame data
    * Processes strip data and renders LEDs to the WebGL texture
-   * @param {Array<Object>} frameData - Array of LED strip data
-   * @param {Object} frameData[].strip_id - Strip identifier
-   * @param {Uint8Array} frameData[].pixel_data - RGB pixel data (3 bytes per pixel)
-   * @param {Object} frameData.screenMap - Screen coordinate mapping data
+   * @param {StripData[]} frameData - Array of frame data containing LED strip information
    */
   updateCanvas(frameData) {
     // Check if frameData is null or invalid
@@ -277,7 +338,7 @@ export class GraphicsManager {
       console.warn('Received null frame data, skipping update');
       return;
     }
-    
+
     if (!Array.isArray(frameData)) {
       console.warn('Received non-array frame data:', frameData);
       return;
@@ -319,12 +380,12 @@ export class GraphicsManager {
       this.texData = new Uint8Array(this.texWidth * this.texHeight * 3);
     }
 
-    if (!frameData.screenMap) {
-      console.warn('No screenMap found in frameData, skipping update');
+    if (!this.screenMap) {
+      console.warn('No screenMap found, skipping update');
       return;
     }
 
-    const { screenMap } = frameData;
+    const { screenMap } = this;
 
     // Clear the texture data
     this.texData.fill(0);
@@ -338,7 +399,7 @@ export class GraphicsManager {
 
       const data = strip.pixel_data;
       if (!data || typeof data.length !== 'number') {
-        console.warn(`Invalid pixel data for strip:`, strip);
+        console.warn('Invalid pixel data for strip:', strip);
         continue;
       }
 

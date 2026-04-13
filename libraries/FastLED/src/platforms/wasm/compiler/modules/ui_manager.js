@@ -26,13 +26,23 @@
  */
 
 /* eslint-disable no-console */
-/* eslint-disable import/prefer-default-export */
 /* eslint-disable no-restricted-syntax */
+
+/**
+ * @typedef {Object} GroupInfo
+ * @property {HTMLDivElement} container - The main container element
+ * @property {HTMLDivElement} content - The content container element
+ * @property {string} name - The group name
+ * @property {boolean} isWide - Whether the group is wide
+ * @property {boolean} isFullWidth - Whether the group is full width
+ * @property {HTMLElement} parentContainer - The parent container element
+ */
 /* eslint-disable max-len */
 /* eslint-disable guard-for-in */
 
 import { AudioManager } from './audio_manager.js';
 import { UILayoutPlacementManager } from './ui_layout_placement_manager.js';
+import { UIRecorder } from './ui_recorder.js';
 
 /** Global instance of AudioManager for audio processing */
 const audioManager = new AudioManager();
@@ -84,12 +94,11 @@ function markdownToHtml(markdown) {
   // Wrap consecutive <li> elements properly
   html = html.replace(
     /(<li(?:\s+class="ordered")?>.*?<\/li>(?:\s*<li(?:\s+class="ordered")?>.*?<\/li>)*)/gs,
-    function (match) {
+    (match) => {
       if (match.includes('class="ordered"')) {
-        return '<ol>' + match.replace(/\s+class="ordered"/g, '') + '</ol>';
-      } else {
-        return '<ul>' + match + '</ul>';
+        return `<ol>${match.replace(/\s+class="ordered"/g, '')}</ol>`;
       }
+      return `<ul>${match}</ul>`;
     },
   );
 
@@ -98,10 +107,10 @@ function markdownToHtml(markdown) {
   html = paragraphs.map((p) => {
     const trimmed = p.trim();
     if (
-      trimmed && !trimmed.startsWith('<h') && !trimmed.startsWith('<ul') &&
-      !trimmed.startsWith('<ol') && !trimmed.startsWith('<pre')
+      trimmed && !trimmed.startsWith('<h') && !trimmed.startsWith('<ul')
+      && !trimmed.startsWith('<ol') && !trimmed.startsWith('<pre')
     ) {
-      return '<p>' + trimmed.replace(/\n/g, '<br>') + '</p>';
+      return `<p>${trimmed.replace(/\n/g, '<br>')}</p>`;
     }
     return trimmed;
   }).join('\n');
@@ -120,20 +129,20 @@ function groupAdjacentNumberFields(elements) {
 
   while (i < elements.length) {
     const current = elements[i];
-    
+
     // Check if current element is a number field and the next one is also a number field
     if (current.type === 'number' && i + 1 < elements.length && elements[i + 1].type === 'number') {
       const next = elements[i + 1];
-      
+
       // Create a paired element that will be handled specially
       result.push({
         type: 'number-pair',
         leftElement: current,
         rightElement: next,
         id: `pair-${current.id}-${next.id}`,
-        group: current.group // Use the group from the first element
+        group: current.group, // Use the group from the first element
       });
-      
+
       i += 2; // Skip both elements since we've paired them
     } else {
       // Add single element as-is
@@ -179,7 +188,7 @@ function createNumberFieldPair(leftElement, rightElement) {
   leftField.style.flex = '1';
   leftField.style.maxWidth = 'calc(50% - 10px)';
 
-  // Create right number field  
+  // Create right number field
   const rightField = createSingleNumberField(rightElement);
   rightField.style.flex = '1';
   rightField.style.maxWidth = 'calc(50% - 10px)';
@@ -188,10 +197,12 @@ function createNumberFieldPair(leftElement, rightElement) {
   pairContainer.appendChild(rightField);
 
   // Store reference to both elements for later registration
-  pairContainer._leftElement = leftElement;
-  pairContainer._rightElement = rightElement;
-  pairContainer._leftControl = leftField;
-  pairContainer._rightControl = rightField;
+  /** @type {HTMLDivElement & {_leftElement?: any, _rightElement?: any, _leftControl?: any, _rightControl?: any}} */
+  const containerWithProps = /** @type {any} */ (pairContainer);
+  containerWithProps._leftElement = leftElement;
+  containerWithProps._rightElement = rightElement;
+  containerWithProps._leftControl = leftField;
+  containerWithProps._rightControl = rightField;
 
   return pairContainer;
 }
@@ -266,13 +277,13 @@ function createSlider(element) {
   const slider = document.createElement('input');
   slider.type = 'range';
   slider.id = `slider-${element.id}`;
-  slider.min = Number.parseFloat(element.min);
-  slider.max = Number.parseFloat(element.max);
-  slider.value = Number.parseFloat(element.value);
-  
+  slider.setAttribute('min', String(Number.parseFloat(String(element.min))));
+  slider.setAttribute('max', String(Number.parseFloat(String(element.max))));
+  slider.setAttribute('value', String(Number.parseFloat(String(element.value))));
+
   // Check if element.step exists and is not undefined/null
   if (element.step !== undefined && element.step !== null) {
-    slider.step = Number.parseFloat(element.step);
+    slider.setAttribute('step', String(Number.parseFloat(String(element.step))));
   } else {
     // Set a default step
     slider.step = 'any';
@@ -288,14 +299,14 @@ function createSlider(element) {
 
   const valueDisplay = document.createElement('span');
   valueDisplay.className = 'slider-value';
-  valueDisplay.textContent = element.value;
+  valueDisplay.textContent = String(element.value);
 
   overlayDiv.appendChild(labelText);
   overlayDiv.appendChild(valueDisplay);
 
   // Set initial value in next frame to ensure proper initialization
   setTimeout(() => {
-    slider.value = Number.parseFloat(element.value);
+    slider.setAttribute('value', String(Number.parseFloat(String(element.value))));
     valueDisplay.textContent = slider.value;
   }, 0);
 
@@ -411,14 +422,6 @@ function createDropdown(element) {
   return controlDiv;
 }
 
-function createUiControlsContainer() {
-  const container = document.getElementById(this.uiControlsId);
-  if (!container) {
-    console.error('UI controls container not found in the HTML');
-  }
-  return container;
-}
-
 function setTitle(titleData) {
   if (titleData && titleData.text) {
     document.title = titleData.text;
@@ -472,7 +475,7 @@ function createHelp(element) {
   // Prepare content for tooltip and popup
   const markdownContent = element.markdownContent || '';
   const tooltipText = markdownContent.length > 200
-    ? markdownContent.substring(0, 200).trim() + '...'
+    ? `${markdownContent.substring(0, 200).trim()}...`
     : markdownContent;
 
   // Convert markdown to HTML for popup
@@ -803,10 +806,10 @@ export class JsonUiManager {
     /** @type {string} HTML element ID for the second UI controls container (ultra-wide mode) */
     this.uiControls2Id = 'ui-controls-2';
 
-    /** @type {Map<string, HTMLElement>} Track created UI groups */
+    /** @type {Map<string, GroupInfo>} Track created UI groups */
     this.groups = new Map();
 
-    /** @type {Map<string, HTMLElement>} Track created UI groups in second container */
+    /** @type {Map<string, GroupInfo>} Track created UI groups in second container */
     this.groups2 = new Map();
 
     /** @type {HTMLElement|null} Container for ungrouped UI items */
@@ -821,23 +824,47 @@ export class JsonUiManager {
     /** @type {number} Counter to track UI element distribution in ultra-wide mode */
     this.elementDistributionIndex = 0;
 
+    /** @type {Object} Configuration for container spillover thresholds */
+    this.spilloverConfig = {
+      // For tablet/desktop (2-container layouts): need at least 4 groups or 8 total elements
+      twoContainer: {
+        minGroups: 4, // At least 4 groups before using second container
+        minElements: 8, // At least 8 total elements before using second container
+        minElementsPerGroup: 2, // Average elements per group threshold
+      },
+      // For ultrawide (3-container layouts): need at least 6 groups or 12 total elements
+      threeContainer: {
+        minGroups: 6, // At least 6 groups before using all three areas
+        minElements: 12, // At least 12 total elements before using all three areas
+        minElementsPerGroup: 2, // Average elements per group threshold
+      },
+    };
+
+    /** @type {Array|null} Stored JSON data for rebuilding UI on layout changes */
+    this.lastJsonData = null;
+
+    /** @type {string|null} Current layout mode for tracking transitions */
+    this.currentLayout = null;
+
     // Initialize the UI Layout Placement Manager
     /** @type {UILayoutPlacementManager} Responsive layout management */
     this.layoutManager = new UILayoutPlacementManager();
 
-    // Listen for layout changes to potentially optimize UI element rendering
-    this.layoutManager.mediaQuery
-      ? this.layoutManager.mediaQuery.addEventListener('change', (e) => {
-        this.onLayoutChange(e.matches ? 'desktop' : 'portrait');
-      })
-      // Handle new breakpoint system
-      : Object.values(this.layoutManager.breakpoints).forEach((mq) => {
-        mq.addEventListener('change', () => {
-          this.onLayoutChange(this.layoutManager.currentLayout);
-        });
-      });
+    // Initialize the UI Recorder
+    /** @type {UIRecorder|null} UI recording functionality */
+    this.uiRecorder = null;
+
+    /** @type {ReturnType<typeof setTimeout>|null} Timeout for debounced element redistribution */
+    this.redistributionTimeout = null;
+
+    // Timing constants
+    this.LAYOUT_OPTIMIZATION_DELAY = 150; // ms
+
+    // REMOVED legacy media query listeners to prevent duplicate event handling
+    // The UILayoutPlacementManager now handles all layout detection and changes
 
     // Listen for custom layout events from the enhanced layout manager
+    // This is the single source of truth for layout changes
     globalThis.addEventListener('layoutChanged', (e) => {
       this.onAdvancedLayoutChange(e.detail);
     });
@@ -846,6 +873,52 @@ export class JsonUiManager {
     if (window._pendingUiDebugMode !== undefined) {
       this.setDebugMode(window._pendingUiDebugMode);
       delete window._pendingUiDebugMode;
+    }
+
+    // Apply any pending spillover configuration
+    if (window._pendingSpilloverConfig !== undefined) {
+      this.updateSpilloverConfig(window._pendingSpilloverConfig);
+      delete window._pendingSpilloverConfig;
+    }
+  }
+
+  /**
+   * Initialize the UI manager
+   * @returns {Promise<void>} Promise that resolves when initialization is complete
+   */
+  async initialize() {
+    // Initialize the layout manager if not already done
+    if (!this.layoutManager) {
+      this.layoutManager = new UILayoutPlacementManager();
+    }
+
+    // Initialize UI recorder if not already done
+    if (!this.uiRecorder) {
+      this.uiRecorder = new UIRecorder();
+    }
+
+    // Set up any additional initialization as needed
+    this.initializationComplete = true;
+  }
+
+  /**
+   * Update a slider element with a new value
+   * @param {string} name - Name/ID of the slider element
+   * @param {number} value - New value for the slider
+   */
+  updateSlider(name, value) {
+    const element = this.uiElements[name];
+    if (element && element.type === 'range') {
+      element.value = value;
+
+      // Update the value display if it exists
+      const valueDisplay = document.getElementById(`${name}_value`);
+      if (valueDisplay) {
+        valueDisplay.textContent = String(value);
+      }
+
+      // Trigger change event
+      element.dispatchEvent(new Event('input', { bubbles: true }));
     }
   }
 
@@ -856,7 +929,7 @@ export class JsonUiManager {
    */
   updateUiComponents(jsonString) {
     // console.log('*** C++→JS: Backend update received:', jsonString);
-    
+
     // Log the inbound update to the inspector
     if (window.jsonInspector) {
       window.jsonInspector.logInboundEvent(jsonString, 'C++ → JS');
@@ -871,9 +944,10 @@ export class JsonUiManager {
         const actualElementId = elementId.startsWith('id_') ? elementId.substring(3) : elementId;
 
         const element = this.uiElements[actualElementId];
-        if (element) {
+        if (element && element.parentNode) {
           // Extract value from update data
           const value = updateData.value !== undefined ? updateData.value : updateData;
+          const previousValue = this.previousUiState[actualElementId];
 
           // Update the element based on its type
           if (element.type === 'checkbox') {
@@ -900,10 +974,21 @@ export class JsonUiManager {
             element.value = value;
           }
 
+          // Record the update if recorder is active
+          if (this.uiRecorder && previousValue !== value) {
+            this.uiRecorder.recordElementUpdate(actualElementId, value, previousValue);
+          }
+
           // Update our internal state tracking
           this.previousUiState[actualElementId] = value;
           // console.log(`*** C++→JS: Updated UI element '${actualElementId}' = ${value} ***`);
         } else {
+          // Element not found or removed from DOM, clean it up
+          if (this.uiElements[actualElementId] && !this.uiElements[actualElementId].parentNode) {
+            delete this.uiElements[actualElementId];
+            delete this.previousUiState[actualElementId];
+            console.log(`*** UI Manager: Cleaned up orphaned element '${actualElementId}' ***`);
+          }
           // console.warn(`*** C++→JS: Element '${actualElementId}' not found ***`);
         }
       }
@@ -913,22 +998,48 @@ export class JsonUiManager {
   }
 
   /**
+   * Cleans up orphaned UI elements that have been removed from the DOM
+   * but are still referenced in our internal tracking
+   */
+  cleanupOrphanedElements() {
+    const orphanedIds = [];
+
+    for (const id in this.uiElements) {
+      if (!Object.prototype.hasOwnProperty.call(this.uiElements, id)) continue;
+
+      const element = this.uiElements[id];
+      if (!element || !element.parentNode) {
+        orphanedIds.push(id);
+      }
+    }
+
+    if (orphanedIds.length > 0) {
+      console.log(`*** UI Manager: Cleaning up ${orphanedIds.length} orphaned elements:`, orphanedIds);
+
+      for (const id of orphanedIds) {
+        delete this.uiElements[id];
+        delete this.previousUiState[id];
+      }
+    }
+  }
+
+  /**
    * Creates a collapsible group container for organizing UI elements
    * @param {string} groupName - Name of the group (displayed as header)
    * @param {HTMLElement} [targetContainer] - Specific container to use (optional)
-   * @returns {HTMLElement} The group container element
+   * @param {number} [totalGroups] - Total number of groups for spillover analysis
+   * @param {number} [totalElements] - Total number of elements for spillover analysis
+   * @returns {GroupInfo} The group info object
    */
-  createGroupContainer(groupName, targetContainer = null) {
-    // First check if group already exists in any container
-    if (this.groups.has(groupName)) {
-      return this.groups.get(groupName);
-    }
-    if (this.groups2.has(groupName)) {
-      return this.groups2.get(groupName);
+  createGroupContainer(groupName, targetContainer = null, totalGroups = 0, totalElements = 0) {
+    // First check if group already exists in ANY container and return it
+    const existingGroup = this.findExistingGroup(groupName);
+    if (existingGroup) {
+      return existingGroup;
     }
 
-    // Determine which container to use
-    const container = targetContainer || this.getTargetContainer();
+    // Determine which container to use - but ensure groups stay together
+    const container = targetContainer || this.getTargetContainerForGroup(groupName, totalGroups, totalElements);
     const groupsMap = this.getGroupsForContainer(container);
 
     const groupDiv = document.createElement('div');
@@ -1034,6 +1145,15 @@ export class JsonUiManager {
 
   // Clear all UI elements and groups
   clearUiElements() {
+    // Record removal of all elements if recorder is active
+    if (this.uiRecorder) {
+      for (const elementId in this.uiElements) {
+        if (Object.prototype.hasOwnProperty.call(this.uiElements, elementId)) {
+          this.uiRecorder.recordElementRemove(elementId);
+        }
+      }
+    }
+
     const uiControlsContainer = document.getElementById(this.uiControlsId);
     if (uiControlsContainer) {
       uiControlsContainer.innerHTML = '';
@@ -1071,6 +1191,14 @@ export class JsonUiManager {
     for (const id in this.uiElements) {
       if (!Object.prototype.hasOwnProperty.call(this.uiElements, id)) continue;
       const element = this.uiElements[id];
+
+      // Check if element is null or has been removed from DOM
+      if (!element || !element.parentNode) {
+        // Element has been removed, clean it up
+        delete this.uiElements[id];
+        continue;
+      }
+
       let currentValue;
       if (element.type === 'checkbox') {
         currentValue = element.checked;
@@ -1080,7 +1208,7 @@ export class JsonUiManager {
       } else if (element.type === 'number') {
         currentValue = parseFloat(element.value);
       } else if (element.tagName === 'SELECT') {
-        currentValue = parseInt(element.value);
+        currentValue = parseInt(element.value, 10);
       } else if (element.type === 'file' && element.accept === 'audio/*') {
         // Handle audio input - get all accumulated sample blocks with timestamps
         if (
@@ -1134,11 +1262,9 @@ export class JsonUiManager {
       // console.log('*** SENDING TO BACKEND:', JSON.stringify(transformedChanges));
 
       // Check if there's audio data in the changes
-      const audioKeys = Object.keys(changes).filter((key) =>
-        this.uiElements[key] &&
-        this.uiElements[key].type === 'file' &&
-        this.uiElements[key].accept === 'audio/*'
-      );
+      const audioKeys = Object.keys(changes).filter((key) => this.uiElements[key]
+        && this.uiElements[key].type === 'file'
+        && this.uiElements[key].accept === 'audio/*');
 
       // Debug logging for audio processing (only when enabled)
       if (this.debugMode && audioKeys.length > 0) {
@@ -1152,7 +1278,7 @@ export class JsonUiManager {
       if (window.jsonInspector) {
         window.jsonInspector.logOutboundEvent(transformedChanges, 'JS → C++');
       }
-      
+
       // Return the transformed format
       return transformedChanges;
     }
@@ -1162,6 +1288,9 @@ export class JsonUiManager {
 
   addUiElements(jsonData) {
     console.log('UI elements added:', jsonData);
+
+    // Store the JSON data for potential layout rebuilds
+    this.lastJsonData = JSON.parse(JSON.stringify(jsonData));
 
     // Clear existing UI elements
     this.clearUiElements();
@@ -1202,12 +1331,31 @@ export class JsonUiManager {
     // Optimize layout based on current screen size and element count
     this.optimizeLayoutForElements(groupedElements, ungroupedElements);
 
-    // Second pass: create groups and add elements with container distribution
-    // Add ungrouped elements first
+    // Second pass: create groups and add elements with smart container distribution
+    // First, analyze total content to determine if we need multiple containers
+    const totalGroups = groupedElements.size;
+    const totalElements = jsonData.length;
+    const sortedGroups = this.sortGroupsForOptimalLayout(groupedElements);
+    const groupContainerMap = new Map();
+
+    if (this.debugMode) {
+      console.log(`🎵 UI Content Analysis: ${totalGroups} groups, ${totalElements} total elements`);
+    }
+
+    // Pre-assign groups to containers to prevent splitting
+    for (const [groupName] of sortedGroups) {
+      const groupInfo = this.createGroupContainer(groupName, null, totalGroups, totalElements);
+      groupContainerMap.set(groupName, groupInfo);
+    }
+
+    // Add ungrouped elements, distributing across containers intelligently
     if (ungroupedElements.length > 0) {
+      let ungroupedIndex = 0;
       ungroupedElements.forEach((data) => {
-        const targetContainer = this.getTargetContainer();
+        // For ungrouped elements, still distribute but consider existing group balance
+        const targetContainer = this.getBalancedTargetContainer(ungroupedIndex, totalGroups, totalElements);
         const ungroupedContainer = this.getUngroupedContainer(targetContainer);
+        ungroupedIndex++;
 
         const control = this.createControlElement(data);
         if (control) {
@@ -1218,11 +1366,9 @@ export class JsonUiManager {
       });
     }
 
-    // Add grouped elements with optimized ordering and distribution
-    const sortedGroups = this.sortGroupsForOptimalLayout(groupedElements);
-
+    // Add grouped elements (groups are already created and assigned containers)
     for (const [groupName, elements] of sortedGroups) {
-      const groupInfo = this.createGroupContainer(groupName);
+      const groupInfo = groupContainerMap.get(groupName);
 
       elements.forEach((data) => {
         const control = this.createControlElement(data);
@@ -1249,6 +1395,12 @@ export class JsonUiManager {
         uiControls2Container.classList.add('active');
       }
 
+      // CRITICAL FIX: Force layout re-application now that UI elements are ready
+      // This ensures the layout manager detects the UI elements and doesn't hide containers
+      if (this.layoutManager) {
+        this.layoutManager.forceLayoutUpdate();
+      }
+
       // Trigger layout optimization after UI is visible
       setTimeout(() => {
         this.optimizeCurrentLayout();
@@ -1271,12 +1423,12 @@ export class JsonUiManager {
     // Mark elements that might benefit from wider layouts
     try {
       if (
-        data.type === 'audio' ||
-        data.type === 'slider' && data.name.toLowerCase().includes('spectrum')
+        data.type === 'audio'
+        || data.type === 'slider' && data.name.toLowerCase().includes('spectrum')
       ) {
         data._layoutHint = 'wide';
       }
-  
+
       // Mark elements that should always be full width
       if (data.type === 'help' || data.name.toLowerCase().includes('debug')) {
         data._layoutHint = 'full-width';
@@ -1284,7 +1436,6 @@ export class JsonUiManager {
     } catch (e) {
       console.log('Error adding element layout hints:', e, data);
     }
-
   }
 
   /**
@@ -1388,8 +1539,8 @@ export class JsonUiManager {
 
     // Handle ultra-wide mode with two separate containers
     if (
-      layoutInfo.mode === 'ultrawide' && uiControls2Container &&
-      uiControls2Container.children.length > 0
+      layoutInfo.mode === 'ultrawide' && uiControls2Container
+      && uiControls2Container.children.length > 0
     ) {
       // Balance between two containers
       const container1Groups = uiControlsContainer.querySelectorAll('.ui-group');
@@ -1399,11 +1550,11 @@ export class JsonUiManager {
       let height2 = 0;
 
       container1Groups.forEach((group) => {
-        height1 += group.offsetHeight;
+        height1 += /** @type {HTMLElement} */ (group).offsetHeight;
       });
 
       container2Groups.forEach((group) => {
-        height2 += group.offsetHeight;
+        height2 += /** @type {HTMLElement} */ (group).offsetHeight;
       });
 
       if (this.debugMode) {
@@ -1472,17 +1623,23 @@ export class JsonUiManager {
   registerControlElement(control, data) {
     if (data.type === 'number-pair') {
       // Register both left and right elements separately
-      const leftElement = data.leftElement;
-      const rightElement = data.rightElement;
-      
+      const { leftElement } = data;
+      const { rightElement } = data;
+
       // Find the input elements within the paired control
       const leftInput = control._leftControl.querySelector('input');
       const rightInput = control._rightControl.querySelector('input');
-      
+
       this.uiElements[leftElement.id] = leftInput;
       this.uiElements[rightElement.id] = rightInput;
       this.previousUiState[leftElement.id] = leftElement.value;
       this.previousUiState[rightElement.id] = rightElement.value;
+
+      // Record element addition if recorder is active
+      if (this.uiRecorder) {
+        this.uiRecorder.recordElementAdd(leftElement.id, leftElement);
+        this.uiRecorder.recordElementAdd(rightElement.id, rightElement);
+      }
 
       if (this.debugMode) {
         console.log(
@@ -1492,12 +1649,27 @@ export class JsonUiManager {
     } else if (data.type === 'button') {
       this.uiElements[data.id] = control.querySelector('button');
       this.previousUiState[data.id] = data.value;
+
+      // Record element addition if recorder is active
+      if (this.uiRecorder) {
+        this.uiRecorder.recordElementAdd(data.id, data);
+      }
     } else if (data.type === 'dropdown') {
       this.uiElements[data.id] = control.querySelector('select');
       this.previousUiState[data.id] = data.value;
+
+      // Record element addition if recorder is active
+      if (this.uiRecorder) {
+        this.uiRecorder.recordElementAdd(data.id, data);
+      }
     } else {
       this.uiElements[data.id] = control.querySelector('input');
       this.previousUiState[data.id] = data.value;
+
+      // Record element addition if recorder is active
+      if (this.uiRecorder) {
+        this.uiRecorder.recordElementAdd(data.id, data);
+      }
     }
 
     // Add layout classes based on element hints (only for non-paired elements)
@@ -1511,7 +1683,7 @@ export class JsonUiManager {
       if (this.debugMode && data.type !== 'number-pair') {
         console.log(
           `🎵 UI Registered element: ID '${data.id}' (${data.type}${
-            data._layoutHint ? ', ' + data._layoutHint : ''
+            data._layoutHint ? `, ${data._layoutHint}` : ''
           }) - Total: ${Object.keys(this.uiElements).length}`,
         );
       }
@@ -1527,21 +1699,169 @@ export class JsonUiManager {
     window.uiManager = this;
   }
 
-  // Handle layout changes (enhanced for new system)
+  /**
+   * Starts UI recording
+   * @param {Object} [metadata] - Optional recording metadata
+   * @returns {string|null} Recording ID or null if failed
+   */
+  startUIRecording(metadata = {}) {
+    if (!this.uiRecorder) {
+      this.uiRecorder = new UIRecorder({
+        debugMode: this.debugMode,
+        maxEvents: 50000
+      });
+    }
+
+    return this.uiRecorder.startRecording(metadata);
+  }
+
+  /**
+   * Stops UI recording and returns the recording data
+   * @returns {Object|null} Recording data or null if no recording
+   */
+  stopUIRecording() {
+    if (this.uiRecorder) {
+      return this.uiRecorder.stopRecording();
+    }
+    return null;
+  }
+
+  /**
+   * Gets the current recording status
+   * @returns {Object} Recording status
+   */
+  getUIRecordingStatus() {
+    if (this.uiRecorder) {
+      return this.uiRecorder.getStatus();
+    }
+    return { isRecording: false, eventCount: 0 };
+  }
+
+  /**
+   * Exports current recording as JSON
+   * @returns {string|null} JSON string or null
+   */
+  exportUIRecording() {
+    if (this.uiRecorder) {
+      return this.uiRecorder.exportRecording();
+    }
+    return null;
+  }
+
+  /**
+   * Clears the current recording
+   */
+  clearUIRecording() {
+    if (this.uiRecorder) {
+      this.uiRecorder.clearRecording();
+    }
+  }
+
+  /**
+   * Update spillover configuration thresholds
+   * @param {Object} newConfig - New spillover configuration
+   * @param {Object} newConfig.twoContainer - 2-container thresholds
+   * @param {Object} newConfig.threeContainer - 3-container thresholds
+   */
+  updateSpilloverConfig(newConfig) {
+    if (newConfig.twoContainer) {
+      Object.assign(this.spilloverConfig.twoContainer, newConfig.twoContainer);
+    }
+    if (newConfig.threeContainer) {
+      Object.assign(this.spilloverConfig.threeContainer, newConfig.threeContainer);
+    }
+
+    if (this.debugMode) {
+      console.log('🎵 Updated spillover configuration:', this.spilloverConfig);
+    }
+  }
+
+  /**
+   * Get current spillover configuration
+   * @returns {Object} Current spillover configuration
+   */
+  getSpilloverConfig() {
+    return JSON.parse(JSON.stringify(this.spilloverConfig));
+  }
+
+  // Handle layout changes (LEGACY - now deprecated)
+  // This method is kept for backward compatibility but should not be actively used
   onLayoutChange(layoutMode) {
     if (this.debugMode) {
-      console.log(`🎵 UI Manager: Layout changed to ${layoutMode}`);
+      console.log(`🎵 UI Manager: LEGACY layout change to ${layoutMode} (consider using onAdvancedLayoutChange instead)`);
     }
 
-    // Force layout update in case UI elements were added before layout was ready
-    if (this.layoutManager) {
-      this.layoutManager.forceLayoutUpdate();
+    // The new onAdvancedLayoutChange method handles all layout changes
+    // This method now just serves as a fallback to avoid breaking existing code
+
+    // NOTE: Do not duplicate redistribution logic here since onAdvancedLayoutChange
+    // will be called by the UILayoutPlacementManager for the same resize event
+  }
+
+  /**
+   * Redistribute UI elements from hidden containers to visible ones
+   * This fixes the bug where elements disappear when the layout changes
+   */
+  redistributeElementsIfNeeded() {
+    // Clear any pending redistribution to avoid multiple rapid calls
+    if (this.redistributionTimeout) {
+      clearTimeout(this.redistributionTimeout);
     }
 
-    // Re-optimize layout for new mode
-    setTimeout(() => {
-      this.optimizeCurrentLayout();
-    }, 100);
+    // Debounce redistribution to allow CSS transitions to complete
+    this.redistributionTimeout = setTimeout(() => {
+      this.performElementRedistribution();
+    }, 100); // Wait for CSS transitions to complete
+  }
+
+  /**
+   * Actually perform the element redistribution after debouncing
+   * @private
+   */
+  performElementRedistribution() {
+    const uiControls2Container = document.getElementById(this.uiControls2Id);
+    if (!uiControls2Container) return;
+
+    // Force a reflow to ensure CSS changes are applied
+    void uiControls2Container.offsetHeight;
+
+    // Check if the second container is hidden by CSS
+    const containerStyle = window.getComputedStyle(uiControls2Container);
+    const isSecondContainerVisible = containerStyle.display !== 'none'
+                                   && containerStyle.visibility !== 'hidden'
+                                   && containerStyle.opacity !== '0';
+
+    if (!isSecondContainerVisible && uiControls2Container.children.length > 0) {
+      if (this.debugMode) {
+        console.log(`🎵 Moving ${uiControls2Container.children.length} elements from hidden ui-controls-2 to ui-controls`);
+      }
+
+      const mainContainer = document.getElementById(this.uiControlsId);
+      if (mainContainer) {
+        // Move all children from the hidden container to the main container
+        while (uiControls2Container.children.length > 0) {
+          const element = uiControls2Container.children[0];
+          mainContainer.appendChild(element);
+        }
+
+        // Update our internal group tracking
+        this.groups2.forEach((groupInfo, groupName) => {
+          // Move group from groups2 to groups
+          this.groups.set(groupName, {
+            ...groupInfo,
+            parentContainer: mainContainer,
+          });
+        });
+        this.groups2.clear();
+
+        // Reset ungrouped container reference
+        this.ungroupedContainer2 = null;
+
+        if (this.debugMode) {
+          console.log(`🎵 Redistributed elements to main container. Groups in main: ${this.groups.size}, Groups in secondary: ${this.groups2.size}`);
+        }
+      }
+    }
   }
 
   /**
@@ -1554,18 +1874,129 @@ export class JsonUiManager {
       console.log(`🎵 UI Manager: Advanced layout change to ${layout}:`, data);
     }
 
-    // Adjust UI elements based on new layout data
-    this.adaptToLayoutData(data);
+    // Check if we need to rebuild the entire UI layout
+    const previousLayout = this.currentLayout;
+    this.currentLayout = layout;
+
+    if (this.shouldRebuildLayout(previousLayout, layout)) {
+      if (this.debugMode) {
+        console.log(`🎵 UI Manager: Rebuilding UI layout from ${previousLayout} to ${layout}`);
+      }
+      this.rebuildUIFromStoredData();
+    } else {
+      // CRITICAL FIX: Redistribute UI elements if second container becomes hidden
+      // This is now the primary method for handling layout changes
+      this.redistributeElementsIfNeeded();
+
+      // Adjust UI elements based on new layout data
+      this.adaptToLayoutData(data);
+    }
+
+    // Re-optimize layout for new mode
+    setTimeout(() => {
+      this.optimizeCurrentLayout();
+    }, this.LAYOUT_OPTIMIZATION_DELAY); // Slightly longer delay to ensure redistribution completes first
+  }
+
+  /**
+   * Determine if a full UI rebuild is needed based on layout transitions
+   * @param {string|undefined} previousLayout - Previous layout mode
+   * @param {string} newLayout - New layout mode
+   * @returns {boolean} True if a full rebuild is needed
+   */
+  shouldRebuildLayout(previousLayout, newLayout) {
+    // Always rebuild if we have stored JSON data and the layout mode changes significantly
+    if (!this.lastJsonData || !previousLayout) {
+      return false;
+    }
+
+    // Rebuild on significant layout transitions that affect column count
+    const significantTransitions = [
+      // Transitions between 1-column and multi-column layouts
+      ['mobile', 'tablet'],
+      ['mobile', 'desktop'],
+      ['mobile', 'ultrawide'],
+      ['tablet', 'mobile'],
+      ['desktop', 'mobile'],
+      ['ultrawide', 'mobile'],
+      // Transitions between 2-column and 3-column layouts
+      ['tablet', 'ultrawide'],
+      ['desktop', 'ultrawide'],
+      ['ultrawide', 'tablet'],
+      ['ultrawide', 'desktop'],
+    ];
+
+    const transition = [previousLayout, newLayout];
+    return significantTransitions.some(([from, to]) =>
+      transition[0] === from && transition[1] === to
+    );
+  }
+
+  /**
+   * Rebuild the entire UI from stored JSON data
+   * This ensures optimal layout distribution for the new screen size
+   */
+  rebuildUIFromStoredData() {
+    if (!this.lastJsonData) {
+      if (this.debugMode) {
+        console.log('🎵 UI Manager: No stored JSON data available for rebuild');
+      }
+      return;
+    }
+
+    // Preserve current element values before rebuilding
+    const currentValues = {};
+    for (const [elementId, element] of Object.entries(this.uiElements)) {
+      if (element && element.parentNode) {
+        if (element.type === 'checkbox') {
+          currentValues[elementId] = element.checked;
+        } else if (element.tagName === 'SELECT') {
+          currentValues[elementId] = element.selectedIndex;
+        } else if (element.type === 'submit') {
+          currentValues[elementId] = element.getAttribute('data-pressed') === 'true';
+        } else {
+          currentValues[elementId] = element.value;
+        }
+      }
+    }
+
+    // Rebuild UI from stored JSON
+    this.addUiElements(this.lastJsonData);
+
+    // Restore preserved values
+    for (const [elementId, value] of Object.entries(currentValues)) {
+      const element = this.uiElements[elementId];
+      if (element && element.parentNode) {
+        if (element.type === 'checkbox') {
+          element.checked = Boolean(value);
+        } else if (element.tagName === 'SELECT') {
+          element.selectedIndex = value;
+        } else if (element.type === 'submit') {
+          element.setAttribute('data-pressed', value ? 'true' : 'false');
+          if (value) {
+            element.classList.add('active');
+          } else {
+            element.classList.remove('active');
+          }
+        } else {
+          element.value = value;
+        }
+      }
+    }
+
+    if (this.debugMode) {
+      console.log('🎵 UI Manager: UI rebuilt from stored JSON data with preserved values');
+    }
   }
 
   /**
    * Adapt UI elements to new layout constraints
    */
   adaptToLayoutData(layoutData) {
-    const { uiColumns, uiColumnWidth, canExpand } = layoutData;
+    const { uiColumns } = layoutData;
 
     // Update group layouts based on available columns
-    this.groups.forEach((groupInfo, groupName) => {
+    this.groups.forEach((groupInfo) => {
       const { container } = groupInfo;
 
       // Adjust wide groups based on available columns
@@ -1594,11 +2025,55 @@ export class JsonUiManager {
     return null;
   }
 
+  /**
+   * Get a balanced target container for ungrouped elements
+   * @param {number} elementIndex - Index of the current element
+   * @param {number} totalGroups - Total number of groups
+   * @param {number} totalElements - Total number of elements
+   * @returns {HTMLElement} The target container
+   */
+  getBalancedTargetContainer(elementIndex, totalGroups = 0, totalElements = 0) {
+    const layoutInfo = this.layoutManager.getLayoutInfo();
+
+    // Check if we should even use multiple containers
+    if (!this.shouldUseMultipleContainers(layoutInfo.mode, totalGroups, totalElements)) {
+      return document.getElementById(this.uiControlsId);
+    }
+
+    if (layoutInfo.mode === 'ultrawide') {
+      const container1 = document.getElementById(this.uiControlsId);
+      const container2 = document.getElementById(this.uiControls2Id);
+
+      if (container1 && container2) {
+        // Balance based on total content (groups + ungrouped elements)
+        const container1Elements = container1.children.length;
+        const container2Elements = container2.children.length;
+
+        // Use the container with fewer total elements
+        if (container2Elements < container1Elements) {
+          return container2;
+        } if (container1Elements < container2Elements) {
+          return container1;
+        }
+        // Equal - alternate
+        return elementIndex % 2 === 0 ? container1 : container2;
+      }
+    }
+
+    return document.getElementById(this.uiControlsId);
+  }
+
   // Cleanup method to remove event listeners
   destroy() {
     if (this.layoutManager) {
       this.layoutManager.destroy();
       this.layoutManager = null;
+    }
+
+    // Clear any pending redistribution timeout
+    if (this.redistributionTimeout) {
+      clearTimeout(this.redistributionTimeout);
+      this.redistributionTimeout = null;
     }
 
     globalThis.removeEventListener('layoutChanged', this.onAdvancedLayoutChange);
@@ -1629,9 +2104,125 @@ export class JsonUiManager {
   }
 
   /**
+   * Get the appropriate UI container for a specific group, ensuring groups don't get split
+   * @param {string} groupName - Name of the group
+   * @param {number} totalGroups - Total number of groups being created
+   * @param {number} totalElements - Total number of UI elements
+   * @returns {HTMLElement} The container where the group should be placed
+   */
+  getTargetContainerForGroup(groupName, totalGroups = 0, totalElements = 0) {
+    const layoutInfo = this.layoutManager.getLayoutInfo();
+
+    // Check if this group already exists in a container
+    const existingGroup = this.findExistingGroup(groupName);
+    if (existingGroup && existingGroup.parentContainer) {
+      return existingGroup.parentContainer;
+    }
+
+    // Check if we should even use multiple containers based on content amount
+    if (!this.shouldUseMultipleContainers(layoutInfo.mode, totalGroups, totalElements)) {
+      return document.getElementById(this.uiControlsId);
+    }
+
+    if (layoutInfo.mode === 'ultrawide') {
+      // For ultra-wide, try to balance containers by group count, not individual elements
+      const container1 = document.getElementById(this.uiControlsId);
+      const container2 = document.getElementById(this.uiControls2Id);
+
+      if (container1 && container2) {
+        const groups1Count = this.groups.size;
+        const groups2Count = this.groups2.size;
+
+        // Use the container with fewer groups
+        if (groups2Count < groups1Count) {
+          return container2;
+        }
+      }
+    }
+
+    // Default to main container
+    return document.getElementById(this.uiControlsId);
+  }
+
+  /**
+   * Determine if we should use multiple containers based on content amount
+   * @param {string} layoutMode - Current layout mode
+   * @param {number} totalGroups - Total number of groups
+   * @param {number} totalElements - Total number of elements
+   * @returns {boolean} Whether to use multiple containers
+   */
+  shouldUseMultipleContainers(layoutMode, totalGroups, totalElements) {
+    if (layoutMode === 'mobile') {
+      return false; // Mobile always uses single container
+    }
+
+    // CRITICAL FIX: Check if the second UI container is actually visible
+    // This prevents the bug where elements get placed in hidden containers
+    const uiControls2Container = document.getElementById(this.uiControls2Id);
+    if (!uiControls2Container) {
+      return false; // Second container doesn't exist
+    }
+
+    // Check if the second container is hidden by CSS (e.g., in tablet mode)
+    const containerStyle = window.getComputedStyle(uiControls2Container);
+    const isSecondContainerVisible = containerStyle.display !== 'none'
+                                   && containerStyle.visibility !== 'hidden'
+                                   && containerStyle.opacity !== '0';
+
+    if (!isSecondContainerVisible) {
+      if (this.debugMode) {
+        console.log(`🎵 Second UI container is hidden by CSS in ${layoutMode} mode - using single container`);
+      }
+      return false; // Don't use multiple containers if the second one is hidden
+    }
+
+    let thresholds;
+    if (layoutMode === 'ultrawide') {
+      thresholds = this.spilloverConfig.threeContainer;
+    } else if (layoutMode === 'tablet' || layoutMode === 'desktop') {
+      thresholds = this.spilloverConfig.twoContainer;
+    } else {
+      return false;
+    }
+
+    // Check if we meet the minimum thresholds for spillover
+    const hasEnoughGroups = totalGroups >= thresholds.minGroups;
+    const hasEnoughElements = totalElements >= thresholds.minElements;
+    const hasGoodGroupDensity = totalGroups > 0 && (totalElements / totalGroups) >= thresholds.minElementsPerGroup;
+
+    const shouldSpill = hasEnoughGroups || (hasEnoughElements && hasGoodGroupDensity);
+
+    if (this.debugMode) {
+      console.log(`🎵 Spillover analysis for ${layoutMode}:`);
+      console.log(`  Groups: ${totalGroups} (need ${thresholds.minGroups})`);
+      console.log(`  Elements: ${totalElements} (need ${thresholds.minElements})`);
+      console.log(`  Density: ${totalGroups > 0 ? (totalElements / totalGroups).toFixed(1) : 0} (need ${thresholds.minElementsPerGroup})`);
+      console.log(`  Second container visible: ${isSecondContainerVisible}`);
+      console.log(`  Result: ${shouldSpill ? 'USE MULTIPLE CONTAINERS' : 'USE SINGLE CONTAINER'}`);
+    }
+
+    return shouldSpill;
+  }
+
+  /**
+   * Find an existing group across all containers
+   * @param {string} groupName - Name of the group to find
+   * @returns {GroupInfo|null} The group info object or null if not found
+   */
+  findExistingGroup(groupName) {
+    if (this.groups.has(groupName)) {
+      return this.groups.get(groupName);
+    }
+    if (this.groups2.has(groupName)) {
+      return this.groups2.get(groupName);
+    }
+    return null;
+  }
+
+  /**
    * Get the appropriate groups map based on the target container
    * @param {HTMLElement} container - The target container
-   * @returns {Map<string, HTMLElement>} The groups map for the container
+   * @returns {Map<string, GroupInfo>} The groups map for the container
    */
   getGroupsForContainer(container) {
     if (container && container.id === this.uiControls2Id) {
@@ -1685,7 +2276,7 @@ export class JsonUiManager {
   }
 }
 
-// Global debug controls for UI Manager
+// Global debug and configuration controls for UI Manager
 if (typeof window !== 'undefined') {
   window.setUiDebug = function (enabled = true) {
     // Access the global UI manager instance if available
@@ -1698,5 +2289,33 @@ if (typeof window !== 'undefined') {
       // Store the preference for when the manager is created
       window._pendingUiDebugMode = enabled;
     }
+  };
+
+  window.setUiSpilloverThresholds = function (config) {
+    if (window.uiManager && typeof window.uiManager.updateSpilloverConfig === 'function') {
+      window.uiManager.updateSpilloverConfig(config);
+    } else {
+      console.warn(
+        '🎵 UI Manager instance not found. Spillover config will be applied when manager is created.',
+      );
+      window._pendingSpilloverConfig = config;
+    }
+  };
+
+  window.getUiSpilloverThresholds = function () {
+    if (window.uiManager && typeof window.uiManager.getSpilloverConfig === 'function') {
+      return window.uiManager.getSpilloverConfig();
+    }
+    console.warn('🎵 UI Manager instance not found.');
+    return null;
+  };
+
+  // Example usage helper
+  window.setUiSpilloverExample = function () {
+    console.log('🎵 Example spillover configuration:');
+    console.log('setUiSpilloverThresholds({');
+    console.log('  twoContainer: { minGroups: 3, minElements: 6, minElementsPerGroup: 2 },');
+    console.log('  threeContainer: { minGroups: 5, minElements: 10, minElementsPerGroup: 2 }');
+    console.log('});');
   };
 }

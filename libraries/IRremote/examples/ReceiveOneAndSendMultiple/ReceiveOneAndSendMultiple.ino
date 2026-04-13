@@ -96,7 +96,7 @@
 #define DECODE_SAMSUNG
 #define ADDRESS_OF_SAMSUNG_REMOTE   0x07 // The value you see as address in printIRResultShort()
 
-#include "PinDefinitionsAndMore.h" // Define macros for input and output pin etc.
+#include "PinDefinitionsAndMore.h" // Define macros for input and output pin etc. Sets FLASHEND and RAMSIZE and evaluates value of SEND_PWM_BY_TIMER.
 #include <IRremote.hpp>
 
 void sendSamsungSmartHubMacro(bool aDoSelect);
@@ -115,7 +115,9 @@ void setup() {
     Serial.println(F("START " __FILE__ " from " __DATE__ "\r\nUsing library version " VERSION_IRREMOTE));
 
     // tone before IR setup, since it kills the IR timer settings
+#if defined(TONE_PIN)
     tone(TONE_PIN, 2200, 400);
+#endif
     digitalWrite(LED_BUILTIN, HIGH);
     delay(400);
     digitalWrite(LED_BUILTIN, LOW);
@@ -208,10 +210,12 @@ void sendSamsungSmartHubMacro(bool aDoSelect) {
         Serial.print(tWaitTimeAfterBoot / 1000);
         Serial.println(F(" seconds after boot to be ready for the command"));
 
+#if defined(TONE_PIN)
         tone(TONE_PIN, 2200, 100);
         delay(200);
         tone(TONE_PIN, 2200, 100);
         delay(100);
+#endif
 
         if (millis() < tWaitTimeAfterBoot) {
             Serial.print(F("Now do a blocking wait for "));
@@ -222,8 +226,10 @@ void sendSamsungSmartHubMacro(bool aDoSelect) {
     }
 
     // Do beep feedback for special key to be received
+#if defined(TONE_PIN)
     tone(TONE_PIN, 2200, 200);
     delay(200);
+#endif
 
 #if !defined(ESP32)
     IrReceiver.restartTimer(); // Restart IR timer.

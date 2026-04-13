@@ -46,21 +46,18 @@
  */
 #include <Arduino.h>
 
-#include "PinDefinitionsAndMore.h" // Define macros for input and output pin etc.
-#if !defined(IR_SEND_PIN)
-#define IR_SEND_PIN         3
-#endif
-
 /*
  * Specify DistanceWidthProtocol for decoding. This must be done before the #include <IRremote.hpp>
  */
 #define DECODE_DISTANCE_WIDTH // Universal decoder for pulse distance width protocols
 //
 #if !defined(RAW_BUFFER_LENGTH)
-// For air condition remotes it may require up to 750. Default is 200.
-#  if (defined(RAMEND) && RAMEND <= 0x4FF) || (defined(RAMSIZE) && RAMSIZE < 0x4FF)
+// Use more than the default values of 100 for 512 bytes RAM, 200 for 2k RAM and 750 for more than 2k RAM
+#  if RAMSIZE <= 0x400
+// Here we have 1 k RAM or less
 #define RAW_BUFFER_LENGTH  360
-#  elif (defined(RAMEND) && RAMEND <= 0x8FF) || (defined(RAMSIZE) && RAMSIZE < 0x8FF)
+#  else
+// Here we most likely have 2 k RAM or more
 #define RAW_BUFFER_LENGTH  750
 #  endif
 #endif
@@ -75,6 +72,7 @@
 
 //#define DEBUG // Activate this for lots of lovely debug output from the decoders.
 
+#include "PinDefinitionsAndMore.h" // Define macros for input and output pin etc. Sets FLASHEND and RAMSIZE and evaluates value of SEND_PWM_BY_TIMER.
 #include <IRremote.hpp>
 
 #define SEND_BUTTON_PIN                     APPLICATION_PIN
@@ -82,7 +80,7 @@
 #define DELAY_BETWEEN_REPEATS_MILLIS        70
 
 // Storage for the recorded code, pre-filled with NEC data
-IRRawDataType sDecodedRawDataArray[DECODED_RAW_DATA_ARRAY_SIZE] = { 0x7B34ED12 }; // Initialize with NEC address 0x12 and command 0x34
+IRDecodedRawDataType sDecodedRawDataArray[DECODED_RAW_DATA_ARRAY_SIZE] = { 0x7B34ED12 }; // Initialize with NEC address 0x12 and command 0x34
 DistanceWidthTimingInfoStruct sDistanceWidthTimingInfo  = { 9000, 4500, 560, 1690, 560, 560 }; // Initialize with NEC timing
 uint8_t sNumberOfBits = 32;
 
@@ -182,7 +180,12 @@ void loop() {
             if (sDecodedRawDataArray[0] != IrReceiver.decodedIRData.decodedRawDataArray[0]) {
                 *sDecodedRawDataArray = *IrReceiver.decodedIRData.decodedRawDataArray; // copy content here
                 Serial.print(F("Store new sDecodedRawDataArray[0]=0x"));
+#  if (__INT_WIDTH__ < 32)
                 Serial.println(IrReceiver.decodedIRData.decodedRawDataArray[0], HEX);
+#  else
+                PrintULL::print(&Serial, IrReceiver.decodedIRData.decodedRawDataArray[0], HEX);
+#  endif
+
             }
         }
         IrReceiver.resume(); // resume receiver

@@ -23,7 +23,6 @@
  */
 
 /* eslint-disable no-console */
-/* eslint-disable import/prefer-default-export */
 
 /**
  * @fileoverview UI Layout Placement Manager for FastLED
@@ -40,6 +39,7 @@
  * @property {number} minUIColumnWidth
  * @property {number} maxUIColumns
  * @property {number} canvasExpansionRatio
+ * @property {number} minContentRatio
  * @property {number} horizontalGap
  * @property {number} verticalGap
  */
@@ -133,6 +133,7 @@ export class UILayoutPlacementManager {
     this.handleLayoutChange = this.handleLayoutChange.bind(this);
     this.handleResize = this.handleResize.bind(this);
     this.forceLayoutUpdate = this.forceLayoutUpdate.bind(this);
+    this.handleContainerResize = this.handleContainerResize.bind(this);
 
     // Listen for breakpoint changes
     Object.values(this.breakpoints).forEach((mq) => {
@@ -141,6 +142,9 @@ export class UILayoutPlacementManager {
 
     // Listen for window resize for fine-grained adjustments
     globalThis.addEventListener('resize', this.handleResize);
+
+    // Set up ResizeObserver for container-specific resize handling
+    this.setupResizeObserver();
 
     // Add visibility change listener to re-apply layout when page becomes visible
     globalThis.addEventListener('visibilitychange', () => {
@@ -155,7 +159,106 @@ export class UILayoutPlacementManager {
     // Force layout update after a brief delay to handle any timing issues
     setTimeout(() => {
       this.forceLayoutUpdate();
+      // Re-observe containers in case they were created after initial setup
+      this.observeContainers();
     }, 100);
+  }
+
+  /**
+   * Set up ResizeObserver to monitor specific containers for size changes
+   */
+  setupResizeObserver() {
+    // Check if ResizeObserver is supported
+    if (typeof ResizeObserver === 'undefined') {
+      console.warn('ResizeObserver not supported, falling back to window resize events only');
+      return;
+    }
+
+    this.resizeObserver = new ResizeObserver((entries) => {
+      // Debounce ResizeObserver callbacks
+      clearTimeout(this.resizeObserverTimeout);
+      this.resizeObserverTimeout = setTimeout(() => {
+        this.handleContainerResize(entries);
+      }, 50);
+    });
+
+    // Observe key containers once they're available
+    this.observeContainers();
+  }
+
+  /**
+   * Start observing key layout containers
+   */
+  observeContainers() {
+    if (!this.resizeObserver) return;
+
+    const containersToObserve = [
+      'main-container',
+      'content-grid',
+      'canvas-container',
+      'ui-controls',
+      'ui-controls-2',
+    ];
+
+    // Track which containers we're already observing to avoid duplicates
+    if (!this.observedContainers) {
+      this.observedContainers = new Set();
+    }
+
+    containersToObserve.forEach((id) => {
+      const element = document.getElementById(id);
+      if (element && !this.observedContainers.has(id)) {
+        this.resizeObserver.observe(element);
+        this.observedContainers.add(id);
+        console.log(`🔍 ResizeObserver: Now observing ${id}`);
+      }
+    });
+  }
+
+  /**
+   * Handle container resize events from ResizeObserver
+   * @param {ResizeObserverEntry[]} entries - Array of resize entries
+   */
+  handleContainerResize(entries) {
+    let shouldUpdate = false;
+    const layoutInfo = this.layoutData;
+
+    for (const entry of entries) {
+      const { target, contentRect } = entry;
+      const elementId = target.id;
+
+      console.log(`🔍 Container resized: ${elementId} - ${contentRect.width}x${contentRect.height}`);
+
+      // Check if this resize affects our layout calculations
+      if (elementId === 'main-container' || elementId === 'content-grid') {
+        // Major container resize - always update
+        shouldUpdate = true;
+        break;
+      } else if (elementId === 'ui-controls' || elementId === 'ui-controls-2') {
+        // UI container resize - check if it significantly affects layout
+        const availableWidth = contentRect.width;
+        const widthDiff = Math.abs(availableWidth - (layoutInfo?.availableWidth || 0));
+
+        if (widthDiff > 20) { // 20px threshold for UI container changes
+          shouldUpdate = true;
+          break;
+        }
+      }
+    }
+
+    if (shouldUpdate) {
+      console.log('🔍 ResizeObserver triggered layout update');
+
+      // Check for layout mode changes first
+      const newLayout = this.detectLayout();
+      if (newLayout !== this.currentLayout) {
+        console.log(`🔍 ResizeObserver detected layout mode change: ${this.currentLayout} → ${newLayout}`);
+        this.currentLayout = newLayout;
+      }
+
+      this.layoutData = this.calculateLayoutData();
+      this.applyLayout();
+    }
   }
 
   /**
@@ -252,8 +355,8 @@ export class UILayoutPlacementManager {
    * @returns {LayoutResult} Updated layout data for tablet
    */
   calculateTabletLayout(layoutData) {
-    const requiredWidth = this.config.minCanvasSize + this.config.minUIColumnWidth +
-      this.config.horizontalGap;
+    const requiredWidth = this.config.minCanvasSize + this.config.minUIColumnWidth
+      + this.config.horizontalGap;
 
     if (layoutData.availableWidth >= requiredWidth) {
       // Side-by-side layout
@@ -283,8 +386,8 @@ export class UILayoutPlacementManager {
    * @returns {LayoutResult} Updated layout data for desktop
    */
   calculateDesktopLayout(layoutData) {
-    const baseRequiredWidth = this.config.minCanvasSize + this.config.minUIColumnWidth +
-      this.config.horizontalGap;
+    const baseRequiredWidth = this.config.minCanvasSize + this.config.minUIColumnWidth
+      + this.config.horizontalGap;
 
     if (layoutData.availableWidth >= baseRequiredWidth) {
       // Calculate optimal canvas size
@@ -405,11 +508,11 @@ export class UILayoutPlacementManager {
   hasAnyLayoutChange(newLayoutData) {
     const threshold = 10; // Much smaller threshold for responsive updates
     return (
-      Math.abs(newLayoutData.canvasSize - this.layoutData.canvasSize) > threshold ||
-      newLayoutData.uiColumns !== this.layoutData.uiColumns ||
-      Math.abs(newLayoutData.uiColumnWidth - this.layoutData.uiColumnWidth) > threshold ||
-      Math.abs(newLayoutData.uiTotalWidth - this.layoutData.uiTotalWidth) > threshold ||
-      newLayoutData.viewportWidth !== this.layoutData.viewportWidth
+      Math.abs(newLayoutData.canvasSize - this.layoutData.canvasSize) > threshold
+      || newLayoutData.uiColumns !== this.layoutData.uiColumns
+      || Math.abs(newLayoutData.uiColumnWidth - this.layoutData.uiColumnWidth) > threshold
+      || Math.abs(newLayoutData.uiTotalWidth - this.layoutData.uiTotalWidth) > threshold
+      || newLayoutData.viewportWidth !== this.layoutData.viewportWidth
     );
   }
 
@@ -475,6 +578,11 @@ export class UILayoutPlacementManager {
       }),
     );
 
+    // Ensure ResizeObserver is watching all containers after layout changes
+    if (this.resizeObserver) {
+      setTimeout(() => this.observeContainers(), 50);
+    }
+
     console.log(`Applied ${this.currentLayout} layout: ${this.getGridDescription()}`);
   }
 
@@ -488,145 +596,173 @@ export class UILayoutPlacementManager {
       case 'tablet':
       case 'desktop':
         return '2×N grid (landscape)';
-      case 'ultrawide':
+      case 'ultrawide': {
+        // Check if we're actually using 3 columns or fell back to 2
+        const contentGrid = document.getElementById('content-grid');
+        if (contentGrid && contentGrid.style.gridTemplateAreas) {
+          const areas = contentGrid.style.gridTemplateAreas;
+          if (areas.includes('ui2')) {
+            return '3×N grid (ultra-wide)';
+          }
+          return '2×N grid (ultra-wide fallback)';
+        }
         return '3×N grid (ultra-wide)';
+      }
       default:
         return 'unknown grid';
     }
   }
 
   /**
-   * Apply styles to main container elements
+   * Apply layout configuration via CSS custom properties and classes
+   * JS handles general layout decisions, CSS handles micro-layouts
    */
   applyContainerStyles(mainContainer, contentGrid, canvasContainer, uiControls, uiControls2) {
-    const isUltrawide = this.currentLayout === 'ultrawide';
-    const isLandscape = this.currentLayout === 'tablet' || this.currentLayout === 'desktop';
-    const isPortrait = this.currentLayout === 'mobile';
-
-    // Determine if there are any UI elements to render. If none, switch to a
-    // single-pane canvas layout and avoid grid-based presentation entirely.
+    // Determine if there are any UI elements to render
     const hasUiElements = (() => {
-      const ui1HasChildren = uiControls && uiControls.classList.contains('active') && uiControls.children.length > 0;
-      const ui2HasChildren = uiControls2 && uiControls2.classList.contains('active') && uiControls2.children.length > 0;
-      return !!(ui1HasChildren || ui2HasChildren);
+      // Check for children first (more reliable than 'active' class timing)
+      const ui1HasChildren = uiControls && uiControls.children.length > 0;
+      const ui2HasChildren = uiControls2 && uiControls2.children.length > 0;
+
+      // If containers have children, assume UI elements exist even without 'active' class
+      // This prevents race conditions where layout is applied before UI elements are fully initialized
+      if (ui1HasChildren || ui2HasChildren) {
+        return true;
+      }
+
+      // Fallback to checking active class for backward compatibility
+      const ui1IsActive = uiControls && uiControls.classList.contains('active') && ui1HasChildren;
+      const ui2IsActive = uiControls2 && uiControls2.classList.contains('active') && ui2HasChildren;
+      return Boolean(ui1IsActive || ui2IsActive);
     })();
 
-    // Main container
-    mainContainer.style.maxWidth = `${
-      Math.min(this.layoutData.availableWidth + this.config.containerPadding * 2, 2000)
-    }px`;
+    // 🎯 REFACTORED APPROACH: Set CSS custom properties instead of inline styles
+    // This allows CSS to handle micro-layouts while JS manages general layout
+    const root = document.documentElement;
 
-    // If there are no UI elements, present a simple centered canvas view and
-    // suppress grid styling to avoid reserving space for non-existent UI.
+    // Set layout data as CSS custom properties
+    root.style.setProperty('--layout-mode', this.currentLayout);
+    root.style.setProperty('--canvas-size', `${this.layoutData.canvasSize}px`);
+    root.style.setProperty('--ui-columns', `${this.layoutData.uiColumns}`);
+    root.style.setProperty('--ui-total-width', `${this.layoutData.uiTotalWidth || 280}px`);
+    root.style.setProperty('--container-max-width', `${Math.min(this.layoutData.availableWidth + this.config.containerPadding * 2, 2000)}px`);
+    root.style.setProperty('--has-ui-elements', hasUiElements ? '1' : '0');
+
+    // Apply layout mode class to main container for CSS targeting
+    mainContainer.className = mainContainer.className.replace(/layout-\w+/g, '');
+    mainContainer.classList.add(`layout-${this.currentLayout}`);
+
+    // 🎯 REFACTORED: Manage UI container visibility via classes instead of inline styles
     if (!hasUiElements) {
-      // Container: simple vertical flow centered
-      contentGrid.style.display = 'flex';
-      contentGrid.style.width = '100%';
-      contentGrid.style.flexDirection = 'column';
-      contentGrid.style.rowGap = `${this.config.verticalGap}px`;
-      contentGrid.style.justifyContent = 'flex-start';
-      contentGrid.style.alignItems = 'center';
+      // Apply no-UI mode class for CSS to handle layout
+      contentGrid.classList.add('no-ui-mode');
+      contentGrid.classList.remove('has-ui-mode');
 
-      // Clear any grid-specific properties that may have been set previously
-      contentGrid.style.gridTemplateColumns = '';
-      contentGrid.style.gridTemplateRows = '';
-      contentGrid.style.gridTemplateAreas = '';
-      contentGrid.style.gap = '';
-
-      // Ensure UI containers are hidden
+      // Ensure UI containers are hidden (only when truly no UI elements)
       if (uiControls) {
-        uiControls.style.display = 'none';
+        uiControls.classList.remove('active');
+        uiControls.classList.add('hidden');
       }
       if (uiControls2) {
-        uiControls2.style.display = 'none';
+        uiControls2.classList.remove('active');
+        uiControls2.classList.add('hidden');
       }
 
-      // Canvas container should be centered in the flex layout
-      canvasContainer.style.gridArea = '';
-      canvasContainer.style.alignSelf = 'center';
-
-      // Nothing else to do for no-UI mode
       return;
+    } else {
+      // Apply UI mode class for CSS to handle layout
+      contentGrid.classList.add('has-ui-mode');
+      contentGrid.classList.remove('no-ui-mode');
+
+      // Ensure UI containers are visible
+      if (uiControls) {
+        uiControls.classList.add('active');
+        uiControls.classList.remove('hidden');
+      }
+
+      // Handle second UI container based on layout mode
+      if (uiControls2) {
+        if (this.currentLayout === 'ultrawide' && this.shouldUseThreeColumnLayout(uiControls, uiControls2)) {
+          uiControls2.classList.add('active');
+          uiControls2.classList.remove('hidden');
+        } else {
+          uiControls2.classList.remove('active');
+          uiControls2.classList.add('hidden');
+        }
+      }
     }
 
-    // Content grid - implements 1×N, 2×N, 3×N layout when UI exists
-    contentGrid.style.display = 'grid';
-    contentGrid.style.width = '100%';
-    contentGrid.style.gap = `${this.config.verticalGap}px ${this.config.horizontalGap}px`;
-    contentGrid.style.justifyContent = 'center';
-    contentGrid.style.alignItems = 'start';
+    // 🎯 REFACTORED: CSS now handles all grid layout via custom properties and classes
+    // JS only provides the data, CSS handles the micro-layout implementation
 
-    if (isPortrait) {
-      // 1×N grid (portrait)
-      contentGrid.style.gridTemplateColumns = '1fr';
-      contentGrid.style.gridTemplateRows = 'auto auto';
-      contentGrid.style.gridTemplateAreas = '"canvas" "ui"';
+    // Set gap values as CSS custom properties
+    root.style.setProperty('--vertical-gap', `${this.config.verticalGap}px`);
+    root.style.setProperty('--horizontal-gap', `${this.config.horizontalGap}px`);
 
-      // Hide second UI container
-      if (uiControls2) {
-        uiControls2.style.display = 'none';
-      }
-    } else if (isLandscape) {
-      // 2×N grid (landscape)
-      contentGrid.style.gridTemplateColumns = `${this.layoutData.canvasSize}px minmax(280px, 1fr)`;
-      contentGrid.style.gridTemplateRows = 'auto';
-      contentGrid.style.gridTemplateAreas = '"canvas ui"';
+    // Layout-specific custom properties are already set above
+    // CSS will handle the actual grid template based on layout mode classes
+    // Add ultrawide-specific custom properties for three-column layout
+    if (this.currentLayout === 'ultrawide' && this.shouldUseThreeColumnLayout(uiControls, uiControls2)) {
+      const minUIWidth = Math.max(this.config.minUIColumnWidth, 280);
+      const maxCanvasSize = Math.min(this.config.maxCanvasSize, 800);
+      const canvasWidth = Math.min(this.layoutData.canvasSize, maxCanvasSize);
 
-      // Hide second UI container
-      if (uiControls2) {
-        uiControls2.style.display = 'none';
-      }
-    } else if (isUltrawide) {
-      // 3×N grid (ultra-wide) - Place canvas in the middle between two UI columns
-      const minUIWidth = 280; // Minimum width for UI columns
-      const canvasWidth = this.layoutData.canvasSize;
+      root.style.setProperty('--ultrawide-min-ui-width', `${minUIWidth}px`);
+      root.style.setProperty('--ultrawide-canvas-width', `${canvasWidth}px`);
+      root.style.setProperty('--use-three-columns', '1');
 
-      console.log(`🔍 Ultra-wide layout (center canvas): canvas=${canvasWidth}px, minUIWidth=${minUIWidth}px`);
-
-      // Flexible UI columns on the sides, fixed canvas in the middle
-      contentGrid.style.gridTemplateColumns =
-        `minmax(${minUIWidth}px, 1fr) ${canvasWidth}px minmax(${minUIWidth}px, 1fr)`;
-      contentGrid.style.gridTemplateRows = 'auto';
-      contentGrid.style.gridTemplateAreas = '"ui canvas ui2"';
-
-      // Show and configure second UI container
-      if (uiControls2) {
-        console.log('🔍 Showing ui-controls-2 container');
-        uiControls2.style.display = 'flex';
-        uiControls2.style.flexDirection = 'column';
-        uiControls2.style.gap = '20px'; // Use 20px gaps between elements
-        uiControls2.style.alignItems = 'stretch'; // Allow elements to expand
-        uiControls2.style.gridArea = 'ui2';
-        uiControls2.style.width = '100%';
-        uiControls2.style.minWidth = `${minUIWidth}px`;
-
-        // Force the container to be visible
-        uiControls2.style.visibility = 'visible';
-        uiControls2.style.opacity = '1';
-      } else {
-        console.warn('🔍 ui-controls-2 container not found!');
-      }
-
-      // Configure first UI container for ultra-wide
-      uiControls.style.minWidth = `${minUIWidth}px`;
-      uiControls.style.gridArea = 'ui';
-
-      console.log('🔍 Ultra-wide grid applied:', contentGrid.style.gridTemplateColumns);
+      console.log('🔍 Ultra-wide three-column layout configured');
+    } else {
+      root.style.setProperty('--use-three-columns', '0');
+      console.log(`🔍 Layout configured: ${this.currentLayout}`);
     }
 
-    // Canvas container
-    canvasContainer.style.gridArea = 'canvas';
-    canvasContainer.style.justifySelf = 'center';
+    // 🎯 REFACTORED: All container styling now handled by CSS via classes and custom properties
+    // No more inline styles - CSS takes full control of micro-layouts
 
-    // UI controls - Configure for optimal space usage
-    uiControls.style.gridArea = 'ui';
-    uiControls.style.display = 'flex';
-    uiControls.style.flexDirection = 'column';
-    uiControls.style.gap = '20px'; // Use 20px gaps between elements
-    uiControls.style.alignItems = 'stretch'; // Allow elements to expand to fill width
-    uiControls.style.width = '100%';
+    console.log(`Applied layout: ${this.getGridDescription()}`);
+  }
 
-    console.log(`Applied grid layout: ${this.getGridDescription()}`);
+  /**
+   * Determine if ultrawide layout should use 3 columns based on content amount
+   * @param {HTMLElement} uiControls - First UI container
+   * @param {HTMLElement} uiControls2 - Second UI container
+   * @returns {boolean} Whether to use 3-column layout
+   */
+  shouldUseThreeColumnLayout(uiControls, uiControls2) {
+    if (!uiControls || !uiControls2) return false;
+
+    // Count total groups and elements across both containers
+    const container1Groups = uiControls.querySelectorAll('.ui-group').length;
+    const container2Groups = uiControls2.querySelectorAll('.ui-group').length;
+    const totalGroups = container1Groups + container2Groups;
+
+    const container1Elements = uiControls.querySelectorAll('.ui-control').length;
+    const container2Elements = uiControls2.querySelectorAll('.ui-control').length;
+    const totalElements = container1Elements + container2Elements;
+
+    // Only check if second container has content
+    const hasContentInSecondContainer = container2Groups > 0 || container2Elements > 0;
+
+    // Thresholds for 3-column layout (matching UI manager thresholds)
+    const minGroupsFor3Col = 6;
+    const minElementsFor3Col = 12;
+    const minElementsPerGroup = 2;
+
+    const hasEnoughGroups = totalGroups >= minGroupsFor3Col;
+    const hasEnoughElements = totalElements >= minElementsFor3Col;
+    const hasGoodDensity = totalGroups > 0 && (totalElements / totalGroups) >= minElementsPerGroup;
+
+    const shouldUse3Col = hasContentInSecondContainer && (hasEnoughGroups || (hasEnoughElements && hasGoodDensity));
+
+    console.log('🔍 3-Column layout analysis:');
+    console.log(`  Container 1: ${container1Groups} groups, ${container1Elements} elements`);
+    console.log(`  Container 2: ${container2Groups} groups, ${container2Elements} elements`);
+    console.log(`  Total: ${totalGroups} groups, ${totalElements} elements`);
+    console.log(`  Thresholds: ${minGroupsFor3Col} groups OR ${minElementsFor3Col} elements with ${minElementsPerGroup} avg density`);
+    console.log(`  Result: ${shouldUse3Col ? 'USE 3-COLUMN' : 'USE 2-COLUMN FALLBACK'}`);
+
+    return shouldUse3Col;
   }
 
   /**
@@ -702,7 +838,17 @@ export class UILayoutPlacementManager {
   }
 
   /**
-   * Clean up event listeners
+   * Refresh ResizeObserver to watch for new containers (useful after dynamic UI changes)
+   */
+  refreshResizeObserver() {
+    if (this.resizeObserver) {
+      console.log('🔍 Refreshing ResizeObserver for new containers');
+      this.observeContainers();
+    }
+  }
+
+  /**
+   * Clean up event listeners and observers
    */
   destroy() {
     Object.values(this.breakpoints).forEach((mq) => {
@@ -710,6 +856,18 @@ export class UILayoutPlacementManager {
     });
     globalThis.removeEventListener('resize', this.handleResize);
     globalThis.removeEventListener('visibilitychange', this.forceLayoutUpdate);
+
+    // Clean up ResizeObserver
+    if (this.resizeObserver) {
+      this.resizeObserver.disconnect();
+      this.resizeObserver = null;
+    }
+
+    if (this.observedContainers) {
+      this.observedContainers.clear();
+    }
+
     clearTimeout(this.resizeTimeout);
+    clearTimeout(this.resizeObserverTimeout);
   }
 }

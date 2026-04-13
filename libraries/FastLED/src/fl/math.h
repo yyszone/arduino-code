@@ -1,26 +1,19 @@
 #pragma once
 
+#include "fl/has_include.h"
 
-#include <math.h>
-
-// Exponential function - binds to standard library exp if available
+// Include math headers with better ESP32C2 compatibility
 #ifndef FASTLED_HAS_EXP
-
-#if !defined(__has_include)
-#define FASTLED_HAS_EXP 0
+#if FL_HAS_INCLUDE(<cmath>)
+  #define FASTLED_HAS_EXP 1
+  #include <cmath>  // ok include
+#elif FL_HAS_INCLUDE(<math.h>)
+  #define FASTLED_HAS_EXP 1
+  #include <math.h>  // ok include
 #else
-#if __has_include(<cmath>)
-#define FASTLED_HAS_EXP 1
-#include <cmath>  // ok include
-#elif __has_include(<math.h>)
-#define FASTLED_HAS_EXP 1
-#include <math.h>  // ok include
-#else
-#define FASTLED_HAS_EXP 0
+  #define FASTLED_HAS_EXP 0
 #endif
-#endif // __has_include
-
-#endif // FASTLED_HAS_EXP
+#endif  // !FASTLED_HAS_EXP
 
 
 #include "fl/clamp.h"
@@ -45,7 +38,7 @@ template <typename T> inline T ceil(T value) {
 
 // Exponential function - binds to standard library exp if available
 template <typename T> inline T exp(T value) {
-#if defined(FASTLED_HAS_EXP)
+#if FASTLED_HAS_EXP
     return static_cast<T>(::exp(static_cast<double>(value)));
 #else
     // Fallback implementation using Taylor series approximation

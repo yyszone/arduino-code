@@ -1,9 +1,9 @@
 
-#include "fl/has_define.h"
+#include "fl/has_include.h"
 
 
 // Platform must be esp32.
-#if !defined(ESP32) || !__has_include("sdkconfig.h")
+#if !defined(ESP32) || !FL_HAS_INCLUDE("sdkconfig.h")
 #define IS_ESP32_DEV 0
 #else
 

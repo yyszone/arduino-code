@@ -1,5 +1,13 @@
 #pragma once
 
+#include "fl/has_include.h"
+
+
+#if FL_HAS_INCLUDE(<math.h>)
+#include <math.h>  // for early definitions of M_PI and other math macros.
+#endif // FL_HAS_INCLUDE(<math.h>)
+
+
 #include "fl/compiler_control.h"
 #include "fl/type_traits.h"
 

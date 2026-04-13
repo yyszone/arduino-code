@@ -112,10 +112,10 @@ button:hover { opacity: 0.8; }
     <div class="br-manual-block" id="brManualBlock" style="display:%BR_MANUAL_DISPLAY%">
       <label>☀️ 手动亮度 (0=关闭, 1-100):</label>
       <input type='number' name='br' id='brInput' min='0' max='100' value='%BRIGHTNESS%'>
-      <div class="sub-hint">0 = 完全关闭屏幕；1-100 = 亮度等级</div>
+      <div class="sub-hint">100 = 硬件安全最高亮度，防烧电源</div>
     </div>
     <div id="brAutoHint" style="display:%BR_AUTO_DISPLAY%; font-size:12px; color:#888; margin-top:8px; padding:8px; background:#111; border-radius:6px;">
-      🔋 自动模式：电量 0% → 最低亮度 5，电量 100% → 亮度 100<br>
+      🔋 自动模式：电量 0% → 最低亮度，电量 100% → 最高亮度<br>
       电量低于 5% 时屏幕自动关闭。
     </div>
 
@@ -196,22 +196,18 @@ private:
     }
   }
 
-  // ── 【重大优化】精准电量百分比计算（磷酸铁锂真实放电曲线） ──────────
+  // ── 精准电量百分比计算（磷酸铁锂真实放电曲线） ──────────
   int getBatteryPercent() {
     if (batteryVoltage < 0.5f) return 0; // 未连接电池
 
-    // 巧妙算法：如果是 24V(8串)，直接将读数除以 2，套用 12V(4串) 的对照表
     float v = batteryVoltage;
     if (batteryType == 1) { 
       v = v / 2.0f; 
     }
 
-    // 保护限制：极高或极低电压直接返回
-    if (v >= 13.6f) return 100; // 满电静置电压约为 13.6V (充电中为14.4V)
-    if (v <= 11.0f) return 0;   // 磷酸铁锂低于 11.0V 基本完全空载
+    if (v >= 13.6f) return 100;
+    if (v <= 11.0f) return 0;  
 
-    // 磷酸铁锂电压 -> 电量 对应表 (分段插值法)
-    // 根据 LiFePO4 特性，平台期在 13.3V ~ 12.8V 之间
     const float curve[11][2] = {
       {13.6, 100},
       {13.4, 90},
@@ -226,34 +222,37 @@ private:
       {11.0, 0}
     };
 
-    // 遍历曲线，找出当前电压落在哪个区间，进行线性插值计算
     for (int i = 0; i < 10; i++) {
       if (v <= curve[i][0] && v > curve[i+1][0]) {
         float v_high = curve[i][0];
         float p_high = curve[i][1];
         float v_low  = curve[i+1][0];
         float p_low  = curve[i+1][1];
-        
-        // 数学公式：比例插值
         float exactPct = p_low + (v - v_low) * (p_high - p_low) / (v_high - v_low);
         return (int)exactPct;
       }
     }
-    return 0; // 兜底
+    return 0;
   }
 
-  // ── 有效亮度计算（考虑自动/手动模式）────────────────────
+  // ── 【重大修复】有效亮度计算（硬隔离过流死机）────────────
   int getEffectiveBrightness() {
     int br100; 
     if (brightnessMode == 1) {
       int pct = getBatteryPercent();
-      if (pct <= 5) return 0; // 极低电量关闭屏幕
+      if (pct <= 5) return 0; 
       br100 = map(pct, 5, 100, 5, 100);
     } else {
       br100 = currentBrightness; 
     }
+    
     if (br100 <= 0) return 0;
-    return (int)map(br100, 1, 100, 4, 255);
+
+    // 【核心修复区域】：
+    // 将网页输入的 1-100% 映射到实际硬件底层的 4-120 (满值是255)。
+    // 限制硬件绝对最大值为 120，不仅足够刺眼，而且能把电流死死限制在 LM2596 的安全范围内。
+    // 防止瞬间抽光 5V 电源导致灯珠内部逻辑死机定格！
+    return (int)map(br100, 1, 100, 4, 120);
   }
 
   // ── 永久记忆存储 ──────────────────────────────────────────
@@ -379,7 +378,7 @@ private:
 
     if (effBr == 0) { 
       matrix->show(); 
-      yield(); // 防止关闭屏幕时死机
+      yield(); 
       return; 
     }
 
@@ -455,8 +454,6 @@ private:
     drawBatteryBar();
 
     matrix->show();
-
-    // 【极其重要】：刷完灯后必须交出控制权，防止看门狗(WDT)判定死机而重启设备！
     yield(); 
   }
 
@@ -499,7 +496,7 @@ public:
     matrix->setBrightness(getEffectiveBrightness());
     matrix->fillScreen(0);
     matrix->show();
-    yield(); // 喂狗
+    yield(); 
 
     configTime(8 * 3600, 0, "ntp.aliyun.com");
 
@@ -509,7 +506,6 @@ public:
 
       html.replace("%UPTIME%", formatUptime());
 
-      // 电池信息 (展示新的精确比例)
       int pct = getBatteryPercent();
       char voltBuf[8]; dtostrf(batteryVoltage, 4, 2, voltBuf);
       html.replace("%BATT_PCT%", String(pct));
@@ -517,7 +513,6 @@ public:
       String battColor = (pct > 60) ? "#00c800" : (pct > 30) ? "#c89600" : "#c80000";
       html.replace("%BATT_COLOR%", battColor);
 
-      // 自定义色
       char hexColor[8]; sprintf(hexColor, "#%02x%02x%02x", colorR, colorG, colorB);
       html.replace("%COLOR_HEX%", String(hexColor));
 
@@ -542,13 +537,11 @@ public:
       html.replace("%BT_0%", batteryType == 0 ? "selected" : "");
       html.replace("%BT_1%", batteryType == 1 ? "selected" : "");
 
-      // 亮度模式
       html.replace("%BM_0%", brightnessMode == 0 ? "selected" : "");
       html.replace("%BM_1%", brightnessMode == 1 ? "selected" : "");
       html.replace("%BR_MANUAL_DISPLAY%", brightnessMode == 0 ? "block" : "none");
       html.replace("%BR_AUTO_DISPLAY%",   brightnessMode == 1 ? "block" : "none");
 
-      // 数字彩虹色板预览
       html.replace("%PALETTE_DISPLAY%", currentTheme == 5 ? "flex" : "none");
 
       webServer->send(200, "text/html", html);
@@ -557,7 +550,6 @@ public:
     // ── POST /clock/save ────────────────────────────────────
     webServer->on("/clock/save", HTTP_POST, [this]() {
       if (webServer->hasArg("bmode")) brightnessMode  = webServer->arg("bmode").toInt();
-      // 这里接收页面传来的0-100亮度（如果你加了小风扇，这里可以放开限制；没加风扇建议在输入时悠着点）
       if (webServer->hasArg("br"))    currentBrightness = constrain(webServer->arg("br").toInt(), 0, 100);
       if (webServer->hasArg("theme")) currentTheme    = webServer->arg("theme").toInt();
       if (webServer->hasArg("mode"))  displayMode     = webServer->arg("mode").toInt();
@@ -568,13 +560,18 @@ public:
         long number = strtol(&hex[1], NULL, 16);
         colorR = number >> 16; colorG = (number >> 8) & 0xFF; colorB = number & 0xFF;
       }
+      
+      // 强制更新底层亮度并立刻刷新，解开死锁状态
       matrix->setBrightness(getEffectiveBrightness());
+      matrix->show(); 
+      
       saveSettings();
 
       webServer->sendHeader("Location", "/clock");
       webServer->send(303);
     });
   }
+  
 
   void loop() {
     if (millis() - lastRefresh >= 100) {

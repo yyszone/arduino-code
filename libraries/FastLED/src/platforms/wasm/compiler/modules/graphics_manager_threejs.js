@@ -15,7 +15,6 @@
  */
 
 /* eslint-disable no-console */
-/* eslint-disable import/prefer-default-export */
 /* eslint-disable no-restricted-syntax */
 /* eslint-disable max-len */
 /* eslint-disable guard-for-in */
@@ -29,17 +28,11 @@
 
 import { isDenseGrid } from './graphics_utils.js';
 
+// Declare THREE as global namespace for type checking
+/* global THREE */
+
 /** Disable geometry merging for debugging (set to true to force individual LED objects) */
 const DISABLE_MERGE_GEOMETRIES = false;
-
-/**
- * Groups all LEDs together for processing (utility function)
- * @param {Array} leds - Array of LED objects to group
- * @returns {Array} The same array (no actual grouping performed)
- */
-function groupAllLeds(leds) {
-  return leds;
-}
 
 /**
  * Creates position calculator functions for mapping LED coordinates to 3D space
@@ -59,9 +52,7 @@ function makePositionCalculators(frameData, screenWidth, screenHeight) {
      * @param {number} x - Screen X coordinate
      * @returns {number} 3D X position centered around origin
      */
-    calcXPosition: (x) => {
-      return (((x - screenMap.absMin[0]) / width) * screenWidth) - (screenWidth / 2);
-    },
+    calcXPosition: (x) => (((x - screenMap.absMin[0]) / width) * screenWidth) - (screenWidth / 2),
     /**
      * Calculates Y position in 3D space from screen coordinates
      * @param {number} y - Screen Y coordinate
@@ -121,16 +112,16 @@ export class GraphicsManagerThreeJS {
     /** @type {Array} Array of merged mesh objects for performance */
     this.mergedMeshes = [];
 
-    /** @type {THREE.Scene|null} Three.js scene object */
+    /** @type {Object|null} Three.js scene object */
     this.scene = null;
 
-    /** @type {THREE.Camera|null} Three.js camera object */
+    /** @type {Object|null} Three.js camera object */
     this.camera = null;
 
-    /** @type {THREE.WebGLRenderer|null} Three.js WebGL renderer */
+    /** @type {Object|null} Three.js WebGL renderer */
     this.renderer = null;
 
-    /** @type {THREE.EffectComposer|null} Post-processing composer */
+    /** @type {Object|null} Post-processing composer */
     this.composer = null;
 
     // State tracking
@@ -196,7 +187,7 @@ export class GraphicsManagerThreeJS {
    */
   initThreeJS(frameData) {
     this._setupCanvasAndDimensions(frameData);
-    this._setupScene(frameData);
+    this._setupScene();
     this._setupRenderer();
     this._setupRenderPasses(frameData);
 
@@ -254,9 +245,8 @@ export class GraphicsManagerThreeJS {
   /**
    * Sets up the Three.js scene and camera
    * @private
-   * @param {Object} frameData - Frame data for scene configuration
    */
-  _setupScene(frameData) {
+  _setupScene() {
     const { THREE } = this.threeJsModules;
 
     // Create the scene
@@ -318,7 +308,9 @@ export class GraphicsManagerThreeJS {
    * @private
    */
   _setupRenderPasses(frameData) {
-    const { THREE, EffectComposer, RenderPass, UnrealBloomPass } = this.threeJsModules;
+    const {
+      THREE, EffectComposer, RenderPass, UnrealBloomPass,
+    } = this.threeJsModules;
 
     // Create basic render pass
     const renderScene = new RenderPass(this.scene, this.camera);
@@ -486,9 +478,9 @@ export class GraphicsManagerThreeJS {
     const { screenMap } = frameData;
 
     // If BufferGeometryUtils is not available, fall back to individual LEDs
-    const BufferGeometryUtils = this.threeJsModules.BufferGeometryUtils;
-    const canMergeGeometries = this.useMergedGeometry && BufferGeometryUtils &&
-      !DISABLE_MERGE_GEOMETRIES;
+    const { BufferGeometryUtils } = this.threeJsModules;
+    const canMergeGeometries = this.useMergedGeometry && BufferGeometryUtils
+      && !DISABLE_MERGE_GEOMETRIES;
 
     if (!canMergeGeometries) {
       console.log('BufferGeometryUtils not available, falling back to individual LEDs');
@@ -650,7 +642,7 @@ export class GraphicsManagerThreeJS {
       console.warn('Received null frame data, skipping update');
       return;
     }
-    
+
     if (!Array.isArray(frameData)) {
       console.warn('Received non-array frame data:', frameData);
       return;
@@ -669,8 +661,9 @@ export class GraphicsManagerThreeJS {
     const positionMap = this._collectLedColorData(frameData);
 
     // Update LED visuals
-    if (frameData.screenMap) {
-      this._updateLedVisuals(positionMap, frameData.screenMap);
+    const screenMap = (/** @type {any} */ (frameData)).screenMap;
+    if (screenMap) {
+      this._updateLedVisuals(positionMap);
     } else {
       console.warn('No screenMap available for LED visual updates');
     }
@@ -718,18 +711,20 @@ export class GraphicsManagerThreeJS {
    * @returns {Map} - Map of LED positions to color data
    */
   _collectLedColorData(frameData) {
-    // Check if frameData has screenMap property
-    if (!frameData.screenMap) {
+    // Handle frameData as array or object with screenMap
+    const dataArray = Array.isArray(frameData) ? frameData : (frameData.data || []);
+    const screenMap = (/** @type {any} */ (frameData)).screenMap;
+
+    if (!screenMap) {
       console.warn('No screenMap found in frameData:', frameData);
       return new Map();
     }
 
-    const { screenMap } = frameData;
     const positionMap = new Map();
     const WARNING_COUNT = 10;
 
     // Process each strip
-    frameData.forEach((strip) => {
+    dataArray.forEach((strip) => {
       if (!strip) {
         console.warn('Null strip encountered, skipping');
         return;
@@ -785,7 +780,9 @@ export class GraphicsManagerThreeJS {
 
         // Only update if this LED is brighter than any existing LED at this position
         if (!positionMap.has(posKey) || positionMap.get(posKey).brightness < brightness) {
-          positionMap.set(posKey, { x, y, r, g, b, brightness });
+          positionMap.set(posKey, {
+            x, y, r, g, b, brightness,
+          });
         }
       }
     });
@@ -816,21 +813,21 @@ export class GraphicsManagerThreeJS {
    * Updates LED visuals based on position map data
    * @private
    */
-  _updateLedVisuals(positionMap, screenMap) {
+  _updateLedVisuals(positionMap) {
     const { THREE } = this.threeJsModules;
 
     // Use the stored bounds from setup
     const min_x = this.screenBounds.minX;
     const min_y = this.screenBounds.minY;
-    const width = this.screenBounds.width;
-    const height = this.screenBounds.height;
+    const { width } = this.screenBounds;
+    const { height } = this.screenBounds;
 
     // Track which merged meshes need updates
     const mergedMeshUpdates = new Map();
 
     // Update LED positions and colors
     let ledIndex = 0;
-    for (const [_, ledData] of positionMap) { // eslint-disable-line
+    for (const [, ledData] of positionMap) {
       if (ledIndex >= this.leds.length) break;
 
       const led = this.leds[ledIndex];
@@ -842,7 +839,7 @@ export class GraphicsManagerThreeJS {
       const normalizedY = (y / height) * this.SCREEN_HEIGHT - this.SCREEN_HEIGHT / 2;
 
       // Get z position (fixed for orthographic camera)
-      const z = this._calculateDepthEffect(normalizedX, normalizedY);
+      const z = this._calculateDepthEffect();
 
       // Update LED position and color
       if (led._isMerged) {
@@ -890,7 +887,7 @@ export class GraphicsManagerThreeJS {
       // Create or update the color attribute if needed
       if (!mesh.geometry.attributes.color) {
         // Create a new color attribute
-        const count = mesh.geometry.attributes.position.count;
+        const { count } = mesh.geometry.attributes.position;
         const colorArray = new Float32Array(count * 3);
         mesh.geometry.setAttribute('color', new THREE.BufferAttribute(colorArray, 3));
 
@@ -904,7 +901,6 @@ export class GraphicsManagerThreeJS {
       // Update colors for each LED
       updates.forEach((update) => {
         const { index, color } = update;
-        const baseIndex = index * 3;
 
         // Each vertex of the geometry needs the color
         const verticesPerInstance = mesh.geometry.attributes.position.count / this.leds.length;
@@ -925,7 +921,7 @@ export class GraphicsManagerThreeJS {
    * Calculates a depth effect based on distance from center
    * @private
    */
-  _calculateDepthEffect(x, y) {
+  _calculateDepthEffect() {
     // With orthographic camera, we don't need a depth effect based on distance
     // But we can still use a small z-offset to prevent z-fighting
     return 0; // Fixed z position for orthographic view
@@ -965,4 +961,5 @@ export class GraphicsManagerThreeJS {
     // Update merged meshes with cleared colors
     this._updateMergedMeshes(mergedMeshUpdates);
   }
+
 }
