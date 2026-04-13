@@ -1,0 +1,15 @@
+# Arduino 编译产物
+*.bin
+*.elf
+*.hex
+build/
+build-local/
+
+# 本地库（必须忽略）
+libraries/
+
+# 编辑器/系统缓存
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
