@@ -1,60 +1,107 @@
 /**
- * 智能垃圾桶翻盖控制器 v2.1
- * ESP32 | 360°舵机 | HC-SR04 | WiFi | OTA | 日志
+ * 智能垃圾桶翻盖控制器 v3.1
+ * ESP32 | SG90 180°舵机 | HC-SR04 | WiFi | OTA | 日志
  * 依赖库：ESP32Servo
+ *
+ * 与 v2.x (360°舵机) 的主要区别：
+ *   - 用目标角度 (closeAngle / openAngle) 代替速度值 (openSpeed / closeSpeed / stopVal)
+ *   - openTime / closeTime 表示舵机从一端转到另一端所需的等待时间
+ *   - EEPROM MAGIC 已更新，防止加载旧版残留配置
+ *   - 日志时间戳使用 NTP 同步的北京时间 (UTC+8)
  */
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Update.h>
 #include <ESP32Servo.h>
 #include <EEPROM.h>
-#include <esp_sleep.h>
+#include <time.h>
 
 // ─── 引脚 ────────────────────────────────────────────────
 #define TRIG_PIN   4
 #define ECHO_PIN   5
 #define SERVO_PIN  6
 
-const char* SSID = "yang1234";
-const char* PASS = "y123456789";
+const char*    SSID       = "yang1234";
+const char*    PASS       = "y123456789";
 const uint32_t WIFI_ALIVE = 60000;
+
+// ─── 时间（北京时间 UTC+8）────────────────────────────────
+#define CST_OFFSET 28800   // 8 * 3600
+bool     ntpSynced = false;
+
+// 返回 "HH:MM:SS" 北京时间；NTP 未同步时返回运行秒数 "+Xs"
+String nowStr() {
+  if (ntpSynced) {
+    struct tm ti;
+    if (getLocalTime(&ti, 0)) {
+      char buf[10];
+      snprintf(buf, sizeof(buf), "%02d:%02d:%02d", ti.tm_hour, ti.tm_min, ti.tm_sec);
+      return String(buf);
+    }
+  }
+  // 降级：显示运行秒
+  uint32_t s = millis() / 1000;
+  return "+" + String(s) + "s";
+}
+
+// NTP 同步（WiFi 连上后调用）
+void syncNTP() {
+  configTime(CST_OFFSET, 0, "ntp.aliyun.com", "pool.ntp.org");
+  struct tm ti;
+  if (getLocalTime(&ti, 5000)) {   // 最多等 5s
+    ntpSynced = true;
+    Serial.printf("[NTP] 同步成功 %02d:%02d:%02d\n", ti.tm_hour, ti.tm_min, ti.tm_sec);
+  } else {
+    Serial.println("[NTP] 同步失败，使用运行时长");
+  }
+}
 
 // ─── 日志 ────────────────────────────────────────────────
 #define LOG_CAP 50
-struct LogEntry { uint32_t ts; char msg[72]; };
+struct LogEntry { char ts[10]; char msg[62]; };  // ts = "HH:MM:SS"
 LogEntry logBuf[LOG_CAP];
-uint8_t logHead = 0, logCount = 0;
+uint8_t  logHead = 0, logCount = 0;
 
 void logf(const char *fmt, ...) {
-  char buf[72]; va_list ap;
-  va_start(ap, fmt); vsnprintf(buf, 72, fmt, ap); va_end(ap);
-  logBuf[logHead] = { (uint32_t)millis(), {} };
-  strncpy(logBuf[logHead].msg, buf, 71);
+  char buf[62]; va_list ap;
+  va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
+  String t = nowStr();
+  strncpy(logBuf[logHead].ts,  t.c_str(), 9);
+  strncpy(logBuf[logHead].msg, buf, 61);
+  logBuf[logHead].ts[9]  = '\0';
+  logBuf[logHead].msg[61] = '\0';
   logHead = (logHead + 1) % LOG_CAP;
   if (logCount < LOG_CAP) logCount++;
-  Serial.println(buf);
+  Serial.printf("[%s] %s\n", t.c_str(), buf);
 }
 
 // ─── 配置 ────────────────────────────────────────────────
-#define MAGIC 0xC6
+// MAGIC 改为 0xC7，避免读取 v2.x 的旧 EEPROM 数据
+#define MAGIC 0xC7
 struct Config {
-  uint8_t magic;
-  int16_t trigDist, openSpeed, closeSpeed, stopVal;
-  int16_t openTime, closeTime, holdTime;
+  uint8_t  magic;
+  int16_t  trigDist;    // 触发距离 cm
+  int16_t  closeAngle;  // 关盖角度 (SG90: 0°)
+  int16_t  openAngle;   // 开盖角度 (SG90: 0~180°，典型值 90°)
+  int16_t  openTime;    // 等待舵机转到开盖位置的时间 ms
+  int16_t  closeTime;   // 等待舵机转到关盖位置的时间 ms
+  int16_t  holdTime;    // 盖子保持开启的时间 ms
 } cfg;
-const Config DEF = { MAGIC, 25, 10, 170, 90, 800, 800, 8000 };
+
+// 默认值：触发距离 25 cm，关盖 0°，开盖 90°
+const Config DEF = { MAGIC, 25, 0, 90, 600, 600, 8000 };
 
 void saveConfig() { EEPROM.put(0, cfg); EEPROM.commit(); logf("[CFG] 已保存"); }
 void loadConfig() {
   EEPROM.get(0, cfg);
-  if (cfg.magic != MAGIC) { cfg = DEF; saveConfig(); }
-  logf("[CFG] trigDist=%d openSpd=%d", cfg.trigDist, cfg.openSpeed);
+  if (cfg.magic != MAGIC) { cfg = DEF; saveConfig(); logf("[CFG] 使用默认值"); }
+  else logf("[CFG] trigDist=%d close=%d° open=%d°", cfg.trigDist, cfg.closeAngle, cfg.openAngle);
 }
 
-// ─── 状态机（enum 必须在 enterState 前声明）────────────
+// ─── 状态机 ──────────────────────────────────────────────
 enum LidState : uint8_t { IDLE, OPENING, OPEN, CLOSING };
 const char* STATE_STR[] = { "IDLE","OPENING","OPEN","CLOSING" };
-LidState  lidState  = IDLE;
+LidState  lidState   = IDLE;
 uint32_t  stateEnter = 0, trigCount = 0, lastPoll = 0;
 Servo     myServo;
 
@@ -74,14 +121,14 @@ float getDist() {
 
 // ─── Web 服务器 ──────────────────────────────────────────
 WebServer server(80);
-bool     wifiOn    = false;
-uint32_t wifiStart = 0;
-float    lastDist  = 999;
+bool      wifiOn   = false;
+uint32_t  wifiStart = 0;
+float     lastDist  = 999;
 
 static const char HTML[] PROGMEM = R"HTML(<!DOCTYPE html>
 <html lang="zh"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>智能垃圾桶</title>
+<title>智能垃圾桶 v3.1</title>
 <style>
 :root{--bg:#0f1117;--card:#181c27;--bd:#252a3a;--acc:#00e5a0;--a2:#0095ff;--wn:#ff6b35;--tx:#dde1f0;--mu:#5a6070}
 *{box-sizing:border-box;margin:0;padding:0}
@@ -123,14 +170,18 @@ input[type=number]:focus{border-color:var(--acc);box-shadow:0 0 0 3px rgba(0,229
 @keyframes ti{from{opacity:0;transform:translate(-50%,7px)}to{opacity:1;transform:translateX(-50%)}}
 .tok{border-color:rgba(0,229,160,.35);color:var(--acc)}.ter{border-color:rgba(255,107,53,.35);color:var(--wn)}
 input[type=file]{display:none}
+/* 角度滑块 */
+.angle-wrap{display:flex;align-items:center;gap:8px}
+.angle-wrap input[type=range]{flex:1;accent-color:var(--acc)}
+.angle-val{font-size:.8rem;font-family:'Courier New',monospace;color:var(--acc);min-width:36px;text-align:right}
 </style></head>
 <body>
-<h1>🗑️ 智能垃圾桶控制器 <small id="wb">WiFi ●</small></h1>
+<h1>🗑️ 智能垃圾桶 (SG90) <small id="wb">WiFi ●</small></h1>
 
 <div class="card">
   <div class="sec">📊 实时状态</div>
   <div class="row"><span class="rl">盖子状态</span><span id="ss" class="badge g">—</span></div>
-  <div class="row"><span class="rl">传感器距离 <span style="font-size:.6rem;color:var(--mu)">(实测值)</span></span><span class="rv" id="sd">—</span></div>
+  <div class="row"><span class="rl">传感器距离</span><span class="rv" id="sd">—</span></div>
   <div class="row"><span class="rl">触发次数</span><span class="rv" id="st">—</span></div>
   <div class="row"><span class="rl">运行时长</span><span class="rv" id="su">—</span></div>
   <div class="row"><span class="rl">WiFi剩余</span><span class="rv" id="sw">—</span></div>
@@ -138,16 +189,54 @@ input[type=file]{display:none}
 
 <div class="card">
   <div class="sec">⚙️ 参数设置</div>
-  <div class="field"><label>触发距离 (cm)</label><input type="number" id="f-trigDist" min="5" max="100"><div class="hint">手距离小于此值时开盖</div></div>
-  <div class="g2">
-    <div class="field"><label>开盖速度值</label><input type="number" id="f-openSpeed" min="0" max="89"><div class="hint">0-89，越小越快</div></div>
-    <div class="field"><label>关盖速度值</label><input type="number" id="f-closeSpeed" min="91" max="180"><div class="hint">91-180，越大越快</div></div>
+
+  <div class="field">
+    <label>触发距离 (cm)</label>
+    <input type="number" id="f-trigDist" min="5" max="100">
+    <div class="hint">手距离小于此值时开盖</div>
   </div>
+
   <div class="g2">
-    <div class="field"><label>开盖时长 (ms)</label><input type="number" id="f-openTime" min="100" max="5000" step="50"></div>
-    <div class="field"><label>关盖时长 (ms)</label><input type="number" id="f-closeTime" min="100" max="5000" step="50"></div>
+    <div class="field">
+      <label>关盖角度 (°)</label>
+      <div class="angle-wrap">
+        <input type="range" id="r-closeAngle" min="0" max="180" oninput="sync('closeAngle',this.value)">
+        <span class="angle-val" id="v-closeAngle">0°</span>
+      </div>
+      <input type="number" id="f-closeAngle" min="0" max="180"
+             oninput="syncR('closeAngle',this.value)" style="margin-top:6px">
+      <div class="hint">盖子完全关闭的角度，通常为 0°</div>
+    </div>
+    <div class="field">
+      <label>开盖角度 (°)</label>
+      <div class="angle-wrap">
+        <input type="range" id="r-openAngle" min="0" max="180" oninput="sync('openAngle',this.value)">
+        <span class="angle-val" id="v-openAngle">90°</span>
+      </div>
+      <input type="number" id="f-openAngle" min="0" max="180"
+             oninput="syncR('openAngle',this.value)" style="margin-top:6px">
+      <div class="hint">盖子完全打开的角度，通常为 90°</div>
+    </div>
   </div>
-  <div class="field"><label>保持开启时长 (ms)</label><input type="number" id="f-holdTime" min="500" max="30000" step="500"></div>
+
+  <div class="g2">
+    <div class="field">
+      <label>开盖等待时间 (ms)</label>
+      <input type="number" id="f-openTime" min="100" max="3000" step="50">
+      <div class="hint">等待舵机转到位的时间</div>
+    </div>
+    <div class="field">
+      <label>关盖等待时间 (ms)</label>
+      <input type="number" id="f-closeTime" min="100" max="3000" step="50">
+      <div class="hint">等待舵机转到位的时间</div>
+    </div>
+  </div>
+
+  <div class="field">
+    <label>保持开启时长 (ms)</label>
+    <input type="number" id="f-holdTime" min="500" max="30000" step="500">
+  </div>
+
   <button class="btn bp" onclick="save()">💾 保存设置</button>
   <button class="btn bg_" onclick="rst()">🔄 恢复默认</button>
 </div>
@@ -173,17 +262,32 @@ input[type=file]{display:none}
 <script>
 var fw=null;
 var SM={IDLE:['g','● 空闲'],OPENING:['b','▶ 开盖中'],OPEN:['o','◉ 已开'],CLOSING:['b','◀ 关盖']};
-var K=['trigDist','openSpeed','closeSpeed','openTime','closeTime','holdTime'];
+var K=['trigDist','closeAngle','openAngle','openTime','closeTime','holdTime'];
 function fmt(ms){var s=ms/1000|0,m=s/60|0,h=m/60|0;return h?h+'h'+(m%60)+'m'+(s%60)+'s':(m?m+'m'+(s%60)+'s':s+'s')}
 function toast(t,c){var e=document.createElement('div');e.className='toast '+(c||'tok');e.textContent=t;document.body.appendChild(e);setTimeout(function(){e.remove()},2500)}
 function $(id){return document.getElementById(id)}
 
-/* ── 配置只在这里写入输入框，不在 loadStatus 里碰 ── */
-function fillInputs(cfg){
-  K.forEach(function(k){var e=$('f-'+k);if(e&&cfg[k]!=null)e.value=cfg[k]});
+/* 角度滑块双向同步 */
+function sync(k,v){
+  $('f-'+k).value=v;
+  $('v-'+k).textContent=v+'°';
+}
+function syncR(k,v){
+  var r=$('r-'+k);if(r){r.value=v;$('v-'+k).textContent=v+'°';}
 }
 
-/* ── 状态刷新：只更新状态栏，绝不碰输入框 ── */
+/* 配置填入（仅在显式拉取配置时调用，不在状态刷新里碰输入框）*/
+function fillInputs(cfg){
+  K.forEach(function(k){
+    var e=$('f-'+k);
+    if(e&&cfg[k]!=null){
+      e.value=cfg[k];
+      syncR(k,cfg[k]);   // 同步滑块
+    }
+  });
+}
+
+/* 状态刷新：只更新状态栏 */
 function loadStatus(){
   fetch('/api/status').then(function(r){return r.json()}).then(function(d){
     var sm=SM[d.state]||['g',d.state];
@@ -197,14 +301,14 @@ function loadStatus(){
   }).catch(function(){});
 }
 
-/* ── 单独拉取配置，写入输入框 ── */
+/* 单独拉取配置 */
 function loadCfg(){
   fetch('/api/status').then(function(r){return r.json()}).then(function(d){
     fillInputs(d.cfg);
   }).catch(function(){});
 }
 
-/* ── 保存：POST 后重新拉配置确认 ── */
+/* 保存：POST 后回读确认 */
 function save(){
   var p=new URLSearchParams();
   K.forEach(function(k){p.append(k,$('f-'+k).value)});
@@ -216,9 +320,7 @@ function save(){
 
 function rst(){
   if(!confirm('恢复默认设置？'))return;
-  fetch('/api/reset',{method:'POST'}).then(function(){
-    toast('✅ 已恢复默认');loadCfg();
-  });
+  fetch('/api/reset',{method:'POST'}).then(function(){toast('✅ 已恢复默认');loadCfg();});
 }
 function reboot(){if(!confirm('重启设备？'))return;fetch('/api/reboot',{method:'POST'});toast('🔄 重启中...')}
 function pick(i){fw=i.files[0];$('fn').textContent=fw?fw.name+' ('+(fw.size/1024).toFixed(1)+'KB)':''}
@@ -235,29 +337,29 @@ function loadLog(){
   fetch('/api/log').then(function(r){return r.json()}).then(function(d){
     $('log').innerHTML=[].concat(d.logs).reverse().map(function(l){
       var c=l.msg.indexOf('[ERR]')>=0?'e':(l.msg.indexOf('WARN')>=0?'w':'i');
-      return '<div class="le"><span class="lt">'+fmt(l.ts)+'</span><span class="lm '+c+'">'+l.msg+'</span></div>';
+      return '<div class="le"><span class="lt">'+l.ts+'</span><span class="lm '+c+'">'+l.msg+'</span></div>';
     }).join('');
   }).catch(function(){});
 }
 
-/* 启动：先拉一次配置填入输入框，之后状态刷新永不碰输入框 */
 loadCfg(); loadStatus(); loadLog();
 setInterval(loadStatus,2500);
 setInterval(loadLog,6000);
 </script>
 </body></html>)HTML";
 
+// ─── JSON 构建 ───────────────────────────────────────────
 String buildStatus() {
   String s = "{";
-  s += "\"state\":\"" + String(STATE_STR[lidState]) + "\",";
-  s += "\"dist\":"    + String(lastDist, 1) + ",";
-  s += "\"triggers\":" + String(trigCount) + ",";
-  s += "\"uptime\":"  + String(millis()) + ",";
-  s += "\"wifiOn\":"  + String(wifiOn ? "true" : "false") + ",";
+  s += "\"state\":\""   + String(STATE_STR[lidState]) + "\",";
+  s += "\"dist\":"      + String(lastDist, 1)         + ",";
+  s += "\"triggers\":"  + String(trigCount)            + ",";
+  s += "\"uptime\":"    + String(millis())             + ",";
+  s += "\"wifiOn\":"    + String(wifiOn ? "true" : "false") + ",";
   s += "\"cfg\":{";
   s += "\"trigDist\":"   + String(cfg.trigDist)   + ",";
-  s += "\"openSpeed\":"  + String(cfg.openSpeed)  + ",";
-  s += "\"closeSpeed\":" + String(cfg.closeSpeed) + ",";
+  s += "\"closeAngle\":" + String(cfg.closeAngle) + ",";
+  s += "\"openAngle\":"  + String(cfg.openAngle)  + ",";
   s += "\"openTime\":"   + String(cfg.openTime)   + ",";
   s += "\"closeTime\":"  + String(cfg.closeTime)  + ",";
   s += "\"holdTime\":"   + String(cfg.holdTime);
@@ -271,7 +373,10 @@ String buildLog() {
   for (int i = 0; i < logCount; i++) {
     int idx = (start + i) % LOG_CAP;
     if (i) s += ",";
-    s += "{\"ts\":" + String(logBuf[idx].ts) + ",\"msg\":\"";
+    // ts 已是字符串，直接输出
+    s += "{\"ts\":\"";
+    s += logBuf[idx].ts;
+    s += "\",\"msg\":\"";
     for (int j = 0; logBuf[idx].msg[j]; j++) {
       char c = logBuf[idx].msg[j];
       if (c == '"' || c == '\\') s += '\\';
@@ -282,28 +387,41 @@ String buildLog() {
   return s + "]}";
 }
 
+// ─── HTTP 路由 ───────────────────────────────────────────
 void setupServer() {
   server.on("/", HTTP_GET, []() { server.send_P(200, "text/html", HTML); });
+
   server.on("/api/status", HTTP_GET, []() {
     lastDist = getDist();
     server.send(200, "application/json", buildStatus());
   });
+
   server.on("/api/save", HTTP_POST, []() {
     auto gi = [&](const char *k, int16_t &f, int mn, int mx) {
       if (server.hasArg(k)) f = (int16_t)constrain(server.arg(k).toInt(), mn, mx);
     };
-    gi("trigDist",   cfg.trigDist,   5,  100);
-    gi("openSpeed",  cfg.openSpeed,  0,   89);
-    gi("closeSpeed", cfg.closeSpeed, 91, 180);
-    gi("openTime",   cfg.openTime,  100, 5000);
-    gi("closeTime",  cfg.closeTime, 100, 5000);
-    gi("holdTime",   cfg.holdTime,  500, 30000);
+    gi("trigDist",   cfg.trigDist,   5,   100);
+    gi("closeAngle", cfg.closeAngle, 0,   180);
+    gi("openAngle",  cfg.openAngle,  0,   180);
+    gi("openTime",   cfg.openTime,   100, 3000);
+    gi("closeTime",  cfg.closeTime,  100, 3000);
+    gi("holdTime",   cfg.holdTime,   500, 30000);
     saveConfig();
     server.send(200, "text/plain", "OK");
   });
-  server.on("/api/reset",  HTTP_POST, []() { cfg = DEF; saveConfig(); server.send(200, "text/plain", "OK"); });
+
+  server.on("/api/reset", HTTP_POST, []() {
+    cfg = DEF; saveConfig();
+    server.send(200, "text/plain", "OK");
+  });
+
   server.on("/api/log",    HTTP_GET,  []() { server.send(200, "application/json", buildLog()); });
-  server.on("/api/reboot", HTTP_POST, []() { server.send(200, "text/plain", "OK"); delay(300); ESP.restart(); });
+
+  server.on("/api/reboot", HTTP_POST, []() {
+    server.send(200, "text/plain", "OK");
+    delay(300); ESP.restart();
+  });
+
   server.on("/update", HTTP_POST,
     []() {
       bool ok = !Update.hasError();
@@ -317,6 +435,7 @@ void setupServer() {
       else if (u.status == UPLOAD_FILE_END)   { Update.end(true); logf("[OTA] 完成 %uB", u.totalSize); }
     }
   );
+
   server.begin();
   logf("[NET] HTTP 启动 %s", WiFi.localIP().toString().c_str());
 }
@@ -330,17 +449,21 @@ void setup() {
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
 
+  // SG90：标准 50Hz，脉宽 500~2400µs
   ESP32PWM::allocateTimer(0);
   myServo.setPeriodHertz(50);
   myServo.attach(SERVO_PIN, 500, 2400);
-  myServo.write(cfg.stopVal);
-  logf("[SRV] 舵机就绪 stop=%d", cfg.stopVal);
+
+  // 上电先回到关盖角度
+  myServo.write(cfg.closeAngle);
+  logf("[SRV] SG90 就绪，归位至 %d°", cfg.closeAngle);
 
   WiFi.begin(SSID, PASS);
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) delay(300);
   if (WiFi.status() == WL_CONNECTED) {
     wifiOn = true; wifiStart = millis();
+    syncNTP();       // NTP 同步北京时间
     setupServer();
   } else {
     WiFi.disconnect(true); WiFi.mode(WIFI_OFF);
@@ -360,37 +483,43 @@ void loop() {
     }
   }
 
-  if (now - lastPoll < 150) {
-    if (!wifiOn && lidState == IDLE) {
-      esp_sleep_enable_timer_wakeup((150-(now-lastPoll)) * 1000ULL);
-      esp_light_sleep_start();
-    }
-    return;
-  }
+  // 限制轮询频率
+  if (now - lastPoll < 150) return;
   lastPoll = now;
   lastDist = getDist();
 
   switch (lidState) {
+
     case IDLE:
+      // 检测到手，开始开盖
       if (lastDist < cfg.trigDist) {
         trigCount++;
         logf("[LID] 触发#%lu %.1fcm", trigCount, lastDist);
-        myServo.write(cfg.openSpeed); enterState(OPENING);
+        myServo.write(cfg.openAngle);   // 直接写目标角度
+        enterState(OPENING);
       }
       break;
+
     case OPENING:
+      // 等待舵机转到位（openTime ms）
       if (now - stateEnter >= (uint32_t)cfg.openTime) {
-        myServo.write(cfg.stopVal); enterState(OPEN);
+        // 舵机已到达 openAngle，不需要额外指令，进入 OPEN
+        enterState(OPEN);
       }
       break;
+
     case OPEN:
+      // 保持开启，超时后关盖
       if (now - stateEnter >= (uint32_t)cfg.holdTime) {
-        myServo.write(cfg.closeSpeed); enterState(CLOSING);
+        myServo.write(cfg.closeAngle);  // 直接写关盖角度
+        enterState(CLOSING);
       }
       break;
+
     case CLOSING:
+      // 等待舵机转到位（closeTime ms）
       if (now - stateEnter >= (uint32_t)cfg.closeTime) {
-        myServo.write(cfg.stopVal); enterState(IDLE);
+        enterState(IDLE);
       }
       break;
   }
