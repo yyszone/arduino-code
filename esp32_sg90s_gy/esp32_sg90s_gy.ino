@@ -18,6 +18,8 @@
 #include <Wire.h>
 #include <VL53L0X.h>
 #include <time.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include "esp_sleep.h"
 
 // ══════════════════════════════════════════════════════════
@@ -44,9 +46,17 @@ const uint32_t STAY_AWAKE_MS = 90000;  // 首次上电强制保持唤醒时长�
 bool ntpSynced = false;
 
 // ══════════════════════════════════════════════════════════
+//  云端笔记
+// ══════════════════════════════════════════════════════════
+#define NOTE_URL  "https://note.yysresume.work/api/note-op"
+#define NOTE_ID   "55692e9f-4843-41ef-a27e-6db8dd888c0e"
+#define NOTE_AUTH "a_secret_fixed_token"
+static bool bootLogSent = false;
+
+// ══════════════════════════════════════════════════════════
 //  RTC 内存（深睡后保留）
 // ══════════════════════════════════════════════════════════
-RTC_DATA_ATTR static uint32_t g_trigCount   = 0;
+
 RTC_DATA_ATTR static bool     g_firstBoot   = true;  // 首次上电标志
 
 // ══════════════════════════════════════════════════════════
@@ -94,7 +104,7 @@ void syncNTP() {
 // ══════════════════════════════════════════════════════════
 //  配置（EEPROM）
 // ══════════════════════════════════════════════════════════
-#define MAGIC 0xD3   // v4.1
+#define MAGIC 0xD4   // v4.1
 struct Config {
   uint8_t  magic;
   int16_t  trigDist;     // 触发距离下限 mm
@@ -105,13 +115,14 @@ struct Config {
   int16_t  closeTime;
   int16_t  holdTime;
   int16_t  sleepMs;
+  uint32_t totalTriggers; // 👈 新增：永久保存的触发总数
 } cfg;
 
 inline bool inTrigRange(float d) {
   return d > (float)cfg.trigDist && d < (float)cfg.trigDistMax;
 }
 
-const Config DEF = { MAGIC, 100, 200, 0, 90, 600, 600, 8000, 500 };
+const Config DEF = { MAGIC, 100, 200, 0, 90, 600, 600, 8000, 500, 0 };
 
 void saveConfig() { EEPROM.put(0, cfg); EEPROM.commit(); logf("[CFG] 已保存"); }
 void loadConfig() {
@@ -243,6 +254,83 @@ void goToSleep() {
 }
 
 // ══════════════════════════════════════════════════════════
+//  云端笔记：开机写入
+// ══════════════════════════════════════════════════════════
+void sendBootLog() {
+  if (bootLogSent) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  // 拼 Markdown 行
+  char timeStr[20] = "未同步";
+  if (ntpSynced) {
+    struct tm ti;
+    if (getLocalTime(&ti, 500) && ti.tm_year > 120)
+      snprintf(timeStr, sizeof(timeStr), "%04d-%02d-%02d %02d:%02d:%02d",
+               ti.tm_year + 1900, ti.tm_mon + 1, ti.tm_mday,
+               ti.tm_hour, ti.tm_min, ti.tm_sec);
+  }
+
+  // UTC 时间戳（API 用）
+  time_t utcNow = time(nullptr);
+  struct tm utcTm;
+  gmtime_r(&utcNow, &utcTm);
+  char updatedAt[25];
+  snprintf(updatedAt, sizeof(updatedAt), "%04d-%02d-%02dT%02d:%02d:%02dZ",
+           utcTm.tm_year + 1900, utcTm.tm_mon + 1, utcTm.tm_mday,
+           utcTm.tm_hour, utcTm.tm_min, utcTm.tm_sec);
+
+  // Markdown 内容（\\n 转义供 JSON 字符串使用）
+  char md[600];
+  snprintf(md, sizeof(md),
+    "---\\n"
+    "**🗑️ 智能垃圾桶 v4.1 开机记录**\\n\\n"
+    "| 项目 | 值 |\\n"
+    "|------|-----|\\n"
+    "| 时间 | %s |\\n"
+    "| IP 地址 | %s |\\n"
+    "| WiFi 信号 | %d dBm |\\n"
+    "| 累计触发 | %lu 次 |\\n"
+    "| 触发范围 | %d ~ %d mm |\\n"
+    "| 开盖角度 | %d° |\\n"
+    "| 关盖角度 | %d° |\\n"
+    "| 保持时长 | %d ms |\\n"
+    "| 深睡间隔 | %d ms |\\n",
+    timeStr,
+    WiFi.localIP().toString().c_str(),
+    (int)WiFi.RSSI(),
+    (unsigned long)cfg.totalTriggers,
+    (int)cfg.trigDist, (int)cfg.trigDistMax,
+    (int)cfg.openAngle,
+    (int)cfg.closeAngle,
+    (int)cfg.holdTime,
+    (int)cfg.sleepMs
+  );
+
+  // 组装 JSON payload
+  char payload[750];
+  snprintf(payload, sizeof(payload),
+    "{\"noteId\":\"%s\",\"appendText\":\"%s\",\"updatedAt\":\"%s\"}",
+    NOTE_ID, md, updatedAt);
+
+  WiFiClientSecure client;
+  client.setInsecure();           // 不验证证书（与感应灯保持一致）
+  HTTPClient http;
+  http.begin(client, NOTE_URL);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Cookie", String("auth_token=") + NOTE_AUTH);
+  http.setTimeout(8000);
+
+  int code = http.POST(payload);
+  http.end();
+
+  if (code == 200) {
+    bootLogSent = true;
+    logf("[NOTE] 云端笔记写入成功 (HTTP %d)", code);
+  } else {
+    logf("[NOTE] 云端笔记写入失败 (HTTP %d)", code);
+  }
+}
+// ══════════════════════════════════════════════════════════
 //  WiFi 启动
 // ══════════════════════════════════════════════════════════
 void startWiFi() {
@@ -259,6 +347,8 @@ void startWiFi() {
     wifiStart = millis();
     logf("[NET] 已连接 IP: %s", WiFi.localIP().toString().c_str());
     syncNTP();
+    sendBootLog();  
+
   } else {
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
@@ -295,13 +385,14 @@ String buildStatus() {
   String s = "{";
   s += "\"state\":\""  + String(STATE_STR[lidState]) + "\",";
   s += "\"dist\":"     + String((int)lastDistMM)     + ",";
-  s += "\"triggers\":" + String(g_trigCount)          + ",";
+  s += "\"triggers\":" + String(cfg.totalTriggers)    + ",";
   s += "\"uptime\":"   + String(millis())             + ",";
   s += "\"wifiOn\":"   + String(wifiOn ? "true" : "false") + ",";
   s += "\"wifiLeft\":" + String(wLeft)                + ",";
   s += "\"cfg\":{";
   s += "\"trigDist\":"   + String(cfg.trigDist)   + ",";   // 👈 把这行补回来
   s += "\"trigDistMax\":"+ String(cfg.trigDistMax)+ ",";
+  s += "\"triggers\":" + String(cfg.totalTriggers) + ",";
   s += "\"closeAngle\":" + String(cfg.closeAngle) + ",";
   s += "\"openAngle\":"  + String(cfg.openAngle)  + ",";
   s += "\"openTime\":"   + String(cfg.openTime)   + ",";
@@ -612,8 +703,8 @@ void setup() {
     }
     // 有目标，标记为已触发
     isTriggered = true;
-    g_trigCount++;
-    logf("[LID] 触发#%lu %d mm", g_trigCount, d);
+    cfg.totalTriggers++; 
+    logf("[LID] 触发#%lu %d mm", cfg.totalTriggers, d);
 
   } else {
     // ── 首次上电 / 手动重启 ───────────────────────────
@@ -686,8 +777,8 @@ void loop() {
         goToSleep();  // 永不返回
       }
       if (inTrigRange(lastDistMM))  {
-        g_trigCount++;
-        logf("[LID] 触发#%lu %d mm", g_trigCount, (int)lastDistMM);
+        cfg.totalTriggers++;
+        logf("[LID] 触发#%lu %d mm", cfg.totalTriggers, (int)lastDistMM);
         myServo.write(cfg.openAngle);
         enterState(OPENING);
       }
@@ -711,6 +802,7 @@ void loop() {
     case CLOSING:
       if (now - stateEnter >= (uint32_t)cfg.closeTime) {
         enterState(IDLE);
+        saveConfig(); // 👈 在这里保存，保证每次开合动作完成后数据入库
         if (!wifiOn && !forceAwake) goToSleep();
       }
       break;
