@@ -627,6 +627,11 @@ void enterStandby() {
 // [修复] exitStandby 现在接受一个参数来处理不同的唤醒情况
 void exitStandby(bool wifiAlreadyConnected) {
   system_update_cpu_freq(160);
+  
+  // 【新增代码】不要仅仅唤醒，直接重新初始化一次屏幕，防止白屏死机
+  tft.begin(); 
+  tft.setRotation(0);
+  
   tft.writeCommand(ILI9341_SLPOUT);
   isInStandby = false;
   lastActivityTime = millis();

@@ -1,6 +1,39 @@
 // =================================================================================================
 // ==   ESP8266 智能继电器 & INA219 v6.30 (Tooltip Time Restored， 87a换87，承受更大电流)                 ==
 // =================================================================================================
+// 元件接线：12v磷酸铁锂电池通过降压模块LM2596降压5v给esp8266供电，esp8266给INA219供电，5v有16v1000uf电容，给JD1914汽车继电器供电（下面继电器引脚速查图），另外一个LM2596降压5v给ws2812灯板32×8供电
+
+/*JD1914继电器引脚速查图
+在接线前，请务必确认元件方向：
+
+MOS管 (IRL8721)：
+
+字面朝自己，引脚朝下。
+1脚 (左)：G (Gate/栅极) -> 信号输入。
+2脚 (中)：D (Drain/漏极) -> 接继电器。
+3脚 (右)：S (Source/源极) -> 接 GND。
+10k 电阻 直接焊接在 MOS管的 1脚 (左) 和 3脚 (右) 之间
+
+二极管 (SS34)：
+
+有横杠端：负极 (-)。
+无横杠端：正极 (+)。
+
+继电器 (JD1914)：
+
+85 & 86：控制线圈 (12V 输入)。
+30：公共端 (开关入口)。
+87：常开端 (常开比常闭承受更大电流)
+
+LM2596 #1 滤波电容（解决ESP8266死机）：
+
+输入端（12V侧，紧贴模块引脚）：
+  470µF 50V 铝电解电容，长脚(+)接12V，短脚(-)接GND
+  100nF 50V 瓷片电容(104)，并联在470µF两端，无极性
+输出端（5V侧，紧贴模块引脚）：
+  100nF 50V 瓷片电容(104)，并联在输出正负之间，无极性
+  （原有1000µF 16V电解电容保留不动）
+*/
 // 描述: 
 // 1. 继电器逻辑 (反转): 
 //    - setRelay(true)  -> digitalWrite(LOW)  -> 开启
@@ -34,6 +67,10 @@ const char* deviceName = "esp8266-smart-relay";
 const int WEB_SERVER_PORT = 80;
 
 // ============== 邮件配置 (默认留空，请去网页设置) ==============
+// 全局变量邮件测试
+bool pendingTestEmail = false;
+String testEmailResult = "idle"; // idle / pending / ok / fail:xxx
+
 String smtp_host     = "smtp.qq.com";
 int    smtp_port     = 465;
 String author_email  = "";
@@ -114,7 +151,16 @@ void ICACHE_RAM_ATTR countCpuIdle() {
 // ============== 网页 (HTML+CSS+JS) v6.20 ==============
 // =====================================================
 const char MAIN_HTML_PART1[] PROGMEM = R"HTML(
-<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ESP8266 智能继电器</title><script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script><style>:root{--bg-color:#111827;--card-color:#1f2937;--text-color:#d1d5db;--accent-color:#38bdf8;--green-color:#22c55e;--red-color:#ef4444;--warning-color:#f59e0b;--muted-text:#9ca3af}body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif,"Apple Color Emoji","Segoe UI Emoji";background-color:var(--bg-color);color:var(--text-color);margin:0;padding:15px;display:flex;justify-content:center}h1,h2,h4{margin-top:0;color:#fff;text-align:center}h2{border-top:1px solid #374151;padding-top:15px;margin-top:20px}.container{width:100%;max-width:500px}.card{background-color:var(--card-color);border-radius:12px;padding:20px;margin-bottom:15px;box-shadow:0 4px 6px -1px rgba(0,0,0,.1),0 2px 4px -1px rgba(0,0,0,.06)}.chart-card{padding:20px 0 10px 0;}.chart-card h2{padding:0 20px 15px;margin:0;border:none;}.data-box{text-align:center;padding:10px}.data-box .val{font-size:2.5em;font-weight:700;color:var(--accent-color);line-height:1.2;transition:color .3s ease}.data-box .unit{color:var(--muted-text)}.btn{width:100%;padding:15px;font-size:1.2em;font-weight:bold;border:none;border-radius:8px;cursor:pointer;transition:background-color .2s ease}.btn.on{background-color:var(--green-color);color:#fff}.btn.off{background-color:var(--red-color);color:#fff}.status-light{width:12px;height:12px;border-radius:50%;display:inline-block;margin-right:8px;background-color:#6b7280}.status-light.on{background-color:var(--green-color)}.input-group{display:flex;align-items:center;gap:10px;margin-bottom:10px}.input-group label{flex-basis:120px;flex-shrink:0;font-size:0.9em}input[type=number],input[type=text],input[type=password]{width:100%;padding:8px;background-color:#374151;border:1px solid #4b5563;border-radius:6px;color:var(--text-color);font-size:1em}.btn-save{padding:10px 15px;background-color:var(--accent-color);color:#fff;border:none;border-radius:6px;cursor:pointer}#sysinfo{font-size:.8em;color:var(--muted-text);word-break:break-all}#lockoutStatus{color:var(--red-color);text-align:center;margin-bottom:10px;font-weight:bold;}.toggle-section{cursor:pointer;color:var(--accent-color);text-align:center;font-size:0.9em;margin-top:10px;}</style></head><body><div class="container"><h1>ESP8266 智能继电器</h1><p style="text-align:center;color:var(--muted-text);">当前时间: <span id="currentTime">--:--:--</span></p><div class="card"><div class="data-box"><div>电池电压</div><div class="val" id="v">--</div><div class="unit">V</div></div></div><div class="card"><h2>手动控制</h2><div id="lockoutStatus" style="display:none;"></div><p><span id="relayStatusLight" class="status-light"></span>继电器状态: <strong id="relayStatusText">读取中...</strong></p><button id="relayBtn" class="btn">读取中...</button></div><div class="card"><h2>参数设置</h2><div class="input-group"><label for="highV">高压开启 (V)</label><input type="number" id="highV" step="0.1"></div><div class="input-group"><label for="warnV">电压警告 (V)</label><input type="number" id="warnV" step="0.1"></div><div class="input-group"><label for="lowV">低压关闭 (V)</label><input type="number" id="lowV" step="0.1"></div><p style="font-size:0.85em;color:var(--muted-text);text-align:right;">邮件通知将发送至: <span id="dispRecvEmail" style="color:var(--accent-color)">未设置</span></p><div style="text-align:right;margin-top:10px;"><button class="btn-save" onclick="saveSettings()">保存电压设置</button></div></div>
+<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ESP8266 智能继电器</title><script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script><style>:root{--bg-color:#111827;--card-color:#1f2937;--text-color:#d1d5db;--accent-color:#38bdf8;--green-color:#22c55e;--red-color:#ef4444;--warning-color:#f59e0b;--muted-text:#9ca3af}body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif,"Apple Color Emoji","Segoe UI Emoji";background-color:var(--bg-color);color:var(--text-color);margin:0;padding:15px;display:flex;justify-content:center}h1,h2,h4{margin-top:0;color:#fff;text-align:center}h2{border-top:1px solid #374151;padding-top:15px;margin-top:20px}.container{width:100%;max-width:500px}.card{background-color:var(--card-color);border-radius:12px;padding:20px;margin-bottom:15px;box-shadow:0 4px 6px -1px rgba(0,0,0,.1),0 2px 4px -1px rgba(0,0,0,.06)}.chart-card{padding:20px 0 10px 0;}.chart-card h2{padding:0 20px 15px;margin:0;border:none;}.data-box{text-align:center;padding:10px}.data-box .val{font-size:2.5em;font-weight:700;color:var(--accent-color);line-height:1.2;transition:color .3s ease}.data-box .unit{color:var(--muted-text)}.btn{width:100%;padding:15px;font-size:1.2em;font-weight:bold;border:none;border-radius:8px;cursor:pointer;transition:background-color .2s ease}.btn.on{background-color:var(--green-color);color:#fff}.btn.off{background-color:var(--red-color);color:#fff}.status-light{width:12px;height:12px;border-radius:50%;display:inline-block;margin-right:8px;background-color:#6b7280}.status-light.on{background-color:var(--green-color)}.input-group{display:flex;align-items:center;gap:10px;margin-bottom:10px}.input-group label{flex-basis:120px;flex-shrink:0;font-size:0.9em}input[type=number],input[type=text],input[type=password]{width:100%;padding:8px;background-color:#374151;border:1px solid #4b5563;border-radius:6px;color:var(--text-color);font-size:1em}.btn-save{padding:10px 15px;background-color:var(--accent-color);color:#fff;border:none;border-radius:6px;cursor:pointer}#sysinfo{font-size:.8em;color:var(--muted-text);word-break:break-all}#lockoutStatus{color:var(--red-color);text-align:center;margin-bottom:10px;font-weight:bold;}.toggle-section{cursor:pointer;color:var(--accent-color);text-align:center;font-size:0.9em;margin-top:10px;}</style></head><body><div class="container"><h1>ESP8266 智能继电器</h1><p style="text-align:center;color:var(--muted-text);">当前时间: <span id="currentTime">--:--:--</span></p><div class="card"><div class="data-box"><div>电池电压</div><div class="val" id="v">--</div><div class="unit">V</div></div></div><div class="card"><h2>手动控制</h2><div id="lockoutStatus" style="display:none;"></div><p><span id="relayStatusLight" class="status-light"></span>继电器状态: <strong id="relayStatusText">读取中...</strong></p><button id="relayBtn" class="btn">读取中...</button></div><div class="card"><h2>参数设置</h2><div class="input-group"><label for="highV">高压开启 (V)</label><input type="number" id="highV" step="0.1"></div><div class="input-group"><label for="warnV">电压警告 (V)</label><input type="number" id="warnV" step="0.1"></div><div class="input-group"><label for="lowV">低压关闭 (V)</label><input type="number" id="lowV" step="0.1"></div>
+<p style="font-size:0.85em;color:var(--muted-text);text-align:right;">
+  邮件通知将发送至: 
+  <span id="dispRecvEmail" 
+    style="color:var(--accent-color);cursor:pointer;text-decoration:underline dotted;" 
+    title="点击发送测试邮件"
+    onclick="sendTestEmail()">未设置</span>
+</p>
+<p id="testEmailStatus" style="font-size:0.8em;text-align:right;margin:0;min-height:1.2em;"></p>
+<div style="text-align:right;margin-top:10px;"><button class="btn-save" onclick="saveSettings()">保存电压设置</button></div></div>
 )HTML";
 
 const char MAIN_HTML_PART2[] PROGMEM = R"HTML(
@@ -159,6 +205,46 @@ function saveSettings(){
   const lowV=$('lowV').value; const warnV=$('warnV').value; const highV=$('highV').value;
   fetch(`/setSettings?low=${lowV}&warn=${warnV}&high=${highV}`).then(r=>{if(r.ok){alert('电压设置已保存!')}else{alert('保存失败!')}}).catch(e=>alert('请求出错: '+e));
 }
+
+function sendTestEmail() {
+  const addr = $('dispRecvEmail').textContent;
+  if (!addr || addr === '未设置') {
+    $('testEmailStatus').style.color = 'var(--warning-color)';
+    $('testEmailStatus').textContent = '请先保存邮件配置';
+    return;
+  }
+  $('testEmailStatus').style.color = 'var(--muted-text)';
+  $('testEmailStatus').textContent = '发送中...';
+
+  fetch('/testEmail').then(r => {
+    if (!r.ok) return r.text().then(t => { throw new Error(t); });
+    // 开始轮询结果
+    let attempts = 0;
+    const poll = setInterval(() => {
+      attempts++;
+      fetch('/testEmailResult').then(r => r.text()).then(result => {
+        if (result === 'pending') return; // 还没完成，继续等
+        clearInterval(poll);
+        if (result === 'ok') {
+          $('testEmailStatus').style.color = 'var(--green-color)';
+          $('testEmailStatus').textContent = '✓ 发送成功';
+        } else {
+          $('testEmailStatus').style.color = 'var(--red-color)';
+          $('testEmailStatus').textContent = '✗ ' + result.replace('fail:', '');
+        }
+      });
+      if (attempts > 30) { // 最多等60秒
+        clearInterval(poll);
+        $('testEmailStatus').style.color = 'var(--warning-color)';
+        $('testEmailStatus').textContent = '⚠ 超时，请查收邮件确认';
+      }
+    }, 2000); // 每2秒查一次
+  }).catch(e => {
+    $('testEmailStatus').style.color = 'var(--red-color)';
+    $('testEmailStatus').textContent = '✗ 请求出错: ' + e;
+  });
+}
+
 function saveEmailConfig(){
   const host=$('smtpHost').value;
   const port=$('smtpPort').value;
@@ -409,6 +495,18 @@ void checkVoltageProtection() {
 }
 
 // ============== Web路由处理 ==============
+void handleTestEmail() {
+  if (author_email.length() < 5 || recipient_email.length() < 5) {
+    server.send(400, "text/plain", "未配置邮件"); return;
+  }
+  pendingTestEmail = true;
+  testEmailResult = "pending";
+  server.send(200, "text/plain", "queued"); // 立即返回，不阻塞
+}
+
+void handleTestEmailResult() {
+  server.send(200, "text/plain", testEmailResult);
+}
 void handleRoot() {
   server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
@@ -574,6 +672,9 @@ void setup() {
   server.on("/setSettings", HTTP_GET, handleSetSettings);
   server.on("/setEmail", HTTP_GET, handleSetEmail);
   server.on("/getChartData", HTTP_GET, handleGetChartData);
+  server.on("/testEmail", HTTP_GET, handleTestEmail);
+  server.on("/testEmailResult", HTTP_GET, handleTestEmailResult);
+
   server.on("/update", HTTP_POST, []() {
     server.sendHeader("Connection", "close");
     server.send(200, "text/html", Update.hasError() ? OTA_FAIL_HTML : OTA_SUCCESS_HTML);
@@ -592,6 +693,15 @@ void setup() {
 void loop() {
   countCpuIdle();
   server.handleClient();
+
+  if (pendingTestEmail) {
+    pendingTestEmail = false;
+    sendEmailNotification("[测试] " + String(deviceName), "这是一封测试邮件，邮件通知功能正常。");
+    testEmailResult = (smtp.statusCode() > 0 && smtp.statusCode() < 400) 
+                      ? "ok" 
+                      : ("fail:" + smtp.errorReason());
+  }
+
   myClock.setBatteryVoltage(busVoltage);  // ← 加这一行
   myClock.loop(); // 【新增：刷新点阵时钟】
   MDNS.update();
