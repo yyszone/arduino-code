@@ -59,6 +59,7 @@ LM2596 #1 滤波电容（解决ESP8266死机）：
 #include <WiFiClientSecure.h>
 #include <LittleFS.h>
 #include "MatrixClock.h" // 【新增：引入时钟库】
+#include "logs.h" 
 
 // ============== 用户 WiFi 配置 (请修改此处) ==============
 const char* ssid       = "yang1234";
@@ -70,6 +71,10 @@ const int WEB_SERVER_PORT = 80;
 // 全局变量邮件测试
 bool pendingTestEmail = false;
 String testEmailResult = "idle"; // idle / pending / ok / fail:xxx
+bool pendingWarningEmail  = false;
+bool pendingLockoutEmail  = false;
+String pendingEmailSubject = "";
+String pendingEmailBody    = "";
 
 String smtp_host     = "smtp.qq.com";
 int    smtp_port     = 465;
@@ -151,7 +156,7 @@ void ICACHE_RAM_ATTR countCpuIdle() {
 // ============== 网页 (HTML+CSS+JS) v6.20 ==============
 // =====================================================
 const char MAIN_HTML_PART1[] PROGMEM = R"HTML(
-<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ESP8266 智能继电器</title><script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script><style>:root{--bg-color:#111827;--card-color:#1f2937;--text-color:#d1d5db;--accent-color:#38bdf8;--green-color:#22c55e;--red-color:#ef4444;--warning-color:#f59e0b;--muted-text:#9ca3af}body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif,"Apple Color Emoji","Segoe UI Emoji";background-color:var(--bg-color);color:var(--text-color);margin:0;padding:15px;display:flex;justify-content:center}h1,h2,h4{margin-top:0;color:#fff;text-align:center}h2{border-top:1px solid #374151;padding-top:15px;margin-top:20px}.container{width:100%;max-width:500px}.card{background-color:var(--card-color);border-radius:12px;padding:20px;margin-bottom:15px;box-shadow:0 4px 6px -1px rgba(0,0,0,.1),0 2px 4px -1px rgba(0,0,0,.06)}.chart-card{padding:20px 0 10px 0;}.chart-card h2{padding:0 20px 15px;margin:0;border:none;}.data-box{text-align:center;padding:10px}.data-box .val{font-size:2.5em;font-weight:700;color:var(--accent-color);line-height:1.2;transition:color .3s ease}.data-box .unit{color:var(--muted-text)}.btn{width:100%;padding:15px;font-size:1.2em;font-weight:bold;border:none;border-radius:8px;cursor:pointer;transition:background-color .2s ease}.btn.on{background-color:var(--green-color);color:#fff}.btn.off{background-color:var(--red-color);color:#fff}.status-light{width:12px;height:12px;border-radius:50%;display:inline-block;margin-right:8px;background-color:#6b7280}.status-light.on{background-color:var(--green-color)}.input-group{display:flex;align-items:center;gap:10px;margin-bottom:10px}.input-group label{flex-basis:120px;flex-shrink:0;font-size:0.9em}input[type=number],input[type=text],input[type=password]{width:100%;padding:8px;background-color:#374151;border:1px solid #4b5563;border-radius:6px;color:var(--text-color);font-size:1em}.btn-save{padding:10px 15px;background-color:var(--accent-color);color:#fff;border:none;border-radius:6px;cursor:pointer}#sysinfo{font-size:.8em;color:var(--muted-text);word-break:break-all}#lockoutStatus{color:var(--red-color);text-align:center;margin-bottom:10px;font-weight:bold;}.toggle-section{cursor:pointer;color:var(--accent-color);text-align:center;font-size:0.9em;margin-top:10px;}</style></head><body><div class="container"><h1>ESP8266 智能继电器</h1><p style="text-align:center;color:var(--muted-text);">当前时间: <span id="currentTime">--:--:--</span></p><div class="card"><div class="data-box"><div>电池电压</div><div class="val" id="v">--</div><div class="unit">V</div></div></div><div class="card"><h2>手动控制</h2><div id="lockoutStatus" style="display:none;"></div><p><span id="relayStatusLight" class="status-light"></span>继电器状态: <strong id="relayStatusText">读取中...</strong></p><button id="relayBtn" class="btn">读取中...</button></div><div class="card"><h2>参数设置</h2><div class="input-group"><label for="highV">高压开启 (V)</label><input type="number" id="highV" step="0.1"></div><div class="input-group"><label for="warnV">电压警告 (V)</label><input type="number" id="warnV" step="0.1"></div><div class="input-group"><label for="lowV">低压关闭 (V)</label><input type="number" id="lowV" step="0.1"></div>
+<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ESP8266 智能继电器(ESP8266_INA219_r_v)</title><script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script><style>:root{--bg-color:#111827;--card-color:#1f2937;--text-color:#d1d5db;--accent-color:#38bdf8;--green-color:#22c55e;--red-color:#ef4444;--warning-color:#f59e0b;--muted-text:#9ca3af}body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif,"Apple Color Emoji","Segoe UI Emoji";background-color:var(--bg-color);color:var(--text-color);margin:0;padding:15px;display:flex;justify-content:center}h1,h2,h4{margin-top:0;color:#fff;text-align:center}h2{border-top:1px solid #374151;padding-top:15px;margin-top:20px}.container{width:100%;max-width:500px}.card{background-color:var(--card-color);border-radius:12px;padding:20px;margin-bottom:15px;box-shadow:0 4px 6px -1px rgba(0,0,0,.1),0 2px 4px -1px rgba(0,0,0,.06)}.chart-card{padding:20px 0 10px 0;}.chart-card h2{padding:0 20px 15px;margin:0;border:none;}.data-box{text-align:center;padding:10px}.data-box .val{font-size:2.5em;font-weight:700;color:var(--accent-color);line-height:1.2;transition:color .3s ease}.data-box .unit{color:var(--muted-text)}.btn{width:100%;padding:15px;font-size:1.2em;font-weight:bold;border:none;border-radius:8px;cursor:pointer;transition:background-color .2s ease}.btn.on{background-color:var(--green-color);color:#fff}.btn.off{background-color:var(--red-color);color:#fff}.status-light{width:12px;height:12px;border-radius:50%;display:inline-block;margin-right:8px;background-color:#6b7280}.status-light.on{background-color:var(--green-color)}.input-group{display:flex;align-items:center;gap:10px;margin-bottom:10px}.input-group label{flex-basis:120px;flex-shrink:0;font-size:0.9em}input[type=number],input[type=text],input[type=password]{width:100%;padding:8px;background-color:#374151;border:1px solid #4b5563;border-radius:6px;color:var(--text-color);font-size:1em}.btn-save{padding:10px 15px;background-color:var(--accent-color);color:#fff;border:none;border-radius:6px;cursor:pointer}#sysinfo{font-size:.8em;color:var(--muted-text);word-break:break-all}#lockoutStatus{color:var(--red-color);text-align:center;margin-bottom:10px;font-weight:bold;}.toggle-section{cursor:pointer;color:var(--accent-color);text-align:center;font-size:0.9em;margin-top:10px;}</style></head><body><div class="container"><h1>ESP8266 智能继电器</h1><p style="text-align:center;color:var(--muted-text);">当前时间: <span id="currentTime">--:--:--</span></p><div class="card"><div class="data-box"><div>电池电压</div><div class="val" id="v">--</div><div class="unit">V</div></div></div><div class="card"><h2>手动控制</h2><div id="lockoutStatus" style="display:none;"></div><p><span id="relayStatusLight" class="status-light"></span>继电器状态: <strong id="relayStatusText">读取中...</strong></p><button id="relayBtn" class="btn">读取中...</button></div><div class="card"><h2>参数设置</h2><div class="input-group"><label for="highV">高压开启 (V)</label><input type="number" id="highV" step="0.1"></div><div class="input-group"><label for="warnV">电压警告 (V)</label><input type="number" id="warnV" step="0.1"></div><div class="input-group"><label for="lowV">低压关闭 (V)</label><input type="number" id="lowV" step="0.1"></div>
 <p style="font-size:0.85em;color:var(--muted-text);text-align:right;">
   邮件通知将发送至: 
   <span id="dispRecvEmail" 
@@ -165,7 +170,11 @@ const char MAIN_HTML_PART1[] PROGMEM = R"HTML(
 
 const char MAIN_HTML_PART2[] PROGMEM = R"HTML(
 <div class="card"><h2>邮件通知设置</h2><div class="input-group"><label>SMTP服务器</label><input type="text" id="smtpHost" placeholder="如: smtp.qq.com"></div><div class="input-group"><label>SMTP端口</label><input type="number" id="smtpPort" placeholder="465"></div><div class="input-group"><label>发件邮箱</label><input type="text" id="authEmail" placeholder="xxxx@qq.com"></div><div class="input-group"><label>授权码/密码</label><input type="password" id="authPass"></div><div class="input-group"><label>收件邮箱</label><input type="text" id="recvEmail" placeholder="接收通知的邮箱"></div><div style="text-align:right;margin-top:10px;"><button class="btn-save" onclick="saveEmailConfig()">保存邮件配置</button></div></div><div class="card"><h2>系统信息与更新</h2><!-- === 这行就是你加的入口按钮 === -->
-<a href="/clock" style="display:block; text-align:center; background:linear-gradient(90deg, #ff007f, #7f00ff); color:#fff; padding:12px; border-radius:8px; text-decoration:none; margin-bottom:15px; font-weight:bold; box-shadow: 0 4px 10px rgba(255,0,127,0.3);">✨ 进入矩阵时钟控制台</a><div id="sysinfo">加载中...</div><h4>固件更新 (OTA)</h4><div id="otaUi"><form id="otaForm" method="POST" action="/update" enctype="multipart/form-data"><input type="file" name="update" accept=".bin,.bin.gz" required><button type="submit" class="btn-save" style="margin-top:10px;">上传并更新</button></form></div><div id="otaStatus"></div></div><div class="card chart-card"><h2>24小时电压曲线</h2><div id="voltageChart" style="width: 100%; height: 250px;"></div></div></div>
+<a href="/clock" style="display:block; text-align:center; background:linear-gradient(90deg, #ff007f, #7f00ff); color:#fff; padding:12px; border-radius:8px; text-decoration:none; margin-bottom:15px; font-weight:bold; box-shadow: 0 4px 10px rgba(255,0,127,0.3);">✨ 进入矩阵时钟控制台</a><div id="sysinfo">加载中...</div><h4>固件更新 (OTA)</h4><div id="otaUi"><form id="otaForm" method="POST" action="/update" enctype="multipart/form-data"><input type="file" name="update" accept=".bin,.bin.gz" required><button type="submit" class="btn-save" style="margin-top:10px;">上传并更新</button></form></div><div id="otaStatus"></div></div><div class="card chart-card"><h2>24小时电压曲线</h2><div id="voltageChart" style="width: 100%; height: 250px;"></div></div>
+<a href="/logs" style="display:block;text-align:center;background:#1f2937;
+color:#34d399;padding:10px;border-radius:8px;text-decoration:none;
+margin-bottom:10px;font-size:13px;">📋 查看系统日志</a>
+</div>
 <script>
 var echartInstance;
 var latestDeviceTimeStr = "--:--:--";
@@ -434,8 +443,8 @@ void recordVoltageHistory() {
 void setRelay(bool state) {
   relayState = state;
   digitalWrite(RELAY_PIN, relayState ? HIGH : LOW);
-  Serial.printf("继电器 -> %s\n", relayState ? "ON" : "OFF");
-
+  sysLogf(LOG_INFO, "继电器 -> %s  电压=%.2fV  堆=%uB",   // ← 替换原来的 Serial.printf
+    state ? "ON" : "OFF", busVoltage, ESP.getFreeHeap());
   // 新增：写入 LittleFS
   File f = LittleFS.open("/relay.txt", "w");
   if (f) { f.print(state ? "1" : "0"); f.close(); }
@@ -449,10 +458,13 @@ void checkVoltageProtection() {
   if (relayState && busVoltage <= warningVoltageThreshold && voltageIsDecreasing) {
       isVoltageWarning = true;
       if (millis() - lastWarningNoticeTime > NOTIFICATION_COOLDOWN_MS || lastWarningNoticeTime == 0) {
-          Serial.printf("!!! 电压警告 (%.2fV)\n", busVoltage);
-          sendEmailNotification("[电压警告] " + String(deviceName), 
-            "电压为 " + String(busVoltage, 2) + "V，低于警告值 " + String(warningVoltageThreshold, 2) + "V。");
           lastWarningNoticeTime = millis();
+          sysLogf(LOG_WARN, "电压警告 %.2fV (阈值%.2fV)", busVoltage, warningVoltageThreshold);
+
+          pendingEmailSubject = "[电压警告] " + String(deviceName);
+          pendingEmailBody    = "电压为 " + String(busVoltage, 2) + "V，低于警告值 " + String(warningVoltageThreshold, 2) + "V。";
+          pendingWarningEmail = true;
+
       }
   } else if (busVoltage > (warningVoltageThreshold + WARNING_HYSTERESIS_V)) {
       isVoltageWarning = false;
@@ -474,9 +486,11 @@ void checkVoltageProtection() {
   if (relayState && busVoltage > 0.1 && busVoltage < lowVoltageThreshold) {
     Serial.printf("!!! 低压切断 (%.2fV)\n", busVoltage);
     if (millis() - lastLockoutNoticeTime > NOTIFICATION_COOLDOWN_MS || lastLockoutNoticeTime == 0) {
-      sendEmailNotification("[低压切断] " + String(deviceName), 
-        "电压 " + String(busVoltage, 2) + "V 低于阈值 " + String(lowVoltageThreshold, 2) + "V，已切断。");
       lastLockoutNoticeTime = millis();
+      sysLogf(LOG_ERR, "低压切断 %.2fV < %.2fV", busVoltage, lowVoltageThreshold);
+      pendingEmailSubject = "[低压切断] " + String(deviceName);
+      pendingEmailBody    = "电压 " + String(busVoltage, 2) + "V 低于阈值 " + String(lowVoltageThreshold, 2) + "V，已切断。";
+      pendingLockoutEmail = true;
     }
     isLockedOut = true; 
     lockoutStartTime = millis(); 
@@ -617,48 +631,127 @@ void handleGetChartData() {
 
 // ============== SETUP ==============
 void setup() {
+  
   Serial.begin(115200);
-  delay(100);
-  Serial.println("\n\n===== ESP8266 Relay v6.20 (Tooltip Restored) =====");
 
-  if (LittleFS.begin()) {
-    File vlogFile = LittleFS.open(VLOG_FILE_PATH, "r+");
-    if (!vlogFile) {
-      vlogFile = LittleFS.open(VLOG_FILE_PATH, "w+");
-      int initialIndex = 0; vlogFile.write((byte*)&initialIndex, sizeof(int));
-      float nan_val = NAN;
-      for (int i = 0; i < DATA_POINTS; i++) vlogFile.write((byte*)&nan_val, sizeof(float));
-      vlogFile.close();
-    } else {
-      vlogFile.read((byte*)&historyIndex, sizeof(int));
-      vlogFile.close();
-    }
-    loadSettings(); 
+  // 1. 文件系统 & 配置
+if (LittleFS.begin()) {
+  logBootReason();
+  File vlogFile = LittleFS.open(VLOG_FILE_PATH, "r+");
+  if (!vlogFile) {
+    vlogFile = LittleFS.open(VLOG_FILE_PATH, "w+");
+    int initialIndex = 0; vlogFile.write((byte*)&initialIndex, sizeof(int));
+    float nan_val = NAN;
+    for (int i = 0; i < DATA_POINTS; i++) vlogFile.write((byte*)&nan_val, sizeof(float));
+    vlogFile.close();
+  } else {
+    vlogFile.read((byte*)&historyIndex, sizeof(int));
+    vlogFile.close();
   }
+  loadSettings();
+}
+  // 2. 引脚
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, LOW); // 先安全关闭，等决策完再设
 
- pinMode(RELAY_PIN, OUTPUT);
+  // 3. ★ 先初始化INA219，才能读到有效电压
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  Wire.setClockStretchLimit(2000); // 【新增这行】强行设置超时限制，防死锁
+  if (ina219.begin()) { ina219_ok = true; Serial.println("[OK] INA219 Ready."); }
 
+  // 4. 读当前电压（此时ina219_ok已有效）
+  if (ina219_ok) busVoltage = ina219.getBusVoltage_V();
+
+  // 5. 读上次继电器状态
   bool savedRelay = false;
   if (LittleFS.exists("/relay.txt")) {
     File f = LittleFS.open("/relay.txt", "r");
     if (f) { savedRelay = (f.read() == '1'); f.close(); }
   }
-  relayState = savedRelay;
-  digitalWrite(RELAY_PIN, savedRelay ? HIGH : LOW);
-  Serial.printf("[OK] 继电器状态已恢复: %s\n", savedRelay ? "ON" : "OFF");
 
-
-  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-  if (ina219.begin()) { ina219_ok = true; Serial.println("[OK] INA219 Ready."); }
-
+  // 6. WiFi连接（带3次重试，每次最多等10s；全部失败则停电保护：强制开启继电器）
   WiFi.mode(WIFI_STA);
   WiFi.hostname(deviceName);
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
-  Serial.println("\n[OK] WiFi Connected.");
+  bool wifiConnected = false;
+  const int    WIFI_MAX_RETRIES    = 3;
+  const unsigned long WIFI_TIMEOUT_MS = 10000UL; // 每次超时10秒
+  for (int attempt = 1; attempt <= WIFI_MAX_RETRIES; attempt++) {
+    Serial.printf("\n[WiFi] 第 %d/%d 次尝试连接...", attempt, WIFI_MAX_RETRIES);
+    WiFi.begin(ssid, password);
+    unsigned long t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < WIFI_TIMEOUT_MS) {
+      delay(500);
+      Serial.print(".");
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+      wifiConnected = true;
+      break;
+    }
+    Serial.printf(" 超时，断开重试");
+    WiFi.disconnect(true);
+    delay(1000);
+  }
 
+  if (!wifiConnected) {
+    // ★ 停电/路由器未启动：无法联网，直接强制开启继电器，防止设备断电无法自恢复
+    sysLog(LOG_WARN, "WiFi连接失败(3次)，停电保护：强制开启继电器");
+    Serial.println("\n[Boot] WiFi失败 → 停电保护，强制 setRelay(ON)");
+    setRelay(true);
+    // 后续 NTP/心跳/决策全部跳过，直接进入 server/mDNS 初始化（离线模式）
+    goto SETUP_NETWORK_DONE;
+  }
+
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);
+  sysLogf(LOG_BOOT, "WiFi已连接 IP=%s", WiFi.localIP().toString().c_str());
+
+  // 7. ★ NTP同步（必须在读心跳之前！）
   timeClient.begin();
   timeClient.forceUpdate();
+  configTime(8 * 3600, 0, "ntp.aliyun.com"); // 同步 time()
+
+  // ★ 等待 time() 真正同步完成（最多等10秒）
+  Serial.print("[Boot] 等待NTP同步");
+  {
+    unsigned long ntpWait = millis();
+    while (time(nullptr) < 1000000UL && millis() - ntpWait < 10000) {
+      delay(200); Serial.print(".");
+    }
+    Serial.printf(" time=%lu\n", (unsigned long)time(nullptr));
+  }
+
+  // 8. ★ NTP同步完成后，才能正确计算离线时长
+  {
+    unsigned long offlineSec = 0;
+    bool offlineTimeKnown = false;
+    if (LittleFS.exists("/heartbeat.txt")) {
+      File f = LittleFS.open("/heartbeat.txt", "r");
+      if (f) {
+        unsigned long savedTs = f.parseInt();
+        f.close();
+        time_t nowTs = time(nullptr);
+        if (nowTs > savedTs && savedTs > 1000000UL) {
+          offlineSec = (unsigned long)(nowTs - savedTs);
+          offlineTimeKnown = true;
+        }
+      }
+    }
+
+    // 9. 决策
+    bool bootRelayOn;
+    if (!offlineTimeKnown || offlineSec <= 10) {
+      bootRelayOn = savedRelay;
+      Serial.printf("[Boot] 崩溃重启(离线%lus) → 恢复上次: %s\n", offlineSec, savedRelay?"ON":"OFF");
+    } else if (busVoltage > warningVoltageThreshold) {
+      bootRelayOn = true;
+      Serial.printf("[Boot] 正常重启(离线%lus), %.2fV > %.2fV → 强制开机\n", offlineSec, busVoltage, warningVoltageThreshold);
+    } else {
+      bootRelayOn = false;
+      Serial.printf("[Boot] 正常重启(离线%lus), %.2fV ≤ %.2fV → 强制关机\n", offlineSec, busVoltage, warningVoltageThreshold);
+    }
+    setRelay(bootRelayOn);
+  }
+
+SETUP_NETWORK_DONE:
 
   smtp.debug(1);
   smtp.callback(smtpCallback);
@@ -685,7 +778,8 @@ void setup() {
     else if (upload.status == UPLOAD_FILE_WRITE) { Update.write(upload.buf, upload.currentSize); }
     else if (upload.status == UPLOAD_FILE_END) { Update.end(true); }
   });
-  
+
+  setupLogEndpoint(server);
   server.begin();
   myClock.begin(); 
 }
@@ -701,7 +795,11 @@ void loop() {
                       ? "ok" 
                       : ("fail:" + smtp.errorReason());
   }
-
+  if (pendingWarningEmail || pendingLockoutEmail) {
+      pendingWarningEmail = false;
+      pendingLockoutEmail = false;
+      sendEmailNotification(pendingEmailSubject, pendingEmailBody);
+  }
   myClock.setBatteryVoltage(busVoltage);  // ← 加这一行
   myClock.loop(); // 【新增：刷新点阵时钟】
   MDNS.update();
@@ -712,10 +810,22 @@ void loop() {
     checkVoltageProtection();
   }
 
+  // 电压历史记录（原有，不能丢）
   static unsigned long lastHistoryRecord = 0;
   if (millis() - lastHistoryRecord > DATA_INTERVAL_MS) {
     lastHistoryRecord = millis();
     recordVoltageHistory();
+  }
+
+  // 心跳时间戳（新增，独立变量）
+  static unsigned long lastHeartbeat = 0;
+  if (millis() - lastHeartbeat > 60000) {
+    lastHeartbeat = millis();
+    time_t nowTs = time(nullptr);
+    if (nowTs > 1000000UL) {
+      File f = LittleFS.open("/heartbeat.txt", "w");
+      if (f) { f.print((unsigned long)nowTs); f.close(); }
+    }
   }
 
   if (millis() < 5000) {

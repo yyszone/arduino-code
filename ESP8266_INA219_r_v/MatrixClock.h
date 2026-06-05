@@ -372,6 +372,7 @@ private:
 
   // ── 主刷新 ────────────────────────────────────────────────
   void updateDisplay() {
+    ESP.wdtFeed();  // ← 加这行，进入函数先喂一次 SW WDT
     int effBr = getEffectiveBrightness();
     matrix->setBrightness(effBr);
     matrix->fillScreen(0);
@@ -453,8 +454,10 @@ private:
 
     drawBatteryBar();
 
-    matrix->show();
-    yield(); 
+    ESP.wdtDisable();   // 临时关闭 Hardware WDT
+    matrix->show();     // 发送数据（~7.68ms 中断禁用）
+    ESP.wdtEnable(0);   // 立刻重新启用 WDT，0=恢复默认超时
+    yield();
   }
 
   // ── 运行时长格式化（供网页）─────────────────────────────
@@ -574,7 +577,7 @@ public:
   
 
   void loop() {
-    if (millis() - lastRefresh >= 100) {
+    if (millis() - lastRefresh >= 2000) {
       lastRefresh = millis();
       updateDisplay();
     }

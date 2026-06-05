@@ -10,6 +10,8 @@
 #include <ArduinoOTA.h>
 #include <DHT.h>
 #include <EEPROM.h>
+#include "fan_stats.h"  // [NEW] 7天统计 + ECharts
+#include "fan_note.h"   // [NEW] 每日云端笔记
 
 // ===== WiFi 配置 =====
 const char* ssid     = "yang1234";
@@ -26,7 +28,7 @@ ESP8266WebServer       server(80);
 ESP8266HTTPUpdateServer httpUpdater;
 
 // ===== EEPROM 配置 =====
-#define EEPROM_SIZE  64
+#define EEPROM_SIZE  512
 #define EEPROM_MAGIC 0xAB  // 魔数，用于判断 EEPROM 是否已写入过有效数据
 
 struct Settings {
@@ -152,6 +154,7 @@ void handleRoot() {
             "<a href='/config'>⚙️ 参数配置</a>"
             "<a href='/ota'>📦 OTA 升级</a>"
             "<a href='/sysinfo'>🖥️ 系统信息</a>"
+            "<a href='/stats'>📈 风扇统计</a>" 
             "</div>");
 
   html += F("<div class='wrap'>");
@@ -225,7 +228,7 @@ void handleRoot() {
   html += F("</div>"); // end .wrap
 
   // 自动刷新脚本
-  html += F("<div class='footer'>ESP8266 智能控制台 — 5秒自动刷新</div>"
+  html += F("<div class='footer'>ESP8266 智能控制台(esp8266_dht_control_fan) — 5秒自动刷新</div>"
             "<script>setTimeout(()=>location.reload(),5000)</script>"
             "</body></html>");
 
@@ -404,7 +407,7 @@ void handleSysInfo() {
             "<button class='btn bd' onclick=\"if(confirm('确认重启设备？'))location='/reboot'\">🔄 重启设备</button>"
             "</div></div>"
             "</div>"
-            "<div class='footer'>系统信息页面</div>"
+            "<div class='footer'>系统信息页面(esp8266_dht_control_fan.ino)</div>"
             "</body></html>");
   server.send(200, "text/html; charset=utf-8", html);
 }
@@ -438,6 +441,7 @@ void handleRelayOn() {
   manualOverride = true;
   relayState = true;
   digitalWrite(RELAYPIN, HIGH);
+  fanStats_onRelayChange(true);
   server.send(200, "text/plain", "ON");
 }
 
@@ -445,6 +449,7 @@ void handleRelayOff() {
   manualOverride = true;
   relayState = false;
   digitalWrite(RELAYPIN, LOW);
+  fanStats_onRelayChange(false); 
   server.send(200, "text/plain", "OFF");
 }
 
@@ -486,6 +491,26 @@ void handleApi() {
 //  setup
 // ============================================================
 void setup() {
+  // [NEW] NTP 时间同步（笔记/统计需要时间）
+  configTime(8 * 3600, 0, "ntp.aliyun.com", "pool.ntp.org");
+  Serial.print("[NTP] 同步");
+  {
+    time_t t = time(nullptr);
+    for (int i = 0; i < 20 && t < 8 * 3600 * 2; i++) {
+      delay(500); Serial.print("."); t = time(nullptr);
+    }
+  }
+  Serial.println();
+ 
+  // [NEW] 初始化统计和笔记模块
+  fanStats_begin();
+  fanNote_begin();
+ 
+  // [NEW] 注册统计图表路由
+  server.on("/stats", HTTP_GET, [](){
+    server.send(200, "text/html; charset=utf-8", fanStats_buildPage());
+  });
+
   Serial.begin(115200);
   Serial.println("\n===== ESP8266 智能控制台 启动 =====");
 
@@ -560,7 +585,8 @@ void loop() {
   unsigned long now = millis();
   ArduinoOTA.handle();
   server.handleClient();
-
+  fanStats_loop();   // [NEW] 周期性刷盘 + 跨天检测
+  fanNote_loop();    // [NEW] 每天 0 点后写一次笔记
   // 非阻塞定时检查
   if (now - lastCheckTime < checkInterval) return;
   lastCheckTime = now;
@@ -588,6 +614,7 @@ void loop() {
     if (shouldOn != relayState) {
       relayState = shouldOn;
       digitalWrite(RELAYPIN, relayState ? HIGH : LOW);
+      fanStats_onRelayChange(relayState);  // [NEW]
       Serial.printf("[Relay] %s 继电器 (温度=%.1f°C, 运动=%s)\n",
                     relayState ? "✅ 打开" : "⛔ 关闭",
                     temperature,
