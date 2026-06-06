@@ -270,7 +270,7 @@ async function initChart(){
 async function updateChart(){ if(!echartInstance)return; try { const chartData=await fetchJson('/getChartData'); echartInstance.setOption({xAxis:{data:chartData.labels},series:[{data:chartData.data}]}); } catch(e){} }
 
 document.addEventListener('DOMContentLoaded', (event) => { fetchInitialState(); fetchData(); initChart(); });
-setInterval(fetchData,2500); setInterval(updateChart,60000);
+setInterval(fetchData,5000); setInterval(updateChart,120000);
 </script></body></html>
 )HTML";
 
@@ -765,6 +765,7 @@ void loop() {
 
   if (pendingTestEmail) {
     pendingTestEmail = false;
+    myClock.loop();           // 先让屏幕刷新一次再去发邮件
     sendEmailNotification("[测试] " + String(deviceName), "这是一封测试邮件，邮件通知功能正常。");
     testEmailResult = (smtp.statusCode() > 0 && smtp.statusCode() < 400) 
                       ? "ok" 
@@ -848,5 +849,5 @@ void loop() {
 
   // 【最核心修复】主动让出 CPU 1 毫秒，给底层 WiFi 栈和 TCP 握手留出喘息时间。
   // 彻底解决单核高速空转导致的网络响应极度迟缓、芯片发热、以及 CPU 虚高的问题。
-  delay(1); 
+  delay(5); 
 }

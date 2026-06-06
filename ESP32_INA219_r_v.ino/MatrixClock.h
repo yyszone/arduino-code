@@ -366,10 +366,15 @@ private:
   }
 
   // ── 主刷新 ────────────────────────────────────────────────
+  // private 区新增：
+  int lastEffBr = -1;
   void updateDisplay() {
-    yield(); // 【修改】ESP32 标准底层调度让出，替换 wdtFeed
+    yield();
     int effBr = getEffectiveBrightness();
-    matrix->setBrightness(effBr);
+    if (effBr != lastEffBr) {
+        matrix->setBrightness(effBr);
+        lastEffBr = effBr;
+    }
     matrix->fillScreen(0);
 
     if (effBr == 0) { 
@@ -570,7 +575,7 @@ public:
 
   void loop() {
     if (millis() - lastRefresh >= 2000) {
-      lastRefresh = millis();
+      lastRefresh += 2000;  
       updateDisplay();
     }
   }
