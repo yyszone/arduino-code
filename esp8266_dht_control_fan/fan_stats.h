@@ -1,20 +1,4 @@
 #pragma once
-/*
- * fan_stats.h — 风扇运行时长统计
- *
- * 存储策略：
- *   主存储 → EEPROM（OTA升级/重启均不丢失）
- *   备份   → LittleFS /fan_daily.txt（方便调试查看）
- *
- * EEPROM 布局（起始地址 STATS_EEPROM_BASE，共 8+7*8=64 字节）：
- *   [0..3]  魔数 0x46414E53 ("FANS")
- *   [4..7]  条目数量 (uint32_t)
- *   每条目 8 字节：
- *     [0..3] 日期压缩 = year*10000 + month*100 + day  (uint32_t)
- *     [4..7] 累计秒数 (uint32_t)
- *
- * 主文件需已 #include <EEPROM.h> 并在 setup() 调用 EEPROM.begin(512)
- */
 
 #include <LittleFS.h>
 #include <EEPROM.h>
@@ -22,8 +6,8 @@
 
 // ──── 配置 ─────────────────────────────────────────────────
 #define MAX_DAYS             7
-#define STATS_EEPROM_BASE    100          // 避开主文件已用的 0~63
-#define STATS_EEPROM_MAGIC   0x46414E53UL // "FANS"
+#define STATS_EEPROM_BASE    100          
+#define STATS_EEPROM_MAGIC   0x46414E53UL 
 #define STATS_FILE           "/fan_daily.txt"
 #define SAVE_INTERVAL_MS     60000UL
 
@@ -35,7 +19,7 @@ struct FanDayEntry {
 
 struct FanStatsEEPROM {
   uint32_t    magic;
-  uint32_t    count;                  // 有效条目数，最多 MAX_DAYS
+  uint32_t    count;                  
   FanDayEntry entries[MAX_DAYS];
 };
 
@@ -43,11 +27,16 @@ struct FanStatsEEPROM {
 static bool          _fanOn        = false;
 static unsigned long _fanStartMs   = 0;
 static unsigned long _todayFanSec  = 0;
-static uint32_t      _todayKey     = 0;   // 当天 dateKey
+static uint32_t      _todayKey     = 0;   
 static unsigned long _lastSaveMs   = 0;
-static FanStatsEEPROM _eepData;           // 内存镜像
+static FanStatsEEPROM _eepData;           
 
 // ──── 工具函数 ─────────────────────────────────────────────
+static bool _isTimeSynced() {
+  time_t now = time(nullptr);
+  return now > 8 * 3600 * 2; // 判断 NTP 是否已成功同步
+}
+
 static uint32_t _makeDateKey(struct tm* t) {
   return (uint32_t)(t->tm_year + 1900) * 10000
        + (uint32_t)(t->tm_mon  + 1)   * 100
@@ -61,7 +50,6 @@ static uint32_t _todayDateKey() {
 }
 
 static void _dateKeyToStr(uint32_t key, char* buf) {
-  // buf 至少 11 字节
   uint32_t y = key / 10000;
   uint32_t m = (key % 10000) / 100;
   uint32_t d = key % 100;
@@ -69,28 +57,42 @@ static void _dateKeyToStr(uint32_t key, char* buf) {
 }
 
 // ──── EEPROM 读写 ──────────────────────────────────────────
-static void _eepLoad() {
-  EEPROM.get(STATS_EEPROM_BASE, _eepData);
-  if (_eepData.magic != STATS_EEPROM_MAGIC ||
-      _eepData.count > MAX_DAYS) {
-    Serial.println("[FanStats] EEPROM blank/corrupt, init fresh");
-    memset(&_eepData, 0, sizeof(_eepData));
-    _eepData.magic = STATS_EEPROM_MAGIC;
-    _eepData.count = 0;
-  }
-}
-
 static void _eepSave() {
   EEPROM.put(STATS_EEPROM_BASE, _eepData);
   EEPROM.commit();
 }
 
-// ──── 找/插入某天的条目索引，不存在时追加 ────────────────
+static void _eepLoad() {
+  EEPROM.get(STATS_EEPROM_BASE, _eepData);
+  if (_eepData.magic != STATS_EEPROM_MAGIC || _eepData.count > MAX_DAYS) {
+    Serial.println("[FanStats] EEPROM blank/corrupt, init fresh");
+    memset(&_eepData, 0, sizeof(_eepData));
+    _eepData.magic = STATS_EEPROM_MAGIC;
+    _eepData.count = 0;
+    return;
+  }
+
+  // 【修复】自动过滤掉非法的历史日期（如未同步时间时写入的 1970 年 key）
+  int validCount = 0;
+  FanDayEntry tempEntries[MAX_DAYS];
+  for (uint32_t i = 0; i < _eepData.count; i++) {
+    if (_eepData.entries[i].dateKey >= 20200000UL) { // 过滤掉小于2020年的数据
+      tempEntries[validCount++] = _eepData.entries[i];
+    }
+  }
+  if (validCount != (int)_eepData.count) {
+    memset(_eepData.entries, 0, sizeof(_eepData.entries));
+    memcpy(_eepData.entries, tempEntries, sizeof(FanDayEntry) * validCount);
+    _eepData.count = validCount;
+    _eepSave();
+    Serial.println("[FanStats] Filtered out invalid history dates");
+  }
+}
+
 static int _findOrAdd(uint32_t key) {
   for (int i = 0; i < (int)_eepData.count; i++) {
     if (_eepData.entries[i].dateKey == key) return i;
   }
-  // 若已满，把最旧的移除（向前平移）
   if (_eepData.count >= MAX_DAYS) {
     memmove(&_eepData.entries[0], &_eepData.entries[1],
             sizeof(FanDayEntry) * (MAX_DAYS - 1));
@@ -103,7 +105,6 @@ static int _findOrAdd(uint32_t key) {
   return idx;
 }
 
-// ──── 同步当天内存数据到 EEPROM 镜像并保存 ───────────────
 static void _flushToday(uint32_t key, unsigned long secs) {
   int idx = _findOrAdd(key);
   _eepData.entries[idx].secs = (uint32_t)secs;
@@ -111,7 +112,6 @@ static void _flushToday(uint32_t key, unsigned long secs) {
   Serial.printf("[FanStats] EEPROM saved key=%lu secs=%lu\n", (unsigned long)key, secs);
 }
 
-// ──── 同步 EEPROM → LittleFS（调试备份）─────────────────
 static void _syncToFile() {
   if (!LittleFS.begin()) return;
   File f = LittleFS.open(STATS_FILE, "w");
@@ -124,33 +124,52 @@ static void _syncToFile() {
   f.close();
 }
 
-// ──── 初始化（setup 里调用）──────────────────────────────
+// ──── 初始化 ──────────────────────────────────────────────
 void fanStats_begin() {
-  // EEPROM.begin 由主文件负责，这里只读取
   _eepLoad();
 
-  _todayKey = _todayDateKey();
-
-  // 恢复当天已有的累计值
-  for (int i = 0; i < (int)_eepData.count; i++) {
-    if (_eepData.entries[i].dateKey == _todayKey) {
-      _todayFanSec = _eepData.entries[i].secs;
-      Serial.printf("[FanStats] Restored today secs=%lu\n", _todayFanSec);
-      break;
+  // 【修复】仅在 NTP 已同步时初始化今日 key，否则延后处理
+  if (_isTimeSynced()) {
+    _todayKey = _todayDateKey();
+    for (int i = 0; i < (int)_eepData.count; i++) {
+      if (_eepData.entries[i].dateKey == _todayKey) {
+        _todayFanSec = _eepData.entries[i].secs;
+        Serial.printf("[FanStats] Restored today secs=%lu\n", _todayFanSec);
+        break;
+      }
     }
+  } else {
+    _todayKey = 0;
+    _todayFanSec = 0;
+    Serial.println("[FanStats] NTP not synced yet. Postponing date key initialization.");
   }
 
-  // 同步一份到 LittleFS 方便调试
   LittleFS.begin();
   _syncToFile();
 }
 
 // ──── 跨天处理 ─────────────────────────────────────────────
 static void _checkDayRollover() {
+  if (!_isTimeSynced()) return; // 【修复】未同步时不进行日期逻辑，防止假跨天
+
   uint32_t key = _todayDateKey();
+
+  // 【修复】处理首次从未同步突变到同步成功的时刻
+  if (_todayKey == 0) {
+    _todayKey = key;
+    for (int i = 0; i < (int)_eepData.count; i++) {
+      if (_eepData.entries[i].dateKey == _todayKey) {
+        _todayFanSec = _eepData.entries[i].secs;
+        Serial.printf("[FanStats] NTP Synced. Restored today secs=%lu\n", _todayFanSec);
+        break;
+      }
+    }
+    return;
+  }
+
   if (key == _todayKey) return;
 
-  // 跨天：保存昨天，重置今天
+  // 真正的跨天：保存昨天，重置今天
   unsigned long now = millis();
   if (_fanOn && _fanStartMs > 0) {
     _todayFanSec += (now - _fanStartMs) / 1000;
@@ -161,12 +180,11 @@ static void _checkDayRollover() {
 
   _todayKey    = key;
   _todayFanSec = 0;
-  // 确保新的一天在 EEPROM 里有位置（带 0 初始化）
   _findOrAdd(key);
   _eepSave();
+  Serial.printf("[FanStats] Day Rollover! New day key=%lu\n", (unsigned long)_todayKey);
 }
 
-// ──── 继电器状态变更时调用 ────────────────────────────────
 void fanStats_onRelayChange(bool newState) {
   _checkDayRollover();
   unsigned long now = millis();
@@ -180,33 +198,33 @@ void fanStats_onRelayChange(bool newState) {
       _todayFanSec += (now - _fanStartMs) / 1000;
       Serial.printf("[FanStats] Fan off, today total=%lus\n", _todayFanSec);
     }
-    _flushToday(_todayKey, _todayFanSec);
-    _syncToFile();
+    if (_todayKey > 0) {
+      _flushToday(_todayKey, _todayFanSec);
+      _syncToFile();
+    }
     _lastSaveMs = now;
   }
 }
 
-// ──── loop 里调用（跨天检测 + 定时刷盘）─────────────────
 void fanStats_loop() {
   _checkDayRollover();
   unsigned long now = millis();
   if (_fanOn && (now - _lastSaveMs >= SAVE_INTERVAL_MS)) {
     unsigned long live = _todayFanSec + (now - _fanStartMs) / 1000;
-    _flushToday(_todayKey, live);
+    if (_todayKey > 0) {
+      _flushToday(_todayKey, live);
+    }
     _lastSaveMs = now;
   }
 }
 
-// ──── 构建 ECharts 7 天条形图 HTML ───────────────────────
+// ──── 构建 HTML ───
 String fanStats_buildPage() {
-  // 从 EEPROM 镜像读取，实时值叠加今天
   unsigned long liveSec = _todayFanSec;
   if (_fanOn && _fanStartMs > 0)
     liveSec += (millis() - _fanStartMs) / 1000;
 
-  // 临时拷贝，避免修改镜像
   FanStatsEEPROM d = _eepData;
-  // 更新今天实时值
   for (int i = 0; i < (int)d.count; i++) {
     if (d.entries[i].dateKey == _todayKey) {
       d.entries[i].secs = (uint32_t)liveSec;
@@ -214,7 +232,6 @@ String fanStats_buildPage() {
     }
   }
 
-  // 构建 JSON 数组（按日期顺序，oldest first）
   String labels  = "[";
   String dataArr = "[";
   String tips    = "[";
@@ -222,7 +239,6 @@ String fanStats_buildPage() {
   for (int i = 0; i < (int)d.count; i++) {
     if (i) { labels += ","; dataArr += ","; tips += ","; }
     _dateKeyToStr(d.entries[i].dateKey, buf);
-    // 标签只显 MM-DD
     char shortDate[6] = "";
     strncpy(shortDate, buf + 5, 5); shortDate[5] = '\0';
     labels += "\""; labels += shortDate; labels += "\"";

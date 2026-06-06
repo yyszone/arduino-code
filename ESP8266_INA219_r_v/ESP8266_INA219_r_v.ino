@@ -117,6 +117,7 @@ Adafruit_INA219 ina219;
 SMTPSession smtp;
 
 bool relayState = false, ina219_ok = false;
+bool wifiConnected = false; // setup()连接结果，loop()重连逻辑用
 float busVoltage = 0;
 float lowVoltageThreshold = 10.5, highVoltageThreshold = 12.8, warningVoltageThreshold = 11.5;
 bool isLockedOut = false;
@@ -156,7 +157,7 @@ void ICACHE_RAM_ATTR countCpuIdle() {
 // ============== 网页 (HTML+CSS+JS) v6.20 ==============
 // =====================================================
 const char MAIN_HTML_PART1[] PROGMEM = R"HTML(
-<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ESP8266 智能继电器(ESP8266_INA219_r_v)</title><script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script><style>:root{--bg-color:#111827;--card-color:#1f2937;--text-color:#d1d5db;--accent-color:#38bdf8;--green-color:#22c55e;--red-color:#ef4444;--warning-color:#f59e0b;--muted-text:#9ca3af}body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif,"Apple Color Emoji","Segoe UI Emoji";background-color:var(--bg-color);color:var(--text-color);margin:0;padding:15px;display:flex;justify-content:center}h1,h2,h4{margin-top:0;color:#fff;text-align:center}h2{border-top:1px solid #374151;padding-top:15px;margin-top:20px}.container{width:100%;max-width:500px}.card{background-color:var(--card-color);border-radius:12px;padding:20px;margin-bottom:15px;box-shadow:0 4px 6px -1px rgba(0,0,0,.1),0 2px 4px -1px rgba(0,0,0,.06)}.chart-card{padding:20px 0 10px 0;}.chart-card h2{padding:0 20px 15px;margin:0;border:none;}.data-box{text-align:center;padding:10px}.data-box .val{font-size:2.5em;font-weight:700;color:var(--accent-color);line-height:1.2;transition:color .3s ease}.data-box .unit{color:var(--muted-text)}.btn{width:100%;padding:15px;font-size:1.2em;font-weight:bold;border:none;border-radius:8px;cursor:pointer;transition:background-color .2s ease}.btn.on{background-color:var(--green-color);color:#fff}.btn.off{background-color:var(--red-color);color:#fff}.status-light{width:12px;height:12px;border-radius:50%;display:inline-block;margin-right:8px;background-color:#6b7280}.status-light.on{background-color:var(--green-color)}.input-group{display:flex;align-items:center;gap:10px;margin-bottom:10px}.input-group label{flex-basis:120px;flex-shrink:0;font-size:0.9em}input[type=number],input[type=text],input[type=password]{width:100%;padding:8px;background-color:#374151;border:1px solid #4b5563;border-radius:6px;color:var(--text-color);font-size:1em}.btn-save{padding:10px 15px;background-color:var(--accent-color);color:#fff;border:none;border-radius:6px;cursor:pointer}#sysinfo{font-size:.8em;color:var(--muted-text);word-break:break-all}#lockoutStatus{color:var(--red-color);text-align:center;margin-bottom:10px;font-weight:bold;}.toggle-section{cursor:pointer;color:var(--accent-color);text-align:center;font-size:0.9em;margin-top:10px;}</style></head><body><div class="container"><h1>ESP8266 智能继电器</h1><p style="text-align:center;color:var(--muted-text);">当前时间: <span id="currentTime">--:--:--</span></p><div class="card"><div class="data-box"><div>电池电压</div><div class="val" id="v">--</div><div class="unit">V</div></div></div><div class="card"><h2>手动控制</h2><div id="lockoutStatus" style="display:none;"></div><p><span id="relayStatusLight" class="status-light"></span>继电器状态: <strong id="relayStatusText">读取中...</strong></p><button id="relayBtn" class="btn">读取中...</button></div><div class="card"><h2>参数设置</h2><div class="input-group"><label for="highV">高压开启 (V)</label><input type="number" id="highV" step="0.1"></div><div class="input-group"><label for="warnV">电压警告 (V)</label><input type="number" id="warnV" step="0.1"></div><div class="input-group"><label for="lowV">低压关闭 (V)</label><input type="number" id="lowV" step="0.1"></div>
+<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ESP8266 智能继电器</title><script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script><style>:root{--bg-color:#111827;--card-color:#1f2937;--text-color:#d1d5db;--accent-color:#38bdf8;--green-color:#22c55e;--red-color:#ef4444;--warning-color:#f59e0b;--muted-text:#9ca3af}body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif,"Apple Color Emoji","Segoe UI Emoji";background-color:var(--bg-color);color:var(--text-color);margin:0;padding:15px;display:flex;justify-content:center}h1,h2,h4{margin-top:0;color:#fff;text-align:center}h2{border-top:1px solid #374151;padding-top:15px;margin-top:20px}.container{width:100%;max-width:500px}.card{background-color:var(--card-color);border-radius:12px;padding:20px;margin-bottom:15px;box-shadow:0 4px 6px -1px rgba(0,0,0,.1),0 2px 4px -1px rgba(0,0,0,.06)}.chart-card{padding:20px 0 10px 0;}.chart-card h2{padding:0 20px 15px;margin:0;border:none;}.data-box{text-align:center;padding:10px}.data-box .val{font-size:2.5em;font-weight:700;color:var(--accent-color);line-height:1.2;transition:color .3s ease}.data-box .unit{color:var(--muted-text)}.btn{width:100%;padding:15px;font-size:1.2em;font-weight:bold;border:none;border-radius:8px;cursor:pointer;transition:background-color .2s ease}.btn.on{background-color:var(--green-color);color:#fff}.btn.off{background-color:var(--red-color);color:#fff}.status-light{width:12px;height:12px;border-radius:50%;display:inline-block;margin-right:8px;background-color:#6b7280}.status-light.on{background-color:var(--green-color)}.input-group{display:flex;align-items:center;gap:10px;margin-bottom:10px}.input-group label{flex-basis:120px;flex-shrink:0;font-size:0.9em}input[type=number],input[type=text],input[type=password]{width:100%;padding:8px;background-color:#374151;border:1px solid #4b5563;border-radius:6px;color:var(--text-color);font-size:1em}.btn-save{padding:10px 15px;background-color:var(--accent-color);color:#fff;border:none;border-radius:6px;cursor:pointer}#sysinfo{font-size:.8em;color:var(--muted-text);word-break:break-all}#lockoutStatus{color:var(--red-color);text-align:center;margin-bottom:10px;font-weight:bold;}.toggle-section{cursor:pointer;color:var(--accent-color);text-align:center;font-size:0.9em;margin-top:10px;}</style></head><body><div class="container"><h1>ESP8266 智能继电器</h1><p style="text-align:center;color:var(--muted-text);">当前时间: <span id="currentTime">--:--:--</span></p><div class="card"><div class="data-box"><div>电池电压</div><div class="val" id="v">--</div><div class="unit">V</div></div></div><div class="card"><h2>手动控制</h2><div id="lockoutStatus" style="display:none;"></div><p><span id="relayStatusLight" class="status-light"></span>继电器状态: <strong id="relayStatusText">读取中...</strong></p><button id="relayBtn" class="btn">读取中...</button></div><div class="card"><h2>参数设置</h2><div class="input-group"><label for="highV">高压开启 (V)</label><input type="number" id="highV" step="0.1"></div><div class="input-group"><label for="warnV">电压警告 (V)</label><input type="number" id="warnV" step="0.1"></div><div class="input-group"><label for="lowV">低压关闭 (V)</label><input type="number" id="lowV" step="0.1"></div>
 <p style="font-size:0.85em;color:var(--muted-text);text-align:right;">
   邮件通知将发送至: 
   <span id="dispRecvEmail" 
@@ -672,7 +673,7 @@ if (LittleFS.begin()) {
   // 6. WiFi连接（带3次重试，每次最多等10s；全部失败则停电保护：强制开启继电器）
   WiFi.mode(WIFI_STA);
   WiFi.hostname(deviceName);
-  bool wifiConnected = false;
+  wifiConnected = false;
   const int    WIFI_MAX_RETRIES    = 3;
   const unsigned long WIFI_TIMEOUT_MS = 10000UL; // 每次超时10秒
   for (int attempt = 1; attempt <= WIFI_MAX_RETRIES; attempt++) {
@@ -697,7 +698,8 @@ if (LittleFS.begin()) {
     sysLog(LOG_WARN, "WiFi连接失败(3次)，停电保护：强制开启继电器");
     Serial.println("\n[Boot] WiFi失败 → 停电保护，强制 setRelay(ON)");
     setRelay(true);
-    // 后续 NTP/心跳/决策全部跳过，直接进入 server/mDNS 初始化（离线模式）
+    timeClient.begin(); // NTP client 必须初始化，否则连上WiFi后 update() 会崩
+    // 后续 NTP时间同步/心跳/决策跳过，直接进入 server/mDNS 初始化（离线模式）
     goto SETUP_NETWORK_DONE;
   }
 
@@ -803,6 +805,40 @@ void loop() {
   myClock.setBatteryVoltage(busVoltage);  // ← 加这一行
   myClock.loop(); // 【新增：刷新点阵时钟】
   MDNS.update();
+
+  // WiFi 自动重连（离线模式启动后，路由器恢复时自动接入并补做NTP同步）
+  static unsigned long lastWifiCheck = 0;
+  // 正常启动时 wifiConnected=true，ntpSynced 初始即 true，避免重复同步
+  // 离线启动时 wifiConnected=false，ntpSynced 初始为 false，等重连后触发补同步
+  static bool ntpSynced = wifiConnected;
+  static bool prevWifiOk = wifiConnected;
+  if (millis() - lastWifiCheck > 15000) { // 每15秒检查一次
+    lastWifiCheck = millis();
+    bool curWifiOk = (WiFi.status() == WL_CONNECTED);
+    if (!curWifiOk) {
+      if (prevWifiOk) {
+        // 刚断线：标记需要重新同步
+        ntpSynced = false;
+        sysLog(LOG_WARN, "WiFi断线，等待重连...");
+      }
+      Serial.println("[WiFi] 未连接，尝试重连...");
+      WiFi.disconnect(true);
+      delay(200);
+      WiFi.begin(ssid, password);
+      // 非阻塞：本次 loop 先返回，下一个15s周期再确认结果
+    } else if (!ntpSynced) {
+      // 刚重连上——补做一次NTP同步
+      ntpSynced = true;
+      WiFi.setSleepMode(WIFI_NONE_SLEEP);
+      sysLogf(LOG_INFO, "WiFi已连接(重连) IP=%s", WiFi.localIP().toString().c_str());
+      timeClient.begin();
+      timeClient.forceUpdate();
+      configTime(8 * 3600, 0, "ntp.aliyun.com");
+      Serial.println("[WiFi] 重连成功，NTP补同步完成");
+      if (MDNS.begin(deviceName)) MDNS.addService("http", "tcp", WEB_SERVER_PORT);
+    }
+    prevWifiOk = curWifiOk;
+  }
 
   static unsigned long lastVoltageCheck = 0;
   if (millis() - lastVoltageCheck > 5000) {

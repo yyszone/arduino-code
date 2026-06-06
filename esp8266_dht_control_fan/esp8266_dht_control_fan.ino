@@ -490,8 +490,18 @@ void handleApi() {
 // ============================================================
 //  setup
 // ============================================================
+
 void setup() {
-  // [NEW] NTP 时间同步（笔记/统计需要时间）
+  Serial.begin(115200);
+  Serial.println("\n===== ESP8266 智能控制台 启动 =====");
+
+  // 1. 【修复】必须最先初始化 EEPROM 
+  EEPROM.begin(EEPROM_SIZE);
+
+  // 2. 加载主配置
+  loadSettings();
+
+  // 3. NTP 时间同步
   configTime(8 * 3600, 0, "ntp.aliyun.com", "pool.ntp.org");
   Serial.print("[NTP] 同步");
   {
@@ -502,20 +512,14 @@ void setup() {
   }
   Serial.println();
  
-  // [NEW] 初始化统计和笔记模块
+  // 4. 【修复】EEPROM 初始化后，再启动统计和笔记模块
   fanStats_begin();
   fanNote_begin();
  
-  // [NEW] 注册统计图表路由
+  // 注册统计图表路由
   server.on("/stats", HTTP_GET, [](){
     server.send(200, "text/html; charset=utf-8", fanStats_buildPage());
   });
-
-  Serial.begin(115200);
-  Serial.println("\n===== ESP8266 智能控制台 启动 =====");
-
-  // 加载配置
-  loadSettings();
 
   // 硬件初始化
   dht.begin();
@@ -538,25 +542,18 @@ void setup() {
   }
   Serial.println("\n[WiFi] 已连接，IP：" + WiFi.localIP().toString());
 
-  // ---- ArduinoOTA（网络上传，兼容 Arduino IDE）----
+  // ---- ArduinoOTA ----
   ArduinoOTA.setHostname("esp8266-smart");
-  ArduinoOTA.setPassword("ota12345");   // ← IDE 提示输入密码时填这个
-  ArduinoOTA.onStart([]() {
-    Serial.println("[OTA] 开始 ArduinoOTA 升级...");
-  });
-  ArduinoOTA.onEnd([]() {
-    Serial.println("\n[OTA] 完成，重启中");
-  });
+  ArduinoOTA.setPassword("ota12345");
+  ArduinoOTA.onStart([]() { Serial.println("[OTA] 开始 ArduinoOTA 升级..."); });
+  ArduinoOTA.onEnd([]() { Serial.println("\n[OTA] 完成，重启中"); });
   ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
     Serial.printf("[OTA] 进度: %u%%\r", (progress / (total / 100)));
   });
-  ArduinoOTA.onError([](ota_error_t error) {
-    Serial.printf("[OTA] 错误[%u]\n", error);
-  });
+  ArduinoOTA.onError([](ota_error_t error) { Serial.printf("[OTA] 错误[%u]\n", error); });
   ArduinoOTA.begin();
-  Serial.println("[OTA] ArduinoOTA 准备就绪（密码：ota12345）");
 
-  // 注册 Web OTA（POST /update）
+  // 注册 Web OTA
   httpUpdater.setup(&server, "/update");
 
   // 注册页面路由
