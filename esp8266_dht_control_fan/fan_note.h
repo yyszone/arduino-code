@@ -4,14 +4,17 @@
 #include <WiFiClientSecure.h>
 #include <LittleFS.h>
 #include <time.h>
+#include "fan_stats.h"   // 【修复】直接读 EEPROM，不再依赖文件时序
 
 #define FAN_NOTE_URL  "https://note.yysresume.work/api/note-op"
 #define FAN_NOTE_ID   "0cad9dc8-d703-4d20-9d75-cc0ec457b788"
 #define FAN_NOTE_AUTH "a_secret_fixed_token"
-#define NOTE_DONE_FILE "/fan_note_done.txt"  
+#define NOTE_DONE_FILE "/fan_note_done.txt"
 
-static bool _noteWrittenToday = false;
-static char _noteDoneDate[12] = "";   
+// 【修复】用两个标志分离"本次运行已写"和"文件记录已写"，防止重入
+static bool _noteWrittenToday  = false;   // 本次运行内存标志
+static bool _notePosting       = false;   // 防重入锁
+static char _noteDoneDate[12]  = "";
 
 void fanNote_begin() {
   if (!LittleFS.begin()) {
@@ -38,37 +41,11 @@ static String _fmtSec(unsigned long s) {
   return String(buf);
 }
 
-static unsigned long _readDaySec(const char* dateStr) {
-  if (!LittleFS.exists("/fan_daily.txt")) return 0;
-  File f = LittleFS.open("/fan_daily.txt", "r");
-  unsigned long result = 0;
-  while (f.available()) {
-    String line = f.readStringUntil('\n');
-    line.trim();
-    if (line.length() < 11) continue;
-    int tab = line.indexOf('\t');
-    if (tab < 0) continue;
-    if (line.substring(0, tab) == String(dateStr)) {
-      result = line.substring(tab + 1).toInt();
-      break;
-    }
-  }
-  f.close();
-  return result;
-}
-
 static unsigned long _readTotalSec() {
-  if (!LittleFS.exists("/fan_daily.txt")) return 0;
-  File f = LittleFS.open("/fan_daily.txt", "r");
   unsigned long total = 0;
-  while (f.available()) {
-    String line = f.readStringUntil('\n');
-    line.trim();
-    if (line.length() < 3) continue;
-    int tab = line.indexOf('\t');
-    if (tab >= 0) total += line.substring(tab + 1).toInt();
+  for (int i = 0; i < (int)_eepData.count; i++) {
+    total += _eepData.entries[i].secs;
   }
-  f.close();
   return total;
 }
 
@@ -100,7 +77,7 @@ static bool _postNote(const char* dateYesterday, unsigned long daySec) {
   strftime(nowStr, sizeof(nowStr), "%Y-%m-%d %H:%M", lt);
 
   unsigned long totalSec = _readTotalSec();
-  String fanYest = _fmtSec(daySec);
+  String fanYest  = _fmtSec(daySec);
   String fanTotal = _fmtSec(totalSec);
   String ip = WiFi.localIP().toString();
 
@@ -133,42 +110,52 @@ void fanNote_loop() {
   if (WiFi.status() != WL_CONNECTED) return;
 
   time_t now = time(nullptr);
-  if (now < 8 * 3600 * 2) return;   
+  if (now < 8 * 3600 * 2) return;   // NTP 未同步
+
+  // 【修复】防重入：HTTPS 发送期间不允许再次进入
+  if (_notePosting) return;
 
   struct tm* lt = localtime(&now);
-
   char today[12];
   strftime(today, sizeof(today), "%Y-%m-%d", lt);
 
+  // 内存标志优先（本次运行已写过，直接跳过）
   if (_noteWrittenToday && strcmp(_noteDoneDate, today) == 0) return;
 
+  // 文件标志：本次启动后首次进来，同步内存标志
   if (strcmp(_noteDoneDate, today) == 0) {
     _noteWrittenToday = true;
     return;
   }
 
-  // ──── 【修复】HTTPS OOM 崩溃重发的防范逻辑 ────
-  // 1. 发送前先乐观锁写入本地文件，标志“今天已写”
-  File f = LittleFS.open(NOTE_DONE_FILE, "w");
-  if (f) { f.println(today); f.close(); }
-  strncpy(_noteDoneDate, today, sizeof(_noteDoneDate) - 1);
-  _noteWrittenToday = true;
+  // ──── 到这里才真正需要发送 ────────────────────────────────
 
-  // 2. 准备发送数据
+  // 【修复】先计算好昨天数据，再写乐观锁文件
+  // 这样即使崩溃重启，也能保证数据已经在发送时是正确的
+  uint32_t yesterdayKey = fanStats_yesterdayKey();
+  unsigned long daySec  = fanStats_getDaySec(yesterdayKey);  // 直接读 EEPROM，无时序问题
+
   time_t yesterday_t = now - 86400;
   struct tm* yt = localtime(&yesterday_t);
   char yesterday[12];
   strftime(yesterday, sizeof(yesterday), "%Y-%m-%d", yt);
 
-  unsigned long daySec = _readDaySec(yesterday);
   Serial.printf("[FanNote] Posting note for %s, fan=%lus\n", yesterday, daySec);
 
-  // 3. 执行 HTTPS 发送（若在这里崩溃重启，开机后读到本地文件有记录，不再重发）
+  // 乐观锁：先写文件，防止崩溃后重发
+  File f = LittleFS.open(NOTE_DONE_FILE, "w");
+  if (f) { f.println(today); f.close(); }
+  strncpy(_noteDoneDate, today, sizeof(_noteDoneDate) - 1);
+  _noteWrittenToday = true;
+  _notePosting      = true;   // 上锁
+
   bool ok = _postNote(yesterday, daySec);
+  _notePosting = false;       // 解锁
+
   if (ok) {
     Serial.printf("[FanNote] Note successfully written for date %s\n", today);
   } else {
-    // 4. 若没崩溃但发送失败（比如网络抖动），清除本地标记以允许下次 loop 重试
+    // 发送失败（非崩溃），撤销标记，下次 loop 重试
     Serial.println("[FanNote] Post failed, removing local done flag to retry later.");
     _noteWrittenToday = false;
     memset(_noteDoneDate, 0, sizeof(_noteDoneDate));

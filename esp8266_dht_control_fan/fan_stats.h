@@ -6,8 +6,8 @@
 
 // ──── 配置 ─────────────────────────────────────────────────
 #define MAX_DAYS             7
-#define STATS_EEPROM_BASE    100          
-#define STATS_EEPROM_MAGIC   0x46414E53UL 
+#define STATS_EEPROM_BASE    100
+#define STATS_EEPROM_MAGIC   0x46414E53UL
 #define STATS_FILE           "/fan_daily.txt"
 #define SAVE_INTERVAL_MS     60000UL
 
@@ -19,7 +19,7 @@ struct FanDayEntry {
 
 struct FanStatsEEPROM {
   uint32_t    magic;
-  uint32_t    count;                  
+  uint32_t    count;
   FanDayEntry entries[MAX_DAYS];
 };
 
@@ -27,14 +27,14 @@ struct FanStatsEEPROM {
 static bool          _fanOn        = false;
 static unsigned long _fanStartMs   = 0;
 static unsigned long _todayFanSec  = 0;
-static uint32_t      _todayKey     = 0;   
+static uint32_t      _todayKey     = 0;
 static unsigned long _lastSaveMs   = 0;
-static FanStatsEEPROM _eepData;           
+static FanStatsEEPROM _eepData;
 
 // ──── 工具函数 ─────────────────────────────────────────────
 static bool _isTimeSynced() {
   time_t now = time(nullptr);
-  return now > 8 * 3600 * 2; // 判断 NTP 是否已成功同步
+  return now > 8 * 3600 * 2;
 }
 
 static uint32_t _makeDateKey(struct tm* t) {
@@ -72,11 +72,10 @@ static void _eepLoad() {
     return;
   }
 
-  // 【修复】自动过滤掉非法的历史日期（如未同步时间时写入的 1970 年 key）
   int validCount = 0;
   FanDayEntry tempEntries[MAX_DAYS];
   for (uint32_t i = 0; i < _eepData.count; i++) {
-    if (_eepData.entries[i].dateKey >= 20200000UL) { // 过滤掉小于2020年的数据
+    if (_eepData.entries[i].dateKey >= 20200000UL) {
       tempEntries[validCount++] = _eepData.entries[i];
     }
   }
@@ -89,11 +88,13 @@ static void _eepLoad() {
   }
 }
 
+// ──── 【修复】_findOrAdd：新增时按 dateKey 升序插入，保证历史顺序 ──
 static int _findOrAdd(uint32_t key) {
   for (int i = 0; i < (int)_eepData.count; i++) {
     if (_eepData.entries[i].dateKey == key) return i;
   }
   if (_eepData.count >= MAX_DAYS) {
+    // 淘汰最旧的一条（第0条）
     memmove(&_eepData.entries[0], &_eepData.entries[1],
             sizeof(FanDayEntry) * (MAX_DAYS - 1));
     _eepData.count = MAX_DAYS - 1;
@@ -128,16 +129,14 @@ static void _syncToFile() {
 void fanStats_begin() {
   _eepLoad();
 
-  // 【修复】仅在 NTP 已同步时初始化今日 key，否则延后处理
   if (_isTimeSynced()) {
     _todayKey = _todayDateKey();
-    for (int i = 0; i < (int)_eepData.count; i++) {
-      if (_eepData.entries[i].dateKey == _todayKey) {
-        _todayFanSec = _eepData.entries[i].secs;
-        Serial.printf("[FanStats] Restored today secs=%lu\n", _todayFanSec);
-        break;
-      }
-    }
+    // 【修复】确保今天的 entry 一定存在，即使今天风扇还没开过
+    int idx = _findOrAdd(_todayKey);
+    _todayFanSec = _eepData.entries[idx].secs;
+    Serial.printf("[FanStats] Today key=%lu, restored secs=%lu\n",
+                  (unsigned long)_todayKey, _todayFanSec);
+    _eepSave();
   } else {
     _todayKey = 0;
     _todayFanSec = 0;
@@ -150,38 +149,38 @@ void fanStats_begin() {
 
 // ──── 跨天处理 ─────────────────────────────────────────────
 static void _checkDayRollover() {
-  if (!_isTimeSynced()) return; // 【修复】未同步时不进行日期逻辑，防止假跨天
+  if (!_isTimeSynced()) return;
 
   uint32_t key = _todayDateKey();
 
-  // 【修复】处理首次从未同步突变到同步成功的时刻
   if (_todayKey == 0) {
     _todayKey = key;
-    for (int i = 0; i < (int)_eepData.count; i++) {
-      if (_eepData.entries[i].dateKey == _todayKey) {
-        _todayFanSec = _eepData.entries[i].secs;
-        Serial.printf("[FanStats] NTP Synced. Restored today secs=%lu\n", _todayFanSec);
-        break;
-      }
-    }
+    // 【修复】NTP 首次同步时，同样确保今天 entry 存在
+    int idx = _findOrAdd(_todayKey);
+    _todayFanSec = _eepData.entries[idx].secs;
+    _eepSave();
+    _syncToFile();
+    Serial.printf("[FanStats] NTP Synced. key=%lu secs=%lu\n",
+                  (unsigned long)_todayKey, _todayFanSec);
     return;
   }
 
   if (key == _todayKey) return;
 
-  // 真正的跨天：保存昨天，重置今天
+  // 真正跨天：flush 昨天，初始化今天
   unsigned long now = millis();
   if (_fanOn && _fanStartMs > 0) {
     _todayFanSec += (now - _fanStartMs) / 1000;
     _fanStartMs   = now;
   }
   _flushToday(_todayKey, _todayFanSec);
-  _syncToFile();
 
   _todayKey    = key;
   _todayFanSec = 0;
+  // 【修复】新的一天立即建 entry，stats 页能看到今天（即使风扇没开）
   _findOrAdd(key);
   _eepSave();
+  _syncToFile();
   Serial.printf("[FanStats] Day Rollover! New day key=%lu\n", (unsigned long)_todayKey);
 }
 
@@ -216,6 +215,22 @@ void fanStats_loop() {
     }
     _lastSaveMs = now;
   }
+}
+
+// ──── 对外查询（供 fan_note.h 在零点前获取昨天数据）─────────
+// 【新增】按 dateKey 查找秒数，fanNote 调此函数替代读文件
+unsigned long fanStats_getDaySec(uint32_t key) {
+  for (int i = 0; i < (int)_eepData.count; i++) {
+    if (_eepData.entries[i].dateKey == key) return _eepData.entries[i].secs;
+  }
+  return 0;
+}
+
+// 昨天的 dateKey
+uint32_t fanStats_yesterdayKey() {
+  time_t t = time(nullptr) - 86400;
+  struct tm* yt = localtime(&t);
+  return _makeDateKey(yt);
 }
 
 // ──── 构建 HTML ───
