@@ -227,14 +227,7 @@ function saveEmailConfig(){
   const url = `/setEmail?host=${encodeURIComponent(host)}&port=${port}&user=${encodeURIComponent(user)}&pass=${encodeURIComponent(pass)}&to=${encodeURIComponent(to)}`;
   fetch(url).then(r=>{if(r.ok){alert('邮件配置已保存! 以后将发送通知至: '+to);$('dispRecvEmail').textContent = to;} else { alert('保存失败!'); }}).catch(e=>alert('请求出错: '+e));
 }
-$('relayBtn').addEventListener('click', () => {
-  const newState = $('relayBtn').classList.contains('on');
-  // 立即更新 UI（不等网络）
-  updateStatus({ relay: !newState, lockout: false, lockout_rem: 0 });
-  fetch('/setRelay?state=' + (newState ? '1' : '0'))
-    .then(r => { if (!r.ok) fetchData(); }) // 失败才回滚
-    .catch(() => fetchData());
-});
+$('relayBtn').addEventListener('click',()=>{const newState=$('relayBtn').classList.contains('on');fetch('/setRelay?state='+(newState?'1':'0')).then(()=>setTimeout(fetchData,200))});
 $('otaForm').addEventListener('submit', function(e){$('otaUi').style.display='none';$('otaStatus').innerHTML='<h4>正在上传并更新...</h4><p>请勿关闭此页面或断开设备电源。设备将在大约一分钟后自动重启。</p>';});
 
 async function initChart(){
@@ -501,6 +494,7 @@ void handleRoot() {
 
 void handleGetData() {
   if (ina219_ok) busVoltage = ina219.getBusVoltage_V();
+  timeClient.update();
   long remaining_min = isLockedOut ? (LOCKOUT_DURATION_MS - (millis() - lockoutStartTime)) / 60000 : 0;
   
   String json = "{";
@@ -644,7 +638,7 @@ void setup() {
   // 6. WiFi连接
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(deviceName); // 【修改】ESP32 设置主机名
-  WiFi.enableIPv6();            // 启用 IPv6
+  
   wifiConnected = false;
   const int    WIFI_MAX_RETRIES    = 3;
   const unsigned long WIFI_TIMEOUT_MS = 10000UL; 
@@ -674,6 +668,7 @@ void setup() {
   }
 
   WiFi.setSleep(false); // 【修改】ESP32 关闭 WiFi 自动睡眠防掉线
+  WiFi.enableIPv6();  
   ipv6Mgr.onWiFiConnected();   // 等待 RA 下发，缓存 IPv6 地址
   sysLogf(LOG_BOOT, "WiFi已连接 IP=%s IPv6=%s", WiFi.localIP().toString().c_str(), ipv6Mgr.cached().c_str());
 
@@ -809,6 +804,8 @@ void loop() {
     } else if (!ntpSynced) {
       ntpSynced = true;
       WiFi.setSleep(false); 
+      WiFi.enableIPv6();        // ← 移到这里，连上之后再启用
+      ipv6Mgr.onWiFiConnected();
       sysLogf(LOG_INFO, "WiFi已连接(重连) IP=%s", WiFi.localIP().toString().c_str());
       timeClient.begin();
       timeClient.forceUpdate();

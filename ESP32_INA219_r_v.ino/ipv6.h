@@ -1,10 +1,9 @@
 #pragma once
 // =============================================================================
-// ==  ipv6.h  —  ESP32 IPv6 工具模块                                        ==
+// ==  ipv6.h  —  ESP32 IPv6 工具模块 (完全非阻塞高效率版)                      ==
 // ==  依赖: <WiFi.h> <WebServer.h> <esp_netif.h>                            ==
-// ==  用法: #include "ipv6.h"                                                ==
-// ==        在 setup() 中调用 IPv6.begin(server);                            ==
-// ==        在 WiFi 连接成功后调用 IPv6.onWiFiConnected();                  ==
+// ==  说明: 移除了原有的 while-delay 阻塞设计，改用后台异步更新机制，         ==
+// ==        避免在 WiFi 连接/重连时导致主循环及 WS2812 点阵卡顿。             ==
 // =============================================================================
 
 #include <WiFi.h>
@@ -39,36 +38,52 @@ public:
     });
   }
 
-  // ── WiFi 连接成功后调用：启用 IPv6 并缓存地址 ───────────────────────────
-  // 注意：WiFi.enableIPv6() 必须在 WiFi.begin() 之前调用，
-  //       onWiFiConnected() 在 WL_CONNECTED 后调用，等待 RA 下发。
-  void onWiFiConnected(unsigned long waitMs = 2000) {
-    // 等路由通告(RA)下发全局地址，最多 waitMs 毫秒
-    unsigned long t0 = millis();
-    while (millis() - t0 < waitMs) {
-      String addr = _fetchGlobal();
-      if (addr.length() > 0) { _cache = addr; return; }
-      delay(200);
-    }
-    // 超时退而缓存 Link-local
-    _cache = _fetchLinkLocal();
+  // ── WiFi 连接成功后调用：非阻塞初始化 ──────────────────────────────────
+  // 不再进行任何死等，ESP32 协议栈会在后台异步接收 RA 通告并生成 Global IP
+  void onWiFiConnected() {
+    updateCache();
   }
 
-  // ── 获取当前 IPv6 地址（优先 Global > Link-local）────────────────────────
-  // 每次调用都实时查询，不依赖缓存（适合 handler 里调用）
+  // ── 实时获取当前 IPv6 地址（优先 Global > Link-local）──────────────────
+  // 每次调用时实时查询，并在获取到有效地址时动态更新缓存（无阻塞设计）
   String getAddress() {
+    if (WiFi.status() != WL_CONNECTED) return _cache; // 断线时直接返回上一次的缓存值
+    
+    // 尝试获取全局单播地址
     String g = _fetchGlobal();
-    if (g.length() > 0) return g;
+    if (g.length() > 0) {
+      _cache = g; // 动态更新缓存
+      return g;
+    }
+    
+    // 降级尝试获取链路本地地址
     String ll = _fetchLinkLocal();
-    if (ll.length() > 0) return ll;
-    return String("Not Available");
+    if (ll.length() > 0) {
+      _cache = ll; // 动态更新缓存
+      return ll;
+    }
+    
+    return _cache;
   }
 
-  // ── 返回上次 onWiFiConnected() 缓存的地址（轻量，无系统调用）─────────────
+  // ── 主动尝试更新一次缓存（非阻塞）──────────────────────────────────────
+  void updateCache() {
+    if (WiFi.status() != WL_CONNECTED) return;
+    String g = _fetchGlobal();
+    if (g.length() > 0) {
+      _cache = g;
+    } else {
+      String ll = _fetchLinkLocal();
+      if (ll.length() > 0) {
+        _cache = ll;
+      }
+    }
+  }
+
+  // ── 返回上次缓存的地址（轻量，无系统接口调用）──────────────────────────
   const String &cached() const { return _cache; }
 
   // ── 将 IPv6 追加到已有 JSON 字符串末尾（逗号紧随其后）──────────────────
-  //    用法: appendJSON(json);  然后继续 json += "\"next\":..." ;
   void appendJSON(String &json) {
     json += "\"ipv6\":\"" + getAddress() + "\",";
   }
@@ -84,9 +99,11 @@ private:
     esp_netif_t *ni = _netif();
     if (!ni) return String();
     esp_ip6_addr_t addr;
-    if (esp_netif_get_ip6_global(ni, &addr) == ESP_OK)
-      if (addr.addr[0] || addr.addr[1] || addr.addr[2] || addr.addr[3])
+    if (esp_netif_get_ip6_global(ni, &addr) == ESP_OK) {
+      if (addr.addr[0] || addr.addr[1] || addr.addr[2] || addr.addr[3]) {
         return _ipv6_format(&addr);
+      }
+    }
     return String();
   }
 
@@ -94,12 +111,14 @@ private:
     esp_netif_t *ni = _netif();
     if (!ni) return String();
     esp_ip6_addr_t addr;
-    if (esp_netif_get_ip6_linklocal(ni, &addr) == ESP_OK)
-      if (addr.addr[0] || addr.addr[1] || addr.addr[2] || addr.addr[3])
+    if (esp_netif_get_ip6_linklocal(ni, &addr) == ESP_OK) {
+      if (addr.addr[0] || addr.addr[1] || addr.addr[2] || addr.addr[3]) {
         return _ipv6_format(&addr);
+      }
+    }
     return String();
   }
 };
 
-// 全局单例（注意：不能命名为 IPv6，与 Arduino IPAddress.h 中的枚举值冲突）
+// 全局单例
 IPv6Manager ipv6Mgr;
