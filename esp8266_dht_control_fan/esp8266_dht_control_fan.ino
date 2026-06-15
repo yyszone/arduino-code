@@ -2,6 +2,7 @@
  * ESP8266 智能控制台
  * 功能：DHT11 温度/湿度 + PIR 人体感应 + 继电器自动控制
  * 新增：Web OTA 固件升级 / EEPROM 参数持久化 / 美化界面
+ * 更新：PIR 多重确认次数可配置，有效降低误触发
  */
 
 #include <ESP8266WiFi.h>
@@ -10,8 +11,8 @@
 #include <ArduinoOTA.h>
 #include <DHT.h>
 #include <EEPROM.h>
-#include "fan_stats.h"  // [NEW] 7天统计 + ECharts
-#include "fan_note.h"   // [NEW] 每日云端笔记
+#include "fan_stats.h"  // 7天统计 + ECharts
+#include "fan_note.h"   // 每日云端笔记
 
 // ===== WiFi 配置 =====
 const char* ssid     = "yang1234";
@@ -29,19 +30,21 @@ ESP8266HTTPUpdateServer httpUpdater;
 
 // ===== EEPROM 配置 =====
 #define EEPROM_SIZE  512
-#define EEPROM_MAGIC 0xAB  // 魔数，用于判断 EEPROM 是否已写入过有效数据
+#define EEPROM_MAGIC 0xAC   // 魔数升版（原0xAB），强制新字段生效
 
 struct Settings {
   uint8_t  magic;
   float    temperatureThreshold;  // 温度阈值 °C
   uint32_t detectionWindow;       // 检测窗口 ms
   uint32_t checkInterval;         // 检查间隔 ms
+  uint8_t  pirConfirmN;           // PIR 多重确认次数（1~10）
 };
 
 // ===== 控制变量（从 EEPROM 加载或使用默认值）=====
 float         temperatureThreshold = 25.0;
 unsigned long detectionWindow      = 30 * 1000UL;
-unsigned long checkInterval        = 2000UL;
+unsigned long checkInterval        = 500UL;    // 默认改为 500ms，配合多重确认
+uint8_t       pirConfirmN          = 3;        // 默认连续 3 次 HIGH 才触发
 
 // ===== 状态变量 =====
 unsigned long lastMotionTime = 0;
@@ -49,12 +52,13 @@ unsigned long lastCheckTime  = 0;
 float         temperature    = 0.0;
 float         humidity       = 0.0;
 bool          relayState     = false;
-bool          manualOverride = false;   // 手动控制标志
+bool          manualOverride = false;
 
-// ===== 去抖参数 =====
-static bool          lastPirState   = LOW;
-static unsigned long lastPirTrigger = 0;
-const  unsigned long pirMinInterval = 1000;
+// ===== PIR 多重确认去抖 =====
+static bool          lastPirState    = LOW;
+static unsigned long lastPirTrigger  = 0;
+static uint8_t       pirConfirmCount = 0;
+const  unsigned long pirMinInterval  = 2000;   // 两次有效触发之间最小间隔 2s
 
 // ============================================================
 //  EEPROM 读写
@@ -65,11 +69,13 @@ void loadSettings() {
   EEPROM.get(0, s);
   if (s.magic == EEPROM_MAGIC &&
       s.temperatureThreshold > -40 && s.temperatureThreshold < 100 &&
-      s.detectionWindow >= 5000 && s.detectionWindow <= 3600000UL &&
-      s.checkInterval   >= 500  && s.checkInterval   <= 60000UL) {
+      s.detectionWindow >= 5000    && s.detectionWindow <= 3600000UL &&
+      s.checkInterval   >= 500     && s.checkInterval   <= 60000UL  &&
+      s.pirConfirmN >= 1           && s.pirConfirmN <= 10) {
     temperatureThreshold = s.temperatureThreshold;
     detectionWindow      = s.detectionWindow;
     checkInterval        = s.checkInterval;
+    pirConfirmN          = s.pirConfirmN;
     Serial.println("[EEPROM] 配置已加载");
   } else {
     Serial.println("[EEPROM] 使用默认配置");
@@ -82,6 +88,7 @@ void saveSettings() {
   s.temperatureThreshold = temperatureThreshold;
   s.detectionWindow      = detectionWindow;
   s.checkInterval        = checkInterval;
+  s.pirConfirmN          = pirConfirmN;
   EEPROM.put(0, s);
   EEPROM.commit();
   Serial.println("[EEPROM] 配置已保存");
@@ -146,7 +153,6 @@ void handleRoot() {
 
   String html = htmlHead("ESP8266 智能控制台");
 
-  // 顶部导航
   html += F("<div class='hdr'><h1>🏠 ESP8266 智能控制台</h1>"
             "<p>实时监控 · 自动控制 · 远程管理</p></div>"
             "<div class='nav'>"
@@ -154,7 +160,7 @@ void handleRoot() {
             "<a href='/config'>⚙️ 参数配置</a>"
             "<a href='/ota'>📦 OTA 升级</a>"
             "<a href='/sysinfo'>🖥️ 系统信息</a>"
-            "<a href='/stats'>📈 风扇统计</a>" 
+            "<a href='/stats'>📈 风扇统计</a>"
             "</div>");
 
   html += F("<div class='wrap'>");
@@ -219,7 +225,9 @@ void handleRoot() {
             "<div class='info-item'><div class='k'>检测窗口</div><div class='v'>");
   html += String(detectionWindow / 1000) + F(" 秒</div></div>"
             "<div class='info-item'><div class='k'>检查间隔</div><div class='v'>");
-  html += String(checkInterval / 1000) + F(" 秒</div></div>"
+  html += String(checkInterval / 1000.0f, 1) + F(" 秒</div></div>"
+            "<div class='info-item'><div class='k'>PIR确认次数</div><div class='v'>");
+  html += String(pirConfirmN) + F(" 次</div></div>"
             "<div class='info-item'><div class='k'>逻辑说明</div>"
             "<div class='v' style='font-size:.85em;color:#94a3b8'>"
             "人体活跃 且 温度超阈值 → 开继电器</div></div>"
@@ -227,7 +235,6 @@ void handleRoot() {
 
   html += F("</div>"); // end .wrap
 
-  // 自动刷新脚本
   html += F("<div class='footer'>ESP8266 智能控制台(esp8266_dht_control_fan) — 5秒自动刷新</div>"
             "<script>setTimeout(()=>location.reload(),5000)</script>"
             "</body></html>");
@@ -258,10 +265,22 @@ void handleConfig() {
             "<input type='number' id='win' min='5' max='3600' value='");
   html += String(detectionWindow / 1000);
   html += F("'></div>"
-            "<div class='fg'><label>🔁 检查间隔 (秒) — 逻辑刷新频率</label>"
-            "<input type='number' id='itv' min='1' max='60' value='");
-  html += String(checkInterval / 1000);
-  html += F("'></div></div>"
+            "<div class='fg'><label>🔁 检查间隔 (秒) — 逻辑刷新频率，建议 0.5</label>"
+            "<input type='number' id='itv' step='0.5' min='0.5' max='60' value='");
+  html += String(checkInterval / 1000.0f, 1);
+  html += F("'></div>"
+            "<div class='fg'><label>🛡️ PIR确认次数 (1~10) — 连续N次HIGH才触发，越大越严格</label>"
+            "<input type='number' id='cfn' min='1' max='10' value='");
+  html += String(pirConfirmN);
+  html += F("'></div>"
+            "</div>"
+            "<div style='margin-top:12px;padding:10px 14px;background:#0f172a;"
+            "border-radius:8px;border:1px solid #334155;font-size:.82em;color:#64748b;line-height:1.8'>"
+            "💡 <strong style='color:#94a3b8'>防误触建议：</strong>"
+            "检查间隔设 <strong style='color:#60a5fa'>0.5秒</strong>，"
+            "PIR确认次数设 <strong style='color:#60a5fa'>3~5次</strong>（即连续 1.5~2.5 秒持续感应才触发）。"
+            "热气流、马桶热源通常只引起 1~2 次短暂高电平，可被过滤。"
+            "</div>"
             "<div class='brow'>"
             "<button class='btn bp' onclick='doSave()'>💾 保存到 EEPROM</button>"
             "<button class='btn bd' onclick='doReset()'>↩️ 恢复默认值</button>"
@@ -272,8 +291,9 @@ void handleConfig() {
             "function doSave(){"
             "  var t=document.getElementById('thr').value,"
             "      w=document.getElementById('win').value,"
-            "      i=document.getElementById('itv').value;"
-            "  fetch('/settings?threshold='+t+'&window='+w+'&interval='+i)"
+            "      i=document.getElementById('itv').value,"
+            "      n=document.getElementById('cfn').value;"
+            "  fetch('/settings?threshold='+t+'&window='+w+'&interval='+i+'&confirmN='+n)"
             "    .then(r=>r.text()).then(m=>{"
             "      var el=document.getElementById('msg');"
             "      el.style.color='#4ade80';el.textContent='✅ '+m;"
@@ -284,7 +304,7 @@ void handleConfig() {
             "}"
             "function doReset(){"
             "  if(!confirm('恢复默认值？'))return;"
-            "  fetch('/settings?threshold=25&window=30&interval=2')"
+            "  fetch('/settings?threshold=25&window=30&interval=0.5&confirmN=3')"
             "    .then(r=>r.text()).then(()=>location.reload());"
             "}"
             "</script></body></html>");
@@ -384,7 +404,6 @@ void handleSysInfo() {
             "<div class='sec'><h2>🖥️ 系统信息</h2>"
             "<div class='info-row'>");
 
-  // 逐项输出信息
   auto infoItem = [&](const String& k, const String& v) {
     html += F("<div class='info-item' style='min-width:200px'>"
               "<div class='k'>") + k + F("</div><div class='v'>") + v + F("</div></div>");
@@ -426,8 +445,13 @@ void handleSettings() {
     if (v >= 5000 && v <= 3600000UL) { detectionWindow = v; changed = true; }
   }
   if (server.hasArg("interval")) {
-    unsigned long v = (unsigned long)server.arg("interval").toInt() * 1000UL;
+    // 支持小数（如 0.5），用 toFloat 再转 ms
+    unsigned long v = (unsigned long)(server.arg("interval").toFloat() * 1000.0f);
     if (v >= 500 && v <= 60000UL) { checkInterval = v; changed = true; }
+  }
+  if (server.hasArg("confirmN")) {
+    int v = server.arg("confirmN").toInt();
+    if (v >= 1 && v <= 10) { pirConfirmN = (uint8_t)v; changed = true; }
   }
   if (changed) {
     saveSettings();
@@ -449,7 +473,7 @@ void handleRelayOff() {
   manualOverride = true;
   relayState = false;
   digitalWrite(RELAYPIN, LOW);
-  fanStats_onRelayChange(false); 
+  fanStats_onRelayChange(false);
   server.send(200, "text/plain", "OFF");
 }
 
@@ -467,21 +491,22 @@ void handleReboot() {
 }
 
 // ============================================================
-//  JSON API（可供外部应用调用）
+//  JSON API
 // ============================================================
 void handleApi() {
   unsigned long now = millis();
   String json = "{";
-  json += "\"temperature\":" + String(temperature, 1) + ",";
-  json += "\"humidity\":"    + String(humidity, 1) + ",";
-  json += "\"relay\":"       + String(relayState ? "true" : "false") + ",";
-  json += "\"manual\":"      + String(manualOverride ? "true" : "false") + ",";
-  json += "\"motion\":"      + String((now - lastMotionTime <= detectionWindow) ? "true" : "false") + ",";
-  json += "\"motionAge\":"   + String((now - lastMotionTime) / 1000) + ",";
-  json += "\"threshold\":"   + String(temperatureThreshold, 1) + ",";
-  json += "\"window\":"      + String(detectionWindow / 1000) + ",";
-  json += "\"interval\":"    + String(checkInterval / 1000) + ",";
-  json += "\"uptime\":"      + String(now / 1000);
+  json += "\"temperature\":"  + String(temperature, 1) + ",";
+  json += "\"humidity\":"     + String(humidity, 1) + ",";
+  json += "\"relay\":"        + String(relayState ? "true" : "false") + ",";
+  json += "\"manual\":"       + String(manualOverride ? "true" : "false") + ",";
+  json += "\"motion\":"       + String((now - lastMotionTime <= detectionWindow) ? "true" : "false") + ",";
+  json += "\"motionAge\":"    + String((now - lastMotionTime) / 1000) + ",";
+  json += "\"threshold\":"    + String(temperatureThreshold, 1) + ",";
+  json += "\"window\":"       + String(detectionWindow / 1000) + ",";
+  json += "\"interval\":"     + String(checkInterval / 1000.0f, 1) + ",";
+  json += "\"pirConfirmN\":"  + String(pirConfirmN) + ",";
+  json += "\"uptime\":"       + String(now / 1000);
   json += "}";
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.send(200, "application/json", json);
@@ -490,15 +515,14 @@ void handleApi() {
 // ============================================================
 //  setup
 // ============================================================
-
 void setup() {
   Serial.begin(115200);
   Serial.println("\n===== ESP8266 智能控制台 启动 =====");
 
-  // 1. 【修复】必须最先初始化 EEPROM 
+  // 1. 最先初始化 EEPROM
   EEPROM.begin(EEPROM_SIZE);
 
-  // 2. 加载主配置
+  // 2. 加载主配置（含 pirConfirmN）
   loadSettings();
 
   // 3. NTP 时间同步
@@ -511,11 +535,11 @@ void setup() {
     }
   }
   Serial.println();
- 
-  // 4. 【修复】EEPROM 初始化后，再启动统计和笔记模块
+
+  // 4. EEPROM 初始化后，再启动统计和笔记模块
   fanStats_begin();
   fanNote_begin();
- 
+
   // 注册统计图表路由
   server.on("/stats", HTTP_GET, [](){
     server.send(200, "text/html; charset=utf-8", fanStats_buildPage());
@@ -542,11 +566,11 @@ void setup() {
   }
   Serial.println("\n[WiFi] 已连接，IP：" + WiFi.localIP().toString());
 
-  // ---- ArduinoOTA ----
+  // ArduinoOTA
   ArduinoOTA.setHostname("esp8266-smart");
   ArduinoOTA.setPassword("ota12345");
-  ArduinoOTA.onStart([]() { Serial.println("[OTA] 开始 ArduinoOTA 升级..."); });
-  ArduinoOTA.onEnd([]() { Serial.println("\n[OTA] 完成，重启中"); });
+  ArduinoOTA.onStart([]()   { Serial.println("[OTA] 开始升级..."); });
+  ArduinoOTA.onEnd([]()     { Serial.println("\n[OTA] 完成，重启中"); });
   ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
     Serial.printf("[OTA] 进度: %u%%\r", (progress / (total / 100)));
   });
@@ -557,10 +581,10 @@ void setup() {
   httpUpdater.setup(&server, "/update");
 
   // 注册页面路由
-  server.on("/",        HTTP_GET,  handleRoot);
-  server.on("/config",  HTTP_GET,  handleConfig);
-  server.on("/ota",     HTTP_GET,  handleOtaPage);
-  server.on("/sysinfo", HTTP_GET,  handleSysInfo);
+  server.on("/",        HTTP_GET, handleRoot);
+  server.on("/config",  HTTP_GET, handleConfig);
+  server.on("/ota",     HTTP_GET, handleOtaPage);
+  server.on("/sysinfo", HTTP_GET, handleSysInfo);
 
   // 注册 API 路由
   server.on("/settings",   HTTP_GET, handleSettings);
@@ -572,6 +596,7 @@ void setup() {
 
   server.begin();
   Serial.println("[Web] 服务器已启动");
+  Serial.printf("[PIR] 多重确认模式，N=%d，采样间隔=%lums\n", pirConfirmN, checkInterval);
   Serial.println("===================================");
 }
 
@@ -582,20 +607,35 @@ void loop() {
   unsigned long now = millis();
   ArduinoOTA.handle();
   server.handleClient();
-  fanStats_loop();   // [NEW] 周期性刷盘 + 跨天检测
-  fanNote_loop();    // [NEW] 每天 0 点后写一次笔记
-  // 非阻塞定时检查
+  fanStats_loop();
+  fanNote_loop();
+
   if (now - lastCheckTime < checkInterval) return;
   lastCheckTime = now;
 
-  // —— PIR 上升沿 + 最小间隔去抖 ——
+  // —— PIR 多重确认去抖 ——
+  // 需要连续 pirConfirmN 次采样都是 HIGH，才算一次有效触发
+  // 热气流/马桶热源通常只引起短暂1~2次高电平，可被过滤
   bool pir = digitalRead(PIRPIN);
-  if (pir && !lastPirState && (now - lastPirTrigger > pirMinInterval)) {
-    lastMotionTime = now;
-    lastPirTrigger = now;
-    Serial.println("[PIR] 👤 有效人体触发");
+
+  if (pir) {
+    pirConfirmCount++;
+  } else {
+    pirConfirmCount = 0;   // 只要有一次 LOW，清零重来
   }
-  lastPirState = pir;
+
+  if (pirConfirmCount >= pirConfirmN
+      && !lastPirState
+      && (now - lastPirTrigger > pirMinInterval)) {
+    lastMotionTime  = now;
+    lastPirTrigger  = now;
+    lastPirState    = true;
+    pirConfirmCount = 0;
+    Serial.printf("[PIR] 👤 有效触发（连续确认 %d 次）\n", pirConfirmN);
+  }
+
+  // PIR 回到 LOW 后重置状态，允许下一次确认重新开始
+  if (!pir) lastPirState = false;
 
   // —— 读取 DHT11 ——
   float t = dht.readTemperature();
@@ -611,7 +651,7 @@ void loop() {
     if (shouldOn != relayState) {
       relayState = shouldOn;
       digitalWrite(RELAYPIN, relayState ? HIGH : LOW);
-      fanStats_onRelayChange(relayState);  // [NEW]
+      fanStats_onRelayChange(relayState);
       Serial.printf("[Relay] %s 继电器 (温度=%.1f°C, 运动=%s)\n",
                     relayState ? "✅ 打开" : "⛔ 关闭",
                     temperature,

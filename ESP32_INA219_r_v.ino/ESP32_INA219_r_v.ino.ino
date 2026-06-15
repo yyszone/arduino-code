@@ -11,6 +11,7 @@ I2C 传感器	INA219 SCL	GPIO 5	避开 GPIO 9 以防上电异常
 #include <WiFi.h>              // 【修改】
 #include <WebServer.h>         // 【修改】
 #include <ESPmDNS.h>           // 【修改】
+#include "ipv6.h"              // IPv6 工具模块
 #include <Wire.h>
 #include <Adafruit_INA219.h>
 #include <NTPClient.h>
@@ -166,7 +167,7 @@ function fetchInitialState(){fetchJson('/getStatus').then(data=>{
   $('lowV').value=data.low_v;
   $('warnV').value=data.warn_v;
   $('highV').value=data.high_v;
-  $('sysinfo').innerHTML=`IPv4: ${data.ip}<br>芯片ID: ${data.chip_id}<br>CPU繁忙度: ${data.cpu_usage}%<br>内存(RAM): ${data.free_heap} / ${data.total_heap} KB<br>存储(Flash): ${data.fs_free} / ${data.fs_total} KB`;
+  $('sysinfo').innerHTML=`IPv4: ${data.ip}<br>IPv6: ${data.ipv6}<br>芯片ID: ${data.chip_id}<br>CPU繁忙度: ${data.cpu_usage}%<br>内存(RAM): ${data.free_heap} / ${data.total_heap} KB<br>存储(Flash): ${data.fs_free} / ${data.fs_total} KB`;
   $('smtpHost').value = data.mail_host;
   $('smtpPort').value = data.mail_port;
   $('authEmail').value = data.mail_user;
@@ -226,7 +227,14 @@ function saveEmailConfig(){
   const url = `/setEmail?host=${encodeURIComponent(host)}&port=${port}&user=${encodeURIComponent(user)}&pass=${encodeURIComponent(pass)}&to=${encodeURIComponent(to)}`;
   fetch(url).then(r=>{if(r.ok){alert('邮件配置已保存! 以后将发送通知至: '+to);$('dispRecvEmail').textContent = to;} else { alert('保存失败!'); }}).catch(e=>alert('请求出错: '+e));
 }
-$('relayBtn').addEventListener('click',()=>{const newState=$('relayBtn').classList.contains('on');fetch('/setRelay?state='+(newState?'1':'0')).then(()=>setTimeout(fetchData,200))});
+$('relayBtn').addEventListener('click', () => {
+  const newState = $('relayBtn').classList.contains('on');
+  // 立即更新 UI（不等网络）
+  updateStatus({ relay: !newState, lockout: false, lockout_rem: 0 });
+  fetch('/setRelay?state=' + (newState ? '1' : '0'))
+    .then(r => { if (!r.ok) fetchData(); }) // 失败才回滚
+    .catch(() => fetchData());
+});
 $('otaForm').addEventListener('submit', function(e){$('otaUi').style.display='none';$('otaStatus').innerHTML='<h4>正在上传并更新...</h4><p>请勿关闭此页面或断开设备电源。设备将在大约一分钟后自动重启。</p>';});
 
 async function initChart(){
@@ -493,7 +501,6 @@ void handleRoot() {
 
 void handleGetData() {
   if (ina219_ok) busVoltage = ina219.getBusVoltage_V();
-  timeClient.update();
   long remaining_min = isLockedOut ? (LOCKOUT_DURATION_MS - (millis() - lockoutStartTime)) / 60000 : 0;
   
   String json = "{";
@@ -514,6 +521,7 @@ void handleGetStatus() {
   json += "\"warn_v\":" + String(warningVoltageThreshold, 2) + ",";
   json += "\"high_v\":" + String(highVoltageThreshold, 2) + ",";
   json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
+  ipv6Mgr.appendJSON(json);    // 追加 "ipv6":"xxxx",
   json += "\"chip_id\":\"" + String(getChipId(), HEX) + "\","; // 【修改】
   
   // 【修改】移除了 ESP8266 特有的 FSInfo 限制，直接使用 ESP32 LittleFS API
@@ -636,6 +644,7 @@ void setup() {
   // 6. WiFi连接
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(deviceName); // 【修改】ESP32 设置主机名
+  WiFi.enableIPv6();            // 启用 IPv6
   wifiConnected = false;
   const int    WIFI_MAX_RETRIES    = 3;
   const unsigned long WIFI_TIMEOUT_MS = 10000UL; 
@@ -665,7 +674,8 @@ void setup() {
   }
 
   WiFi.setSleep(false); // 【修改】ESP32 关闭 WiFi 自动睡眠防掉线
-  sysLogf(LOG_BOOT, "WiFi已连接 IP=%s", WiFi.localIP().toString().c_str());
+  ipv6Mgr.onWiFiConnected();   // 等待 RA 下发，缓存 IPv6 地址
+  sysLogf(LOG_BOOT, "WiFi已连接 IP=%s IPv6=%s", WiFi.localIP().toString().c_str(), ipv6Mgr.cached().c_str());
 
   // 7. NTP同步
   timeClient.begin();
@@ -728,6 +738,7 @@ SETUP_NETWORK_DONE:
   server.on("/getChartData", HTTP_GET, handleGetChartData);
   server.on("/testEmail", HTTP_GET, handleTestEmail);
   server.on("/testEmailResult", HTTP_GET, handleTestEmailResult);
+  ipv6Mgr.begin(server);  // 注册 /getIPv6 路由（纯文本，供 Go DDNS 拉取）
 
   // 【修改】ESP32 Web 固件在线更新端点 (OTA)
   server.on("/update", HTTP_POST, []() {
