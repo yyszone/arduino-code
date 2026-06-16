@@ -290,6 +290,7 @@ void smtpCallback(SMTP_Status status){
   }
 }
 
+// ============== 完美兼容 IPv6 环境的邮件发送函数 ==============
 void sendEmailNotification(String subject, String message) {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("[!!] 无法发送邮件，WiFi未连接。");
@@ -301,7 +302,15 @@ void sendEmailNotification(String subject, String message) {
   }
   
   Session_Config config;
-  config.server.host_name = smtp_host.c_str();
+
+  // === 【最核心修复：利用 getaddrinfo 强制走 IPv4】 ===
+  String resolved_host = resolveIPv4(smtp_host.c_str());
+  if (resolved_host.length() == 0) {
+    // 如果强解失败，作为兜底方案才使用原域名
+    resolved_host = smtp_host;
+  }
+  
+  config.server.host_name = resolved_host.c_str(); // 此时 host_name 将是纯 IPv4 的 IP 字符串 (例如 "14.18.245.164")
   config.server.port = smtp_port;
   config.login.email = author_email.c_str();
   config.login.password = author_pass.c_str();
@@ -309,6 +318,18 @@ void sendEmailNotification(String subject, String message) {
   config.time.ntp_server = NTP_SERVERS;
   config.time.gmt_offset = GMT_OFFSET;
   config.time.day_light_offset = DAYLIGHT_OFFSET;
+
+  // 465 与 587 端口均统一使用 esp_mail_secure_mode_ssl_tls
+  if (smtp_port == 465 || smtp_port == 587) {
+    config.secure.mode = esp_mail_secure_mode_ssl_tls;
+  } else {
+    config.secure.mode = esp_mail_secure_mode_nonsecure;
+  }
+
+  // 强行关闭 SSL 证书链验证（因为我们是用 IPv4 IP 直接建立 SSL 握手，不关闭验证会导致“证书域名不匹配”报错）
+  config.certificate.verify = false;
+  
+  smtp.setTCPTimeout(10);
 
   SMTP_Message email;
   email.sender.name = F("ESP32-C3 继电器");
@@ -320,7 +341,7 @@ void sendEmailNotification(String subject, String message) {
   email.html.content = htmlMsg;
   email.html.transfer_encoding = Content_Transfer_Encoding::enc_base64;
 
-  Serial.printf("准备发送邮件至 %s ...\n", recipient_email.c_str());
+  Serial.printf("准备通过 IPv4 发送邮件至 %s ...\n", recipient_email.c_str());
   if (!smtp.connect(&config)) {
     MailClient.printf("SMTP Error: %d, %s\n", smtp.statusCode(), smtp.errorReason().c_str());
     return;
@@ -328,7 +349,10 @@ void sendEmailNotification(String subject, String message) {
   if (!MailClient.sendMail(&smtp, &email)) {
     MailClient.printf("Send Error: %d, %s\n", smtp.statusCode(), smtp.errorReason().c_str());
   }
+  smtp.closeSession(); 
 }
+
+
 
 // ============== 数据存储函数 ==============
 void loadSettings() {
@@ -494,7 +518,7 @@ void handleRoot() {
 
 void handleGetData() {
   if (ina219_ok) busVoltage = ina219.getBusVoltage_V();
-  timeClient.update();
+  // timeClient.update();
   long remaining_min = isLockedOut ? (LOCKOUT_DURATION_MS - (millis() - lockoutStartTime)) / 60000 : 0;
   
   String json = "{";
@@ -680,7 +704,7 @@ void setup() {
   Serial.print("[Boot] 等待NTP同步");
   {
     unsigned long ntpWait = millis();
-    while (time(nullptr) < 1000000UL && millis() - ntpWait < 10000) {
+    while (time(nullptr) < 1700000000UL && millis() - ntpWait < 10000) {
       delay(200); Serial.print(".");
     }
     Serial.printf(" time=%lu\n", (unsigned long)time(nullptr));
@@ -768,7 +792,24 @@ void loop() {
   unsigned long loopStart = micros(); // 记录本轮循环开始时间 (微秒)
 
   server.handleClient();
+  // 每 2 秒刷新一次本地时间计数（非阻塞，不走网络）
+  static unsigned long lastTimeRefresh = 0;
+  if (millis() - lastTimeRefresh >= 2000) {
+      lastTimeRefresh = millis();
+      timeClient.update(); // NTPClient 内部有 60s 冷却，实际不会每次都请求网络
+  }
 
+  // 每小时强制 NTP 网络同步一次
+  static unsigned long lastNtpSync = 0;
+  static bool ntpSyncPending = false;
+  if (millis() - lastNtpSync >= 3600000UL) {
+      lastNtpSync = millis();
+      ntpSyncPending = true;
+  }
+  if (ntpSyncPending && WiFi.status() == WL_CONNECTED) {
+      ntpSyncPending = false;
+      timeClient.forceUpdate(); // WiFi 稳定时才执行，避免断线时阻塞
+  }
   if (pendingTestEmail) {
     pendingTestEmail = false;
     myClock.loop();           // 先让屏幕刷新一次再去发邮件

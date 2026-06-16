@@ -5,6 +5,8 @@
 #include <WebServer.h> // 【修改】
 #include <time.h>
 #include <stdarg.h>
+#include <lwip/netdb.h>
+#include <lwip/sockets.h>
 
 #define LOG_FILE      "/syslog.txt"
 #define LOG_MAX_LINES  80           // 最多保留80条
@@ -71,6 +73,29 @@ void sysLogf(const char* level, const char* fmt, ...) {
   vsnprintf(msg, sizeof(msg), fmt, args);
   va_end(args);
   sysLog(level, msg);
+}
+
+// === 强制只解析 IPv4 (A记录) 辅助函数 ===
+String resolveIPv4(const char* host) {
+  struct addrinfo hints, *res;
+  memset(&hints, 0, sizeof(hints));
+  hints.ai_family = AF_INET;       // 强制只获取 IPv4 地址 (A记录)
+  hints.ai_socktype = SOCK_STREAM; // 流套接字 (TCP)
+
+  int err = getaddrinfo(host, NULL, &hints, &res);
+  if (err != 0 || res == NULL) {
+    Serial.printf("[DNS] IPv4 解析失败: %s\n", host);
+    return "";
+  }
+
+  // 获取解析出的 IPv4 结构体并转换为字符串
+  struct sockaddr_in *ipv4 = (struct sockaddr_in *)res->ai_addr;
+  char ipstr[16];
+  inet_ntop(AF_INET, &(ipv4->sin_addr), ipstr, sizeof(ipstr));
+  freeaddrinfo(res); // 必须释放内存
+
+  Serial.printf("[DNS] 强制 IPv4 解析成功: %s -> %s\n", host, ipstr);
+  return String(ipstr);
 }
 
 // ─── 【重大修改】ESP32-C3 专属引导原因诊断 ────────────────────
