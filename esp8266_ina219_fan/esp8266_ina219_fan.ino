@@ -1,8 +1,8 @@
 // =================================================================
 // PowerMonitor_INA219.ino — 继电器 + INA219 独立电源监控保护模块
 // 适用平台: ESP8266 (NodeMCU / Wemos D1 Mini)
-// 特性：高于电压开启、欠压关闭（带倒计时显示）、低功率保护、首次通电WiFi保护、断电记忆、赛博霓虹非主流前端、Web控制、Web OTA更新
-// 库依赖: GyverINA, ArduinoJson, NTPClient
+// 特性：高于电压开启、欠压关闭（带倒计时显示）、低功率保护、首次通电WiFi保护、断电记忆、全中文智能状态提示系统、Web OTA更新、TM1637数码管轮播显示
+// 库依赖: GyverINA, ArduinoJson, NTPClient, TM1637Display
 // =================================================================
 
 #include <ESP8266WiFi.h>
@@ -20,6 +20,10 @@
 #include <time.h>
 
 #include "note.h"        // 引入打卡模块（含 SystemState 与 TripReason 声明）
+#include "display_tm1637.h" // 【新增】引入数码管显示模块（请将上述代码保存为同目录下的 note.h 或另存为头文件引用）
+
+// 如果您将数码管代码直接放在同目录下的 display_tm1637.h 中，请确保文件名一致
+#include "display_tm1637.h" 
 
 // =================================================================
 // 1. 用户配置
@@ -246,22 +250,22 @@ void resetSystem() {
     st.retryCount     = 0;
     st.confirmCounter = 0;
     
-    // 清除锁定后，判断当前实际电压是否满足自动开启条件
+    // 清除锁定后，判断当前实际电压决定：
     if (st.busVoltage > cfg.turnOnVoltage) {
         st.relayOn    = true;
-        relayOnTimeMs = millis(); // 记录开启时间，避开前10秒低功率检测
+        relayOnTimeMs = millis(); // 记录恢复开启时刻，避开前10秒低功率判断
         setRelayPhysical(true);
-        Serial.printf("[Reset] 重置复位：当前电压 %.2fV 高于开启阈值 %.2fV，自动接通\n", st.busVoltage, cfg.turnOnVoltage);
+        Serial.printf("[Reset] 故障清除并重新开启继电器 (%.2fV > 阈值 %.2fV)\n", st.busVoltage, cfg.turnOnVoltage);
     } else {
         st.relayOn    = false;
         setRelayPhysical(false);
-        Serial.printf("[Reset] 重置复位：当前电压 %.2fV 未达到开启阈值 %.2fV，回到监测待机状态\n", st.busVoltage, cfg.turnOnVoltage);
+        Serial.printf("[Reset] 故障清除，但电压低于阈值，保持关闭等待自动恢复 (%.2fV <= 阈值 %.2fV)\n", st.busVoltage, cfg.turnOnVoltage);
     }
     saveSystemState();
 }
 
 // =================================================================
-// 6. 核心状态解析与提示系统（使用引用传参避开编译器Bug）
+// 6. Web 前端
 // =================================================================
 String getTripReasonText(TripReason r) {
     switch (r) {
@@ -355,7 +359,7 @@ void handleRoot() {
              ".meta{color:#8b949e; font-size:.82em; line-height:1.7; margin-top:10px; text-align:left; font-family:monospace;}"
              "</style></head><body>"
              "<div class='card'>"
-             "<h1>⚡ SYSTEM POWER CORE <small style='font-size:.6em; color:#8b949e; float:right;'>esp8266_ina219_fan</small></h1>");
+             "<h1>⚡ SYSTEM POWER CORE <small style='font-size:.6em; color:#8b949e; float:right;'>INA219</small></h1>");
 
     // 数据显示面板切换为三栏并行网格
     html += "<div class='val-container'>";
@@ -513,6 +517,7 @@ void setup() {
     note_begin();       
     loadConfig();
     loadSystemState();
+    display_begin(); 
     setRelayPhysical(st.relayOn);
     
     if (st.relayOn) {
@@ -699,4 +704,5 @@ void loop() {
         saveSystemState();
         Serial.println("[Storage] 周期归档完成");
     }
+    display_update(st.busVoltage, st.current_mA);
 }
