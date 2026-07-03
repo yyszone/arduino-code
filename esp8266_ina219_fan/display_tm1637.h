@@ -1,5 +1,5 @@
 // =================================================================
-// display_tm1637.h — TM1637 4位数字数码管模拟驱动（双定时器优化版）
+// display_tm1637.h — TM1637 4位数字数码管模拟驱动（电流对齐 & 单小数优化版）
 // =================================================================
 #ifndef DISPLAY_TM1637_H
 #define DISPLAY_TM1637_H
@@ -135,7 +135,6 @@ public:
     }
 
     void displaySegments(const uint8_t segments[]) {
-        // 已彻底恢复正常写入顺序，直接依序写入
         startSignal();
         writeByte(0x40);
         stopSignal();
@@ -173,7 +172,7 @@ uint8_t getDigitSegment(uint8_t val) {
 }
 
 // 辅助自定义符号
-const uint8_t SEG_U = 0x3e;    // "U" (已优化为标准饱满的大写 U)
+const uint8_t SEG_U = 0x3e;    // "U" (饱满的大写 U)
 const uint8_t SEG_A = 0x77;    // "A" (大写 A)
 const uint8_t SEG_LINE = 0x40; // "-"
 
@@ -202,9 +201,8 @@ void display_on() {
     }
 }
 
-// 刷新数码管显示（重构双定时器，完美支持冒号闪烁与数据更新）
+// 刷新数码管显示
 void display_update(float voltage, float current_mA, bool userEnabled, bool forceUpdate = false) {
-    // 1. 根据系统状态决定数码管是否休眠
     if (!userEnabled || !currentWifiState) {
         display_off();
         return;
@@ -215,7 +213,7 @@ void display_update(float voltage, float current_mA, bool userEnabled, bool forc
     unsigned long now = millis();
     bool modeChanged = false;
 
-    // 2. 轮播定时器：每 3 秒切换一次显示模式
+    // 1. 轮播定时器：每 3 秒切换一次显示模式
     if (now - lastModeSwitchMs >= DISPLAY_ROTATION_INTERVAL || forceUpdate) {
         lastModeSwitchMs = now;
         modeChanged = true;
@@ -231,7 +229,7 @@ void display_update(float voltage, float current_mA, bool userEnabled, bool forc
         }
     }
 
-    // 3. 刷新定时器：时间模式下每 500ms 刷新（闪烁冒号），电压电流模式每 1000ms 刷新
+    // 2. 刷新定时器：时间模式下每 500ms 刷新（闪烁冒号），电压电流模式每 1000ms 刷新
     unsigned long refreshInterval = (currentDispMode == DISP_TIME) ? 500UL : 1000UL;
     if (now - lastSegWriteMs >= refreshInterval || modeChanged || forceUpdate) {
         lastSegWriteMs = now;
@@ -245,7 +243,7 @@ void display_update(float voltage, float current_mA, bool userEnabled, bool forc
                 int hh = timeinfo->tm_hour;
                 int mm = timeinfo->tm_min;
                 
-                // 冒号闪烁：利用半秒级定时器实现每秒闪烁
+                // 冒号闪烁控制
                 bool toggleState = (now / 500) % 2 == 0; 
 
                 showData[0] = getDigitSegment(hh / 10);
@@ -260,11 +258,11 @@ void display_update(float voltage, float current_mA, bool userEnabled, bool forc
             }
         } 
         else if (currentDispMode == DISP_VOLTAGE) {
-            // 电压显示：如 "12.5U" 或 "12:5U"
+            // 电压显示（双位整数+1位小数，不需要后移）：如 "12.5U" 或 "12:5U"
             int v_10 = (int)(voltage * 10.0f);
             if (v_10 > 999) v_10 = 999;
 
-            showData[3] = SEG_U; // 饱满大写 U 字符
+            showData[3] = SEG_U; 
             if (v_10 >= 100) {
                 showData[0] = getDigitSegment(v_10 / 100);
                 showData[1] = getDigitSegment((v_10 / 10) % 10) | 0x80; // 点亮小数点/冒号
@@ -276,23 +274,15 @@ void display_update(float voltage, float current_mA, bool userEnabled, bool forc
             }
         } 
         else if (currentDispMode == DISP_CURRENT) {
-            // 电流显示：保留两位小数
-            int amp_100 = (int)(current_mA / 10.0f); 
-            if (amp_100 > 999) amp_100 = 999;        
+            // 【全新电流显示优化】：保留一位小数，整体向右平移 1 位，完美对齐物理冒号位置
+            // 采用 +50mA 偏置来实现精准的四舍五入算法
+            int amp_10 = (int)((current_mA + 50.0f) / 100.0f); 
+            if (amp_10 > 99) amp_10 = 99; // 限制最高显示 9.9A
 
-            if (TM1637_SCREEN_TYPE == 1) {
-                // 小数点屏：显示如 "0.40A" 或 "1.25A"
-                showData[0] = getDigitSegment(amp_100 / 100) | 0x80; // 第一位带点
-                showData[1] = getDigitSegment((amp_100 / 10) % 10);        
-                showData[2] = getDigitSegment(amp_100 % 10);               
-                showData[3] = SEG_A;                                       
-            } else {
-                // 时钟屏：显示如 "04:0A"
-                showData[0] = getDigitSegment(amp_100 / 100);
-                showData[1] = getDigitSegment((amp_100 / 10) % 10) | 0x80; // 第二位带冒号
-                showData[2] = getDigitSegment(amp_100 % 10);               
-                showData[3] = SEG_A;                                       
-            }
+            showData[0] = 0;                                   // 【关键】第一位物理留空
+            showData[1] = getDigitSegment(amp_10 / 10) | 0x80; // 第二位（个位）带点/冒号
+            showData[2] = getDigitSegment(amp_10 % 10);        // 第三位（十分位）
+            showData[3] = SEG_A;                               // 第四位固定显示单位 'A'
         }
 
         displayDriver.displaySegments(showData);
