@@ -19,14 +19,11 @@
 #include <NTPClient.h>
 #include <time.h>
 
-#include "note.h"        // 引入打卡模块（含 SystemState 与 TripReason 声明）
-#include "display_tm1637.h" // 【新增】引入数码管显示模块（请将上述代码保存为同目录下的 note.h 或另存为头文件引用）
-
-// 如果您将数码管代码直接放在同目录下的 display_tm1637.h 中，请确保文件名一致
-#include "display_tm1637.h" 
+#include "note.h"           // 引入打卡模块（含 SystemState 与 TripReason 声明）
+#include "display_tm1637.h" // 引入数码管显示模块
 
 // =================================================================
-// 1. 用户配置
+// 1. 用户配置与结构体
 // =================================================================
 const char* ssid     = "yang1234";
 const char* password = "y123456789";
@@ -64,6 +61,10 @@ struct ProtectSettings {
     uint8_t sleepMinute = 0;       // 休眠起始 - 分
     uint8_t wakeHour   = 6;        // 唤醒起始 - 时
     uint8_t wakeMinute = 0;        // 唤醒起始 - 分
+
+    // 新增：数码管物理屏幕控制与低电压休眠
+    bool displayEnabledUser = true; // 是否开启数码管显示
+    float sleepVoltage      = 11.0f; // 低于多少V在继电器断开时进入低压休眠
 } cfg;
 
 // 全局状态实例
@@ -82,9 +83,14 @@ NTPClient               timeClient(ntpUDP, "ntp.aliyun.com", 8 * 3600);
 const char* configFile = "/config.json";
 const char* stateFile  = "/state.json";
 
-// 定时开关状态追踪
+// 定时及休眠控制变量
 bool currentWifiState  = true; // 记录当前 Wi-Fi 的开启状态
 unsigned long lastWifiCheckMs = 0;
+
+// 低电压待机休眠追踪
+bool lowVoltageSleeping = false;
+unsigned long sleepStartMs = 0;
+unsigned long sleepGuardUntilMs = 120000UL; // 首次通电前120秒不进入休眠（保证可以连上后台）
 
 // 继电器启动时间记录，用于防抖避开开机暂态
 unsigned long relayOnTimeMs = 0;
@@ -95,18 +101,18 @@ unsigned long relayOnTimeMs = 0;
 void saveConfig() {
     File file = LittleFS.open(configFile, "w");
     if (!file) return;
-    StaticJsonDocument<512> doc;
-    doc["turnOnVoltage"] = cfg.turnOnVoltage;
-    doc["underVoltage"]  = cfg.underVoltage;
-    doc["underPower"]    = cfg.underPower;
-    doc["cooldownSec"]   = cfg.cooldownSec;  
-    
-    // 保存定时配置
-    doc["timerEnabled"] = cfg.timerEnabled;
-    doc["sleepHour"]    = cfg.sleepHour;
-    doc["sleepMinute"]  = cfg.sleepMinute;
-    doc["wakeHour"]     = cfg.wakeHour;
-    doc["wakeMinute"]   = cfg.wakeMinute;
+    StaticJsonDocument<768> doc;
+    doc["turnOnVoltage"]      = cfg.turnOnVoltage;
+    doc["underVoltage"]       = cfg.underVoltage;
+    doc["underPower"]         = cfg.underPower;
+    doc["cooldownSec"]        = cfg.cooldownSec;  
+    doc["timerEnabled"]       = cfg.timerEnabled;
+    doc["sleepHour"]          = cfg.sleepHour;
+    doc["sleepMinute"]        = cfg.sleepMinute;
+    doc["wakeHour"]           = cfg.wakeHour;
+    doc["wakeMinute"]         = cfg.wakeMinute;
+    doc["displayEnabledUser"] = cfg.displayEnabledUser;
+    doc["sleepVoltage"]       = cfg.sleepVoltage;
     
     serializeJson(doc, file);
     file.close();
@@ -116,19 +122,19 @@ void loadConfig() {
     if (!LittleFS.exists(configFile)) { saveConfig(); return; }
     File file = LittleFS.open(configFile, "r");
     if (!file) return;
-    StaticJsonDocument<512> doc;
+    StaticJsonDocument<768> doc;
     if (!deserializeJson(doc, file)) {
-        cfg.turnOnVoltage = doc["turnOnVoltage"] | 13.5f;
-        cfg.underVoltage  = doc["underVoltage"]  | 11.5f;
-        cfg.underPower    = doc["underPower"]    | 2.0f;
-        cfg.cooldownSec   = doc["cooldownSec"]   | 3600UL; 
-        
-        // 加载定时配置
-        cfg.timerEnabled = doc["timerEnabled"] | false;
-        cfg.sleepHour    = doc["sleepHour"]    | (uint8_t)22;
-        cfg.sleepMinute  = doc["sleepMinute"]  | (uint8_t)0;
-        cfg.wakeHour     = doc["wakeHour"]     | (uint8_t)6;
-        cfg.wakeMinute   = doc["wakeMinute"]   | (uint8_t)0;
+        cfg.turnOnVoltage      = doc["turnOnVoltage"] | 13.5f;
+        cfg.underVoltage       = doc["underVoltage"]  | 11.5f;
+        cfg.underPower         = doc["underPower"]    | 2.0f;
+        cfg.cooldownSec        = doc["cooldownSec"]   | 3600UL; 
+        cfg.timerEnabled       = doc["timerEnabled"]  | false;
+        cfg.sleepHour          = doc["sleepHour"]     | (uint8_t)22;
+        cfg.sleepMinute        = doc["sleepMinute"]   | (uint8_t)0;
+        cfg.wakeHour           = doc["wakeHour"]      | (uint8_t)6;
+        cfg.wakeMinute         = doc["wakeMinute"]    | (uint8_t)0;
+        cfg.displayEnabledUser = doc["displayEnabledUser"] | true;
+        cfg.sleepVoltage       = doc["sleepVoltage"]  | 11.0f;
     }
     file.close();
 }
@@ -190,7 +196,6 @@ long getCooldownRemaining() {
     return rem > 0 ? rem : 0;
 }
 
-// 将秒转换为“X小时Y分Z秒”、“Y分Z秒”或“Z秒”格式
 String formatSeconds(long secs) {
     if (secs <= 0) return "0秒";
     if (secs < 60) return String(secs) + "秒";
@@ -221,14 +226,13 @@ void executeTrip(TripReason reason) {
 
     const char* rStr =
         reason == TripReason::UNDERVOLTAGE ? "欠压"   :
-        reason == TripReason::OVERCURRENT  ? "低功率" : // 复用过流显示为低功率保护
+        reason == TripReason::OVERCURRENT  ? "低功率" : 
         reason == TripReason::MANUAL       ? "手动断开" : "未知";
 
     Serial.printf("[ALARM] 关闭保护动作! 原因: %s  V=%.2fV  W=%.3fW\n",
                   rStr, st.busVoltage, st.power_mW / 1000.f);
 }
 
-// 手动强制开启（忽略所有限制，强制立刻接通）
 void forceOnSystem() {
     st.relayOn        = true;
     st.faultLatched   = false;
@@ -242,7 +246,6 @@ void forceOnSystem() {
     Serial.println("[Manual] 手动强制开启继电器");
 }
 
-// 故障重置 / 恢复自动模式（释放手动安全锁定，并根据当前电压情况决定是否开启）
 void resetSystem() {
     st.faultLatched   = false;
     st.tripReason     = TripReason::NONE;
@@ -250,10 +253,9 @@ void resetSystem() {
     st.retryCount     = 0;
     st.confirmCounter = 0;
     
-    // 清除锁定后，判断当前实际电压决定：
     if (st.busVoltage > cfg.turnOnVoltage) {
         st.relayOn    = true;
-        relayOnTimeMs = millis(); // 记录恢复开启时刻，避开前10秒低功率判断
+        relayOnTimeMs = millis(); 
         setRelayPhysical(true);
         Serial.printf("[Reset] 故障清除并重新开启继电器 (%.2fV > 阈值 %.2fV)\n", st.busVoltage, cfg.turnOnVoltage);
     } else {
@@ -277,6 +279,12 @@ String getTripReasonText(TripReason r) {
 }
 
 void getStatusDisplay(String &statusHtml, String &cooldownHtml) {
+    if (lowVoltageSleeping) {
+        statusHtml = "<span style='color:#ff00ea; text-shadow: 0 0 10px rgba(255,0,234,0.5);'>🌙 系统处于低压省电休眠中</span>";
+        cooldownHtml = "💤 <b>低压待机休眠激活</b>：当电压低于设定电压时，系统已自动关闭数码管并切断网络射频。此时正处于冷却周期中。";
+        return;
+    }
+
     if (st.relayOn) {
         statusHtml = "<span style='color:#39ff14; text-shadow: 0 0 10px rgba(57,255,20,0.5);'>✔ 继电器已吸合（自动托管运行中）</span>";
         cooldownHtml = "🔌 当前系统运行状态良好，回路负载与电压均在安全范围内。";
@@ -287,17 +295,13 @@ void getStatusDisplay(String &statusHtml, String &cooldownHtml) {
         } else {
             long rem = getCooldownRemaining();
             if (rem > 0 && st.tripReason != TripReason::NONE) {
-                // 处于自动跳闸后的待机冷却期中
                 statusHtml = "<span style='color:#ffaa00; text-shadow: 0 0 10px rgba(255,170,0,0.5);'>⌛ 保护待机锁定中（" + getTripReasonText(st.tripReason) + "，剩余冷却：" + formatSeconds(rem) + "）</span>";
                 cooldownHtml = "🛡️ <b>设备冷却保护中</b>：为了防止负载设备频繁通断电损坏，系统正在强制待机。建议等待倒计时结束后自动启动，或直接点击“手动开启”强制跳过保护。";
             } else {
-                // 冷却期过了，或者用户刚刚点击了“故障重置”清除故障，但电压仍不足
                 if (st.busVoltage > cfg.turnOnVoltage) {
-                    // 如果满足开启电压，但依然是关闭状态，说明正处于多样本确认采样期
                     statusHtml = "<span style='color:#00f3ff; text-shadow: 0 0 10px rgba(0,243,255,0.5);'>⏳ 正在启动准备中...</span>";
                     cooldownHtml = "⚡ 当前电压（" + String(st.busVoltage, 2) + "V）已满足开启条件（高于 " + String(cfg.turnOnVoltage, 1) + "V），系统正在进行多样本滤波确认，请稍候...";
                 } else {
-                    // 电压未满足开启电压，系统进入真正的自动待机阶段
                     statusHtml = "<span style='color:#00f3ff; text-shadow: 0 0 10px rgba(0,243,255,0.5);'>🔍 自动控制模式：待机监测中</span>";
                     cooldownHtml = "✨ <b>故障与时间锁已释放！</b>当前系统状态良好，正在持续监测输入电压。等待电压升至高于 <strong>" + String(cfg.turnOnVoltage, 1) + " V</strong>（当前电压为 " + String(st.busVoltage, 3) + " V）时，系统将<b>自动吸合开启</b>继电器。";
                 }
@@ -361,7 +365,6 @@ void handleRoot() {
              "<div class='card'>"
              "<h1>⚡ SYSTEM POWER CORE <small style='font-size:.6em; color:#8b949e; float:right;'>INA219</small></h1>");
 
-    // 数据显示面板切换为三栏并行网格
     html += "<div class='val-container'>";
     html += "  <div class='val-box'><div class='num' id='val-v'>" + String(st.busVoltage, 3) + " V</div><div class='lbl'>电压</div></div>";
     html += "  <div class='val-box'><div class='num' id='val-a'>" + String(st.current_mA / 1000.f, 4) + " A</div><div class='lbl'>电流</div></div>";
@@ -377,7 +380,7 @@ void handleRoot() {
             "<a href='/reset' class='btn btn-rst'>故障重置</a>"
             "</div>";
 
-    // 保护参数网格化排版
+    // 保护参数与屏幕开关
     html += "<hr><h3>⚙️ 阈值与参数配置</h3>"
             "<form action='/save_settings' method='POST'>"
             "<div class='form-grid'>";
@@ -393,9 +396,17 @@ void handleRoot() {
     html += "<div class='form-group'><label>自动保护待机冷却时间 (秒)</label>"
             "<input type='number' name='cds'  class='inp' step='1' value='"
             + String(cfg.cooldownSec) + "' required></div>";
-    html += "</div>"; // End of form-grid
+    html += "<div class='form-group'><label>数码管物理屏幕开关</label>"
+            "<select name='deu' class='inp'>"
+            "<option value='1' " + String(cfg.displayEnabledUser ? "selected" : "") + ">开启</option>"
+            "<option value='0' " + String(!cfg.displayEnabledUser ? "selected" : "") + ">关闭</option>"
+            "</select></div>";
+    html += "<div class='form-group'><label>低于多少 V 自动待机休眠 (V)</label>"
+            "<input type='number' name='slpv' class='inp' step='0.1' value='"
+            + String(cfg.sleepVoltage, 1) + "' required></div>";
+    html += "</div>"; 
 
-    // 定时参数网格化排版
+    // 定时参数
     html += "<hr><h3>📶 无线电定时控制</h3>"
             "<div class='form-grid'>";
     html += "<div class='form-group'><label>定时休眠模式</label>"
@@ -414,11 +425,11 @@ void handleRoot() {
             "<input type='time' name='st' class='inp' value='" + formatTimeInput(cfg.sleepHour, cfg.sleepMinute) + "' required></div>";
     html += "<div class='form-group'><label>唤醒重连 Wi-Fi 时间</label>"
             "<input type='time' name='wt' class='inp' value='" + formatTimeInput(cfg.wakeHour, cfg.wakeMinute) + "' required></div>";
-    html += "</div>"; // End of form-grid
+    html += "</div>"; 
 
     html += "<input type='submit' class='sub-btn' value='保存配置并写入EEPROM'></form>";
 
-    // 数据日志面板
+    // 运行历史数据
     String tripTimeStr = "无";
     if (st.tripEpoch > 0) {
         time_t t = (time_t)st.tripEpoch + 8 * 3600; 
@@ -486,6 +497,8 @@ void handleSaveSettings() {
     if (server.hasArg("uv"))   cfg.underVoltage  = server.arg("uv").toFloat();
     if (server.hasArg("upw"))  cfg.underPower    = server.arg("upw").toFloat();
     if (server.hasArg("cds"))  cfg.cooldownSec   = server.arg("cds").toInt(); 
+    if (server.hasArg("deu"))  cfg.displayEnabledUser = (server.arg("deu").toInt() == 1);
+    if (server.hasArg("slpv")) cfg.sleepVoltage       = server.arg("slpv").toFloat();
     
     // 定时参数
     if (server.hasArg("te"))  cfg.timerEnabled = (server.arg("te").toInt() == 1);
@@ -578,8 +591,39 @@ void setup() {
 void loop() {
     unsigned long now = millis();
 
-    // ── 定时休眠唤醒逻辑，每 5 秒检测一次 ──
-    if (now - lastWifiCheckMs >= 5000UL) {
+    // ── 低压自动待机休眠检测（当未开机、电压低，且过了首次开机/唤醒后的 2 分钟安全期时触发） ──
+    if (st.relayOn == false && st.busVoltage < cfg.sleepVoltage && st.busVoltage > 2.0f) {
+        if (!lowVoltageSleeping && (now > sleepGuardUntilMs)) {
+            lowVoltageSleeping = true;
+            sleepStartMs = now;
+            Serial.printf("[Sleep] 电压 %.2fV 低于阈值 %.2fV 且继电器断开，进入节能省电待机，关闭数码管及射频，冷却: %d秒...\n", 
+                          st.busVoltage, cfg.sleepVoltage, cfg.cooldownSec);
+            
+            // 关闭 Wi-Fi 射频信号
+            WiFi.disconnect(true);
+            WiFi.mode(WIFI_OFF);
+            WiFi.forceSleepBegin(); 
+            currentWifiState = false;
+        }
+    }
+
+    // ── 低压休眠唤醒计时 ──
+    if (lowVoltageSleeping) {
+        if (now - sleepStartMs >= (cfg.cooldownSec * 1000UL)) {
+            lowVoltageSleeping = false;
+            sleepGuardUntilMs = now + 120000UL; // 唤醒后保持 120 秒安全期不进入休眠，允许网页后台操作
+            Serial.println("[Sleep] 待机冷却已过，系统自动唤醒 WiFi 建立连接（开启 2 分钟安全配置期）...");
+            
+            WiFi.forceSleepWake();
+            delay(1);
+            WiFi.mode(WIFI_STA);
+            WiFi.begin(ssid, password);
+            currentWifiState = true;
+        }
+    }
+
+    // ── 定时休眠唤醒逻辑，每 5 秒检测一次（仅在非低电压休眠状态下运行） ──
+    if (!lowVoltageSleeping && (now - lastWifiCheckMs >= 5000UL)) {
         lastWifiCheckMs = now;
         
         bool shouldWifiBeOn = true;
@@ -668,7 +712,7 @@ void loop() {
                     st.faultLatched = false;
                     st.tripReason = TripReason::NONE;
                     st.confirmCounter = 0;
-                    relayOnTimeMs = millis(); // 记录恢复开启时刻，避开前10秒低功率判断
+                    relayOnTimeMs = millis(); 
                     setRelayPhysical(true);
                     saveSystemState();
                     Serial.printf("[Auto-ON] 保护时间已过且电压升至 %.2fV (大于阈值 %.2fV)，自动开启继电器\n", st.busVoltage, cfg.turnOnVoltage);
@@ -676,25 +720,24 @@ void loop() {
             } else {
                 st.confirmCounter = 0; 
             }
-            return;
-        }
-
-        // ── 继电器吸合时的保护检测逻辑 ──
-        TripReason pending = TripReason::NONE;
-
-        if (st.busVoltage < cfg.underVoltage && st.busVoltage > 0.5f) {
-            pending = TripReason::UNDERVOLTAGE;
-        } 
-        // 避开前10秒刚开机时的瞬时无功耗状态，防止启动电流慢导致误判定
-        else if ((now - relayOnTimeMs > 10000UL) && (st.power_mW < cfg.underPower * 1000.f)) {
-            pending = TripReason::OVERCURRENT; // 复用 note.h 的 OVERCURRENT 槽位储存低功率保护关闭
-        }
-
-        if (pending != TripReason::NONE) {
-            if (++st.confirmCounter >= CONFIRM_COUNT)
-                executeTrip(pending);
         } else {
-            st.confirmCounter = 0;
+            // ── 继电器吸合时的保护检测逻辑 ──
+            TripReason pending = TripReason::NONE;
+
+            if (st.busVoltage < cfg.underVoltage && st.busVoltage > 0.5f) {
+                pending = TripReason::UNDERVOLTAGE;
+            } 
+            // 避开前10秒刚开机时的瞬时无功耗状态，防止启动电流慢导致误判定
+            else if ((now - relayOnTimeMs > 10000UL) && (st.power_mW < cfg.underPower * 1000.f)) {
+                pending = TripReason::OVERCURRENT; // 复用 note.h 的 OVERCURRENT 槽位储存低功率保护关闭
+            }
+
+            if (pending != TripReason::NONE) {
+                if (++st.confirmCounter >= CONFIRM_COUNT)
+                    executeTrip(pending);
+            } else {
+                st.confirmCounter = 0;
+            }
         }
     }
 
@@ -704,5 +747,7 @@ void loop() {
         saveSystemState();
         Serial.println("[Storage] 周期归档完成");
     }
-    display_update(st.busVoltage, st.current_mA);
+
+    // 更新数码管显示（融合网页显示开关和低电压睡眠检测）
+    display_update(st.busVoltage, st.current_mA, cfg.displayEnabledUser && !lowVoltageSleeping);
 }
