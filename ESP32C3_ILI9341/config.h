@@ -1,9 +1,22 @@
 #ifndef CONFIG_H
 #define CONFIG_H
 
-// ===============================================================
+#include <Arduino.h>
+
+// ==================== 共享数据结构与枚举定义 ====================
+struct LogEntry { 
+  String timestamp; 
+  String message; 
+  unsigned long epochTime; 
+};
+
+enum ScreenMode { 
+  SCREEN_CONTROL, 
+  SCREEN_WEATHER, 
+  SCREEN_CLOCK 
+};
+
 // ==================== 用户自定义配置区域 =========================
-// ===============================================================
 const char* ssid = "yang1234";
 const char* password = "y123456789";
 const unsigned long standbyDelay = 60000; // 60秒无操作后进入待机模式
@@ -11,7 +24,7 @@ const unsigned long standbyDelay = 60000; // 60秒无操作后进入待机模式
 // Home Assistant 配置
 const char* ha_host = "192.168.31.22";
 const int ha_port = 8123;
-const char* ha_token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiIwYjU4YTMwOWMzNmE0ZDE2ODBjOGI2MzI4YzAwMTlkZCIsImlhdCI6MTc1ODk3NDgwMCwiZXhwIjoyMDc0MzM0ODAwfQ.e1e_iE6iIpdB2EG0d0VXZcb5bjePSoI8m8qTDEFTJ-w";
+const char* ha_token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiIwYjU4YTMwOWMzNmE0ZDE2ODBjOGI2MzI4YzAwMTlkZCIsImlhdCI6MTc1ODk3NDgwMCwiZXhwIjoyMDc0MzM4ODAwfQ.e1e_iE6iIpdB2EG0d0VXZcb5bjePSoI8m8qTDEFTJ-w";
 const char* ha_entity_id = "switch.sonoff_1000a68f48";
 
 // HTTP 控制配置
@@ -22,9 +35,7 @@ const char* led_off_url = "http://192.168.31.162/LED-Control?ledPwm=4";
 const char* configFile = "/config.json"; 
 
 
-// ===============================================================
 // ==================== ESP32-C3 引脚重新定义 ====================
-// ===============================================================
 #define TFT_MISO 5
 #define TFT_MOSI 6
 #define TFT_SCK  4
@@ -35,11 +46,13 @@ const char* configFile = "/config.json";
 #define TFT_BL   1   // 屏幕背光控制引脚
 #define T_CS     0
 
-const uint16_t kIrLedPin = 10; // 红外发射引脚 (GPIO 10)
+// 红外管改回原本的引脚 GPIO 10
+const uint16_t kIrLedPin = 10; 
 
 // ==================== 物理引脚与触发电平优化 ====================
-#define DHTPIN       20   // 温湿度信号线接 GPIO 20 
-#define RELAY_PIN    21   // 继电器控制线接 GPIO 21 
+// 【硬件对齐】：强制换回您开发板的物理硬线引脚，DHT11接20，继电器接21
+#define DHTPIN       20   
+#define RELAY_PIN    21   
 
 // 高电平触发继电器，开机默认低电平（安全关闭）
 #define RELAY_ACTIVE_LOW  false  
@@ -76,8 +89,13 @@ struct Settings {
   
   // 温控保存项
   bool tempCtrlEnabled = false;   // 是否启用温控
-  float tempThreshold = 28.0;     // 新增：温度控制“开启”阈值
-  float tempThresholdOff = 27.0;  // 新增：温度控制“关闭”阈值
+  float tempThreshold = 28.0;     // 温度控制开启阈值
+  float tempThresholdOff = 27.0;  // 温度控制关闭阈值
+  
+  // 继电器专用定时保存项
+  bool relayTimerEnabled = false; // 是否启用继电器定时
+  uint8_t relayOnHour = 8, relayOnMinute = 0;   // 继电器开启时间
+  uint8_t relayOffHour = 22, relayOffMinute = 0; // 继电器关闭时间
   
   int magic_key = 80101; 
 };
