@@ -8,8 +8,6 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <HTTPUpdateServer.h>
-#include <ESPmDNS.h>
-#include <ArduinoOTA.h>
 #include <Wire.h>
 #include <INA219.h>      // GyverINA 库
 #include <FS.h>
@@ -18,6 +16,7 @@
 #include <WiFiUdp.h>
 #include <NTPClient.h>
 #include <time.h>
+#include <esp_system.h>
 
 #include "note.h"           // 引入打卡模块（含 SystemState 与 TripReason 声明）
 #include "display_tm1637.h" // 引入数码管显示模块
@@ -28,9 +27,7 @@
 const char* ssid     = "yang1234";
 const char* password = "y123456789";
 
-const char* dns_hostname = "powermonitor";
-
-// ESP32-C3 Mini 引脚定义 (可根据您的物理接线进行微调)
+// ESP32-C3 Mini 引脚定义
 constexpr uint8_t  RELAY_PIN       = 10;    // GPIO10
 constexpr uint8_t  RELAY_ON_LEVEL  = HIGH;  // HIGH 吸合
 constexpr uint8_t  RELAY_OFF_LEVEL = LOW;   // LOW  释放
@@ -48,23 +45,23 @@ constexpr float    MAX_CURRENT_A       = 5.0f;  // 最大设计电流
 constexpr unsigned long SAMPLE_INTERVAL_MS = 1000UL; // 采样间隔
 constexpr uint8_t       CONFIRM_COUNT      = 3;      // 连续确认次数才触发动作
 
-// 保护阈值与定时配置（支持保存到 LittleFS）
+// 保护阈值与定时配置
 struct ProtectSettings {
     float turnOnVoltage = 13.5f;   // 高于多少 V 自动开启 (V)
     float underVoltage  = 11.5f;   // 欠压保护阈值 (V)
-    float underPower    = 2.0f;    // 低于多少 W 自动关闭 (W)
-    uint32_t cooldownSec = 3600UL; // 自动保护锁定/待机持续时间（秒，可由网页自定义）
+    float underPower    = 2.0f;    // 低于多少 W 自动关闭 (W)，设为 0 可禁用
+    uint32_t cooldownSec = 3600UL; // 自动保护锁定待机时间（秒）
     
     // Wi-Fi 定时控制参数
-    bool timerEnabled  = false;    // 是否启用定时开关 Wi-Fi
-    uint8_t sleepHour  = 22;       // 休眠起始 - 时
-    uint8_t sleepMinute = 0;       // 休眠起始 - 分
-    uint8_t wakeHour   = 6;        // 唤醒起始 - 时
-    uint8_t wakeMinute = 0;        // 唤醒起始 - 分
+    bool timerEnabled  = false;    
+    uint8_t sleepHour  = 22;       
+    uint8_t sleepMinute = 0;       
+    uint8_t wakeHour   = 6;        
+    uint8_t wakeMinute = 0;        
 
     // 数码管物理屏幕控制与低电压休眠
-    bool displayEnabledUser = true; // 是否开启数码管显示
-    float sleepVoltage      = 11.0f; // 低于多少V在继电器断开时进入低压休眠
+    bool displayEnabledUser = true; 
+    float sleepVoltage      = 11.0f; 
 } cfg;
 
 // 全局状态实例
@@ -84,20 +81,37 @@ const char* configFile = "/config.json";
 const char* stateFile  = "/state.json";
 
 // 定时及休眠控制变量
-bool currentWifiState  = true; // 记录当前 Wi-Fi 的开启状态
+bool currentWifiState  = true; 
 unsigned long lastWifiCheckMs = 0;
 
 // 低电压待机休眠追踪
 bool lowVoltageSleeping = false;
 unsigned long sleepStartMs = 0;
-unsigned long sleepGuardUntilMs = 120000UL; // 首次通电前120秒不进入休眠（保证可以连上后台）
+unsigned long sleepGuardUntilMs = 120000UL; 
 
-// 继电器启动时间记录，用于防抖避开开机暂态
+// 继电器启动时间记录
 unsigned long relayOnTimeMs = 0;
 
 // =================================================================
-// 3. 配置与状态持久化
+// 3. 配置与状态持久化与复位原因诊断
 // =================================================================
+String getResetReasonString() {
+    esp_reset_reason_t reason = esp_reset_reason();
+    switch (reason) {
+        case ESP_RST_POWERON:   return "POWERON (正常上电)";
+        case ESP_RST_EXT:       return "EXTERNAL (外部按键复位)";
+        case ESP_RST_SW:        return "SOFTWARE (软件重启)";
+        case ESP_RST_PANIC:     return "PANIC (异常崩溃重启)";
+        case ESP_RST_INT_WDT:   return "INT_WDT (看门狗复位)";
+        case ESP_RST_TASK_WDT:  return "TASK_WDT (任务看门狗复位)";
+        case ESP_RST_WDT:       return "OTHER_WDT (看门狗复位)";
+        case ESP_RST_DEEPSLEEP: return "DEEPSLEEP (休眠唤醒)";
+        case ESP_RST_BROWNOUT:  return "BROWNOUT (供电电压不足/下拉重启)";
+        case ESP_RST_SDIO:      return "SDIO (SDIO复位)";
+        default:                return "UNKNOWN (未知原因)";
+    }
+}
+
 void saveConfig() {
     File file = LittleFS.open(configFile, "w");
     if (!file) return;
@@ -162,7 +176,7 @@ void loadSystemState() {
     if (!file) return;
     StaticJsonDocument<512> doc;
     if (!deserializeJson(doc, file)) {
-        st.relayOn        = doc["relayOn"]        | false; // 此处默认值仍留作载入参考
+        st.relayOn        = doc["relayOn"]        | false; 
         st.faultLatched   = doc["faultLatched"]   | false;
         st.tripReason     = static_cast<TripReason>(doc["tripReason"] | 0);
         st.tripEpoch      = doc["tripEpoch"]      | 0;
@@ -181,10 +195,11 @@ void setRelayPhysical(bool on) {
 }
 
 // =================================================================
-// 4. 倒计时剩余秒数查询与时间格式化
+// 4. 倒计时剩余秒数查询
 // =================================================================
 long getCooldownRemaining() {
-    if (st.tripEpoch == 0) return (long)cfg.cooldownSec;
+    if (st.tripEpoch == 0) return 0;
+
     time_t now_t = time(nullptr);
     if (now_t > 1000000000L) {
         long elapsed = (long)(now_t - st.tripEpoch);
@@ -253,7 +268,6 @@ void resetSystem() {
     st.retryCount     = 0;
     st.confirmCounter = 0;
     
-    // 如果仍在开机1分钟预热内，仅清除故障，不执行恢复逻辑
     if (millis() < 60000UL) {
         st.relayOn    = false;
         setRelayPhysical(false);
@@ -288,7 +302,6 @@ String getTripReasonText(TripReason r) {
 void getStatusDisplay(String &statusHtml, String &cooldownHtml) {
     unsigned long now = millis();
     
-    // 优先展示开机 1 分钟的安全预热状态
     if (now < 60000UL) {
         long remainSec = (60000UL - now) / 1000UL;
         statusHtml = "<span style='color:#ffea00; text-shadow: 0 0 10px rgba(255,234,0,0.5);'>⏳ 系统开机预热中（剩余 " + String(remainSec) + " 秒）</span>";
@@ -384,10 +397,8 @@ void handleRoot() {
              "<div class='card'>"
              "<h1>⚡ SYSTEM POWER CORE <small style='font-size:.6em; color:#8b949e; float:right;'>INA219</small></h1>");
 
-    // 网页头部标注脚本名字与访问方式
     html += "<div class='sub' style='text-align:left; border-left:3px solid var(--neon-cyan); padding-left:8px; margin-bottom:15px; font-size:0.8em; line-height:1.5;'>"
             "📂 脚本程序: <strong style='color:#fff;'>esp32_PowerMonitor_INA219.ino</strong><br>"
-            "🌐 局域网域名: <a href='http://powermonitor.local' style='color:var(--neon-cyan); text-decoration:none;'>http://powermonitor.local</a><br>"
             "🔌 IP直连访问: <a href='http://" + ipStr + "' style='color:var(--neon-cyan); text-decoration:none;'>http://" + ipStr + "</a>"
             "</div>";
 
@@ -416,7 +427,7 @@ void handleRoot() {
     html += "<div class='form-group'><label>欠压关闭切断阈值 (V)</label>"
             "<input type='number' name='uv'   class='inp' step='0.1' value='"
             + String(cfg.underVoltage,  1) + "' required></div>";
-    html += "<div class='form-group'><label>低于多少 W 触发自动保护</label>"
+    html += "<div class='form-group'><label>低于多少 W 触发自动保护 (设0禁用)</label>"
             "<input type='number' name='upw'  class='inp' step='0.1' value='"
             + String(cfg.underPower,    1) + "' required></div>";
     html += "<div class='form-group'><label>自动保护待机冷却时间 (秒)</label>"
@@ -455,7 +466,7 @@ void handleRoot() {
 
     html += "<input type='submit' class='sub-btn' value='保存配置并写入EEPROM'></form>";
 
-    // 运行历史数据
+    // 运行历史数据与复位诊断
     String tripTimeStr = "无";
     if (st.tripEpoch > 0) {
         time_t t = (time_t)st.tripEpoch + 8 * 3600; 
@@ -473,6 +484,7 @@ void handleRoot() {
     html += "<hr><h3>📊 运行历史数据</h3>"
             "<p class='meta'>"
             + bootGuardStr +
+            "• 上次芯片复位原因: <strong style='color:#ffea00;'>" + getResetReasonString() + "</strong><br>"
             "• 昨日在线累计时长: <strong>" + _fmtSec(st.yesterdayOnSec) + "</strong><br>"
             "• 今日在线累计时长: <strong>" + _fmtSec(st.todayOnSec)     + "</strong><br>"
             "• 累计集成消耗电能: <strong>" + String(st.cumulativeWh, 3)  + " Wh</strong><br>"
@@ -558,7 +570,7 @@ void setup() {
     loadSystemState();
     display_begin(); 
 
-    // 【修改】强制开机继电器默认物理关闭
+    // 默认开机继电器物理关闭
     st.relayOn = false;
     setRelayPhysical(false);
     
@@ -586,11 +598,6 @@ void setup() {
 
         configTime(8 * 3600, 0, "ntp.aliyun.com");
 
-        if (MDNS.begin(dns_hostname)) {
-            Serial.printf("[MDNS] http://%s.local\n", dns_hostname);
-            MDNS.addService("http", "tcp", 80);
-        }
-
         timeClient.begin();
         timeClient.update();
 
@@ -603,7 +610,6 @@ void setup() {
 
         httpUpdater.setup(&server);
         server.begin();
-        ArduinoOTA.begin();
     } else {
         Serial.println("[Network] 无网络，独立运行");
     }
@@ -694,10 +700,9 @@ void loop() {
         }
     }
 
-    // ── 仅在网络开启且连接成功时执行 Web、NTP 与 OTA 逻辑 ──
+    // ── 仅在网络开启且连接成功时执行 Web、NTP 逻辑 ──
     if (currentWifiState && WiFi.status() == WL_CONNECTED) {
         server.handleClient();
-        ArduinoOTA.handle();
         timeClient.update();
         note_loop();
     }
@@ -717,9 +722,8 @@ void loop() {
             st.cumulativeWh += (st.power_mW / 1000.f) / 3600.0;
         }
 
-        // ── 【修改】1分钟开机保护判定延迟 ──
+        // ── 1分钟开机保护判定延迟 ──
         if (now < 60000UL) {
-            // 开机前 1 分钟安全预热期间不执行自动逻辑，确认计数复位，保持默认关闭
             st.confirmCounter = 0;
         } else {
             // ── 继电器断开时的自动恢复逻辑 ──
@@ -751,9 +755,9 @@ void loop() {
                 if (st.busVoltage < cfg.underVoltage && st.busVoltage > 0.5f) {
                     pending = TripReason::UNDERVOLTAGE;
                 } 
-                // 避开前10秒刚开机时的瞬时无功耗状态，防止启动电流慢导致误判定
-                else if ((now - relayOnTimeMs > 10000UL) && (st.power_mW < cfg.underPower * 1000.f)) {
-                    pending = TripReason::OVERCURRENT; // 复用 note.h 的 OVERCURRENT 槽位储存低功率保护关闭
+                // 仅在设置的低功率阈值大于 0.05W 时触发低功率切断，避免误判断
+                else if ((cfg.underPower > 0.05f) && (now - relayOnTimeMs > 10000UL) && (st.power_mW < cfg.underPower * 1000.f)) {
+                    pending = TripReason::OVERCURRENT; 
                 }
 
                 if (pending != TripReason::NONE) {
