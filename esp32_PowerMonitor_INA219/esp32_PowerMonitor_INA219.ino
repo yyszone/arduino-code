@@ -1,7 +1,7 @@
 // =================================================================
 // esp32_PowerMonitor_INA219.ino — 继电器 + INA219 独立电源监控保护模块
 // 适用平台: ESP32-C3 (C3 Mini / C3 SuperMini)
-// 特性：高于电压开启、欠压关闭（带倒计时显示）、低功率保护、首次通电WiFi保护、断电记忆、全中文智能状态提示系统、Web OTA更新、TM1637数码管轮播显示
+// 特性：高于电压开启、欠压关闭（带倒计时显示）、低功率保护、首次通电WiFi保护、断电记忆、全中文智能状态提示系统、Web OTA更新、TM1637数码管轮播显示、系统日志追踪
 // 库依赖: GyverINA, ArduinoJson, NTPClient, TM1637Display
 // =================================================================
 
@@ -18,6 +18,7 @@
 #include <time.h>
 #include <esp_system.h>
 
+#include "log.h"            // 引入日志模块
 #include "note.h"           // 引入打卡模块（含 SystemState 与 TripReason 声明）
 #include "display_tm1637.h" // 引入数码管显示模块
 
@@ -101,12 +102,12 @@ String getResetReasonString() {
         case ESP_RST_POWERON:   return "POWERON (正常上电)";
         case ESP_RST_EXT:       return "EXTERNAL (外部按键复位)";
         case ESP_RST_SW:        return "SOFTWARE (软件重启)";
-        case ESP_RST_PANIC:     return "PANIC (异常崩溃重启)";
-        case ESP_RST_INT_WDT:   return "INT_WDT (看门狗复位)";
+        case ESP_RST_PANIC:     return "PANIC (崩溃崩溃重启)";
+        case ESP_RST_INT_WDT:   return "INT_WDT (中断看门狗复位)";
         case ESP_RST_TASK_WDT:  return "TASK_WDT (任务看门狗复位)";
         case ESP_RST_WDT:       return "OTHER_WDT (看门狗复位)";
         case ESP_RST_DEEPSLEEP: return "DEEPSLEEP (休眠唤醒)";
-        case ESP_RST_BROWNOUT:  return "BROWNOUT (供电电压不足/下拉重启)";
+        case ESP_RST_BROWNOUT:  return "BROWNOUT (供电压降/欠压下拉重启)";
         case ESP_RST_SDIO:      return "SDIO (SDIO复位)";
         default:                return "UNKNOWN (未知原因)";
     }
@@ -244,8 +245,10 @@ void executeTrip(TripReason reason) {
         reason == TripReason::OVERCURRENT  ? "低功率" : 
         reason == TripReason::MANUAL       ? "手动断开" : "未知";
 
-    Serial.printf("[ALARM] 关闭保护动作! 原因: %s  V=%.2fV  W=%.3fW\n",
-                  rStr, st.busVoltage, st.power_mW / 1000.f);
+    String logMsg = "保护跳闸动作! 原因: " + String(rStr) + 
+                    " | 电压: " + String(st.busVoltage, 2) + "V" +
+                    " | 功率: " + String(st.power_mW / 1000.f, 2) + "W";
+    sysLog(logMsg);
 }
 
 void forceOnSystem() {
@@ -258,7 +261,7 @@ void forceOnSystem() {
     relayOnTimeMs     = millis(); 
     setRelayPhysical(true);
     saveSystemState();
-    Serial.println("[Manual] 手动强制开启继电器");
+    sysLog("手动强制开启继电器");
 }
 
 void resetSystem() {
@@ -271,17 +274,17 @@ void resetSystem() {
     if (millis() < 60000UL) {
         st.relayOn    = false;
         setRelayPhysical(false);
-        Serial.println("[Reset] 预热期内清除故障，保持默认关闭");
+        sysLog("[Reset] 预热期内清除故障，保持默认关闭");
     } else {
         if (st.busVoltage > cfg.turnOnVoltage) {
             st.relayOn    = true;
             relayOnTimeMs = millis(); 
             setRelayPhysical(true);
-            Serial.printf("[Reset] 故障清除并重新开启继电器 (%.2fV > 阈值 %.2fV)\n", st.busVoltage, cfg.turnOnVoltage);
+            sysLog("[Reset] 故障清除并重新开启继电器 (电压: " + String(st.busVoltage, 2) + "V)");
         } else {
             st.relayOn    = false;
             setRelayPhysical(false);
-            Serial.printf("[Reset] 故障清除，但电压低于阈值，保持关闭等待自动恢复 (%.2fV <= 阈值 %.2fV)\n", st.busVoltage, cfg.turnOnVoltage);
+            sysLog("[Reset] 故障清除，但电压低于阈值，保持关闭 (电压: " + String(st.busVoltage, 2) + "V)");
         }
     }
     saveSystemState();
@@ -347,7 +350,7 @@ void handleRoot() {
     String ipStr = WiFi.localIP().toString();
 
     String html;
-    html.reserve(4096);
+    html.reserve(5120);
     html = F("<!DOCTYPE html><html lang='zh-CN'><head><meta charset='UTF-8'>"
              "<meta name='viewport' content='width=device-width,initial-scale=1'>"
              "<title>电源监控 INA219</title>"
@@ -393,6 +396,7 @@ void handleRoot() {
              ".sub-btn{background:transparent; color:var(--neon-cyan); border:1px solid var(--neon-cyan); width:100%; padding:10px; font-weight:bold; cursor:pointer; border-radius:4px; text-transform:uppercase; letter-spacing:1px; margin-top:15px; transition:all 0.3s ease;}"
              ".sub-btn:hover{background:var(--neon-cyan); color:#000; box-shadow: 0 0 15px rgba(0,243,255,0.5);}"
              ".meta{color:#8b949e; font-size:.82em; line-height:1.7; margin-top:10px; text-align:left; font-family:monospace;}"
+             ".log-box{background:#000; color:#00f3ff; font-family:monospace; font-size:0.75em; border:1px solid var(--border-color); border-radius:4px; padding:10px; height:150px; overflow-y:auto; text-align:left; white-space:pre-wrap; margin-top:10px;}"
              "</style></head><body>"
              "<div class='card'>"
              "<h1>⚡ SYSTEM POWER CORE <small style='font-size:.6em; color:#8b949e; float:right;'>INA219</small></h1>");
@@ -493,6 +497,10 @@ void handleRoot() {
             "</p>"
             "<p class='meta' id='val-cooldown' style='border-top:1px dashed rgba(176,38,255,0.2); padding-top:10px; color:#ffea00; text-shadow:0 0 5px rgba(255,234,0,0.3);'>" + cooldownStr + "</p>";
 
+    // 实时日志面板
+    html += "<hr><h3>📜 系统事件历史日志 <small style='font-size:0.7em;'><a href='/clear_log' style='color:var(--neon-magenta); text-decoration:none;'>[清空日志]</a></small></h3>"
+            "<div class='log-box' id='sys-log-box'>" + getLogsText() + "</div>";
+
     html += "<p class='meta' style='text-align:right;'><a href='/update' style='color:var(--neon-cyan); text-decoration:none; text-shadow:0 0 5px rgba(0,243,255,0.4);'>🚀 SYSTEM FIRMWARE UPDATE (OTA)</a></p>"
             "<script>"
             "setInterval(function(){"
@@ -552,6 +560,7 @@ void handleSaveSettings() {
     }
 
     saveConfig();
+    sysLog("用户修改并保存了配置参数");
     server.sendHeader("Location", "/", true);
     server.send(302, "text/plain", "");
 }
@@ -570,17 +579,22 @@ void setup() {
     loadSystemState();
     display_begin(); 
 
+    // 记录重启日志
+    String rStr = getResetReasonString();
+    sysLog(">>> 系统上电/复位启动 <<< | 复位原因: " + rStr);
+
     // 默认开机继电器物理关闭
     st.relayOn = false;
     setRelayPhysical(false);
     
     // 初始化 ESP32-C3 默认硬件 I2C 接口
     Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+    Wire.setTimeOut(1000); // 增加 1 秒 I2C 超时锁，防止 INA219 锁死引发 WDT 看门狗重启
 
     if (!ina.begin()) {
-        Serial.println("[INA219] 初始化失败！检查接线和 I2C 地址");
+        sysLog("[INA219] 初始化失败！请检查接线及 I2C 地址");
     } else {
-        Serial.println("[INA219] 初始化成功");
+        sysLog("[INA219] 硬件传感器初始化成功");
     }
 
     // WiFi 初始化
@@ -594,7 +608,7 @@ void setup() {
     Serial.println();
 
     if (WiFi.status() == WL_CONNECTED) {
-        Serial.printf("[Network] 已连接 IP: %s\n", WiFi.localIP().toString().c_str());
+        sysLog("[Network] Wi-Fi 连接成功，分配 IP: " + WiFi.localIP().toString());
 
         configTime(8 * 3600, 0, "ntp.aliyun.com");
 
@@ -607,11 +621,12 @@ void setup() {
         server.on("/on",  HTTP_GET, [](){ forceOnSystem();             server.sendHeader("Location","/",true); server.send(302,"text/plain",""); });
         server.on("/off", HTTP_GET, [](){ executeTrip(TripReason::MANUAL); server.sendHeader("Location","/",true); server.send(302,"text/plain",""); });
         server.on("/reset",HTTP_GET,[](){ resetSystem();               server.sendHeader("Location","/",true); server.send(302,"text/plain",""); });
+        server.on("/clear_log", HTTP_GET, [](){ clearLogs(); server.sendHeader("Location","/",true); server.send(302,"text/plain",""); });
 
         httpUpdater.setup(&server);
         server.begin();
     } else {
-        Serial.println("[Network] 无网络，独立运行");
+        sysLog("[Network] Wi-Fi 连接超时，系统进入无网络独立监控模式");
     }
 
     st.lastSaveMs = millis();
@@ -623,13 +638,12 @@ void setup() {
 void loop() {
     unsigned long now = millis();
 
-    // ── 低压自动待机休眠检测（当未开机、电压低，且过了首次开机/唤醒后的 2 分钟安全期时触发） ──
+    // ── 低压自动待机休眠检测 ──
     if (st.relayOn == false && st.busVoltage < cfg.sleepVoltage && st.busVoltage > 2.0f) {
         if (!lowVoltageSleeping && (now > sleepGuardUntilMs)) {
             lowVoltageSleeping = true;
             sleepStartMs = now;
-            Serial.printf("[Sleep] 电压 %.2fV 低于阈值 %.2fV 且继电器断开，进入节能省电待机，关闭数码管及射频，冷却: %d秒...\n", 
-                          st.busVoltage, cfg.sleepVoltage, cfg.cooldownSec);
+            sysLog("进入低压待机休眠 (电压: " + String(st.busVoltage, 2) + "V < 阈值 " + String(cfg.sleepVoltage, 2) + "V)");
             
             // 关闭 ESP32-C3 Wi-Fi 射频信号
             WiFi.disconnect(true);
@@ -642,8 +656,8 @@ void loop() {
     if (lowVoltageSleeping) {
         if (now - sleepStartMs >= (cfg.cooldownSec * 1000UL)) {
             lowVoltageSleeping = false;
-            sleepGuardUntilMs = now + 120000UL; // 唤醒后保持 120 秒安全期不进入休眠，允许网页后台操作
-            Serial.println("[Sleep] 待机冷却已过，系统自动唤醒 WiFi 建立连接（开启 2 分钟安全配置期）...");
+            sleepGuardUntilMs = now + 120000UL;
+            sysLog("待机冷却完毕，自动唤醒 Wi-Fi 开启 2 分钟安全配置期");
             
             WiFi.mode(WIFI_STA);
             WiFi.begin(ssid, password);
@@ -651,7 +665,7 @@ void loop() {
         }
     }
 
-    // ── 定时休眠唤醒逻辑，每 5 秒检测一次（仅在非低电压休眠状态下运行） ──
+    // ── 定时休眠唤醒逻辑，每 5 秒检测一次 ──
     if (!lowVoltageSleeping && (now - lastWifiCheckMs >= 5000UL)) {
         lastWifiCheckMs = now;
         
@@ -687,13 +701,13 @@ void loop() {
         
         // 应用 Wi-Fi 定时状态
         if (shouldWifiBeOn && !currentWifiState) {
-            Serial.println("[Schedule] 到达唤醒时间，开启 Wi-Fi 联网...");
+            sysLog("到达定时唤醒时间，重新开启 Wi-Fi 网络");
             WiFi.mode(WIFI_STA);
             WiFi.begin(ssid, password);
             currentWifiState = true;
         } 
         else if (!shouldWifiBeOn && currentWifiState) {
-            Serial.println("[Schedule] 到达休眠时间，进入低功耗，关闭 Wi-Fi 射频信号...");
+            sysLog("到达定时休眠时间，切断 Wi-Fi 射频信号进入低功耗状态");
             WiFi.disconnect(true);
             WiFi.mode(WIFI_OFF);
             currentWifiState = false;
@@ -707,7 +721,7 @@ void loop() {
         note_loop();
     }
 
-    // ── 每秒采样一次（即便 Wi-Fi 定时关闭，核心监控依然正常独立运行）──
+    // ── 每秒采样一次 ──
     if (now - st.lastSampleMs >= SAMPLE_INTERVAL_MS) {
         st.lastSampleMs = now;
 
@@ -733,7 +747,6 @@ void loop() {
                     saveSystemState();
                 }
                 
-                // 如果不是手动关闭(MANUAL)，且当前电压已经高出设定的自动开启电压值，且保护冷却倒计时已经结束，才恢复吸合
                 if (st.tripReason != TripReason::MANUAL && st.busVoltage > cfg.turnOnVoltage && getCooldownRemaining() <= 0) {
                     if (++st.confirmCounter >= CONFIRM_COUNT) {
                         st.relayOn = true;
@@ -743,7 +756,7 @@ void loop() {
                         relayOnTimeMs = millis(); 
                         setRelayPhysical(true);
                         saveSystemState();
-                        Serial.printf("[Auto-ON] 保护时间已过且电压升至 %.2fV (大于阈值 %.2fV)，自动开启继电器\n", st.busVoltage, cfg.turnOnVoltage);
+                        sysLog("自动开启继电器 (电压升至: " + String(st.busVoltage, 2) + "V)");
                     }
                 } else {
                     st.confirmCounter = 0; 
@@ -755,7 +768,6 @@ void loop() {
                 if (st.busVoltage < cfg.underVoltage && st.busVoltage > 0.5f) {
                     pending = TripReason::UNDERVOLTAGE;
                 } 
-                // 仅在设置的低功率阈值大于 0.05W 时触发低功率切断，避免误判断
                 else if ((cfg.underPower > 0.05f) && (now - relayOnTimeMs > 10000UL) && (st.power_mW < cfg.underPower * 1000.f)) {
                     pending = TripReason::OVERCURRENT; 
                 }
@@ -774,9 +786,8 @@ void loop() {
     if (now - st.lastSaveMs >= 300000UL) {
         st.lastSaveMs = now;
         saveSystemState();
-        Serial.println("[Storage] 周期归档完成");
     }
 
-    // 更新数码管显示（融合网页显示开关和低电压睡眠检测）
+    // 更新数码管显示
     display_update(st.busVoltage, st.current_mA, cfg.displayEnabledUser && !lowVoltageSleeping);
 }

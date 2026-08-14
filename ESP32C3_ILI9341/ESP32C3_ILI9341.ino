@@ -1,8 +1,6 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <HTTPUpdateServer.h>
-#include <ESPmDNS.h>
-#include <ArduinoOTA.h>
 #include <SPI.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ILI9341.h>
@@ -18,90 +16,60 @@
 #include <LittleFS.h>
 
 #include "config.h"
-#include "web_pages.h"
+#include "ina219_sensor.h"
 #include "dht11.h"
+#include "web_pages.h"
 
-// ==================== 1. 定义全局实体变量 ====================
+// ==================== 全局实体变量定义 ====================
 Settings settings;                
+SystemState st;
+
 bool haDeviceState = false;
 bool httpDeviceState = false;
 bool irLightState = false;
-bool relayState = false;          // 继电器当前逻辑状态
+bool relayState = false;          
 bool isInStandby = false;
-bool lastInSleepWindow = false;   
-bool firstTimeSyncDone = false;   // 标记开机后首次网络时间同步与状态初始化是否完成
 
-// 时间戳状态变量
 unsigned long lastActivityTime = 0;
 unsigned long lastStatusUpdate = 0;
-unsigned long lastWakeupCheck = 0; 
+unsigned long relayOnTimeMs = 0;
 
-// 【继电器防噪优化】：记录继电器物理动作的时间戳，初始化为0
-unsigned long lastRelaySwitchTime = 0; 
-
-// 传感器缓存变量
 float dhtTemp = NAN;
 float dhtHum = NAN;
 
-// 日志系统配置
 const int MAX_LOG_ENTRIES = 50;
 LogEntry logBuffer[MAX_LOG_ENTRIES];
 int currentLogIndex = 0;
 bool logBufferFull = false;
 
-// 屏幕轮播控制
-ScreenMode currentScreen = SCREEN_CONTROL;
+// 默认直接显示天气页
+ScreenMode currentScreen = SCREEN_WEATHER;
 unsigned long lastScreenSwitchTime = 0;
 bool pauseRotation = false; 
 
-// 天气数据缓存
 String weather_main = "NODATA";
 String weather_temp = "--";
 String weather_desc = "SYSTEM INIT";
 unsigned long lastWeatherUpdate = 0;
 const unsigned long WEATHER_UPDATE_INTERVAL = 15 * 60 * 1000;
 
-// 时钟局部刷新状态变量
 int lastMinute = -1;
 int lastSecond = -1;
 int lastDay = -1;
 
-// ==================== 2. 声明默认函数（默认参数值只在这里定义一次） ====================
+// ==================== 函数前置声明 ====================
 void loadSettings();
 void saveSettings();
-void handleRoot();
-void handleSettings();
-void handleSaveIR();
-void handleIrCommand();
-void handleRelayCommand(); 
-void updateStatusLine();
-void enterStandby();
-void exitStandby(bool wifiAlreadyConnected = false); 
-void setupWifiAndServices(bool wifiAlreadyConnected = false); 
-void handleTouch();
-void drawCurrentScreen(bool forceRedraw = false); 
-void drawControlScreen();
-void drawWeatherScreen();
-void drawClockScreen(bool isInitialDraw);
-void updateClockTime();
-void updateWeather();
-void controlHttp(bool state);
-void controlHA(bool state);
-void addLog(String message);
-void handleLogs();
-void drawCyberFrame(int x, int y, int w, int h, uint16_t color, String label);
-void drawGridBackground();
-void drawWeatherIcon(String weather, int x, int y);
-bool isSleepTime();
-bool isRelayTimerActive(); 
+void loadSystemState();
+void saveSystemState();
+void setRelay(bool state);
+void executeTrip(TripReason reason);
+void forceOnSystem();
+void resetSystem();
+long getCooldownRemaining();
 void updateRelayLogic();
-void setRelay(bool state); 
 
-// ==================== 3. 加载具体的实现头文件 ====================
-#include "gui.h"
-#include "network_web.h"
-
-// ============== 全局硬件对象实例化 ==============
+// 全局硬件实例化
 Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);
 XPT2046_Touchscreen ts(T_CS);
 WebServer server(80);
@@ -109,140 +77,20 @@ HTTPUpdateServer httpUpdater;
 WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP, "ntp.aliyun.com", 8 * 3600);
 IRsend irsend(kIrLedPin);
-DHT11_ESP32 dht(DHTPIN); // 实例化本地温湿度传感器对象
+DHT11_ESP32 dht(DHTPIN);
+INA219Sensor inaSensor;
 
-// ==================== 统一的继电器硬件控制器（防反偏） ====================
-void setRelay(bool state) {
-  if (relayState != state) {
-    relayState = state;
-    digitalWrite(RELAY_PIN, state ? (RELAY_ACTIVE_LOW ? LOW : HIGH) : (RELAY_ACTIVE_LOW ? HIGH : LOW));
-    lastRelaySwitchTime = millis(); // 记录硬件动作发生时间，用于防抖判定
-  }
-}
+#include "gui.h"
+#include "network_web.h"
 
-// ==================== 主程序入口 ====================
-void setup() {
-  Serial.begin(115200);
-  irsend.begin();
-  dht.begin(); // 初始化温湿度传感器
-  
-  // 继电器引脚初始化，开机默认闭合、安全关闭
-  pinMode(RELAY_PIN, OUTPUT);
-  setRelay(false); 
-  
-  // 配置并使能屏幕背光控制引脚
-  pinMode(TFT_BL, OUTPUT);
-  digitalWrite(TFT_BL, HIGH);
-  
-  // ESP32 文件系统开启格式化后挂载
-  if (!LittleFS.begin(true)) {
-    Serial.println("文件系统挂载失败");
-    return;
-  }
-  
-  loadSettings();
-  
-  // 在初始化屏幕与触控前，指定硬件 SPI 复用引脚
-  SPI.begin(TFT_SCK, TFT_MISO, TFT_MOSI);
-  
-  tft.begin();
-  ts.begin();
-  tft.setRotation(0); 
-
-  exitStandby(); 
-  addLog("系统启动: v8.4 Final ESP32-C3");
-}
-
-void loop() {
-  handleTouch(); 
-  
-  // 5 秒周期无抢占采集 DHT 并判定温控与定时 (即使待机中同样可以低频稳定后台计算)
-  static unsigned long lastDhtRead = 0;
-  if (millis() - lastDhtRead > 5000) {
-    float t = NAN;
-    float h = NAN;
-    if (dht.read(t, h)) {
-      dhtTemp = t;
-      dhtHum = h;
-    }
-    lastDhtRead = millis();
-    updateRelayLogic(); 
-  }
-
-  if (!isInStandby) {
-    server.handleClient();
-    ArduinoOTA.handle();
-
-    if (millis() - lastStatusUpdate > 1000) {
-      if(WiFi.status() == WL_CONNECTED) {
-        timeClient.update();
-      }
-
-      if (currentScreen == SCREEN_CLOCK) {
-        updateClockTime();
-      } else {
-        updateStatusLine();
-      }
-      lastStatusUpdate = millis();
-    }
-
-    if (!pauseRotation) {
-        unsigned long interval = 5000;
-        if (currentScreen == SCREEN_WEATHER || currentScreen == SCREEN_CLOCK) {
-          interval = 4000;
-        }
-
-        if (millis() - lastScreenSwitchTime > interval) {
-            ScreenMode nextScreen = currentScreen;
-            if (currentScreen == SCREEN_CONTROL) nextScreen = SCREEN_WEATHER;
-            else if (currentScreen == SCREEN_WEATHER) nextScreen = SCREEN_CLOCK;
-            else nextScreen = SCREEN_CONTROL;
-            
-            if (nextScreen != currentScreen) {
-                currentScreen = nextScreen;
-                drawCurrentScreen();
-            }
-            lastScreenSwitchTime = millis();
-        }
-    } else {
-        if (millis() - lastActivityTime > 10000) { 
-            pauseRotation = false;
-        }
-    }
-
-    if (WiFi.status() == WL_CONNECTED && (millis() - lastWeatherUpdate > WEATHER_UPDATE_INTERVAL || lastWeatherUpdate == 0)) {
-        updateWeather();
-    }
-
-    // 自动待机判断
-    if (isSleepTime() && (millis() - lastActivityTime > standbyDelay)) {
-        enterStandby();
-    }
-  } else {
-    // ==================== 【重置崩溃/唤醒循环核心修复】 ====================
-    // 待机时静默利用底层 timeClient 的离线 millis() 本地计时。
-    // 每 5 秒低功耗检测一次本地时钟，一旦判定过了睡眠区间，执行自动唤醒。
-    if (millis() - lastWakeupCheck > 5000) {
-      if (!isSleepTime() && timeClient.getEpochTime() > 0) {
-        addLog("本地时钟判定：已到达睡眠区间终点，执行自动唤醒。");
-        exitStandby(false); // 退出待机，重新拉高屏幕并恢复 Wi-Fi 联网
-      }
-      lastWakeupCheck = millis();
-    }
-    delay(200);
-  }
-}
-
-// ==================== 定时与温控算法优化 ====================
-
-// 判断当前时间是否在屏幕待机时间范围内（【核心修复点】：移除对 WiFi 连接状态的强依赖，离线仍能精准判断睡眠时段）
+// ==================== 定时与继电器硬件逻辑 ====================
 bool isSleepTime() {
-  if (timeClient.getEpochTime() <= 0) {
-    return false; 
-  }
-  int sleepM = settings.sleepHour * 60 + settings.sleepMinute;
-  int wakeM = settings.wakeHour * 60 + settings.wakeMinute;
-  int currM = timeClient.getHours() * 60 + timeClient.getMinutes();
+  if (timeClient.getEpochTime() <= 0) return false; 
+  
+  int sleepM = settings.sleepHour * 60 + settings.sleepMinute; 
+  int wakeM  = settings.wakeHour * 60 + settings.wakeMinute;   
+  int currM  = timeClient.getHours() * 60 + timeClient.getMinutes();
+
   if (wakeM > sleepM) {
     return (currM >= sleepM && currM < wakeM);
   } else {
@@ -250,60 +98,252 @@ bool isSleepTime() {
   }
 }
 
-// 判断当前时间是否在继电器定时时间范围内 (独立计算)
-bool isRelayTimerActive() {
-  if (!settings.relayTimerEnabled) return false;
-  // 必须获取过有效网络时间
-  if (timeClient.getEpochTime() <= 0) {
-    return false; 
+void setRelay(bool state) {
+  relayState = state;
+  st.relayOn = state;
+  digitalWrite(RELAY_PIN, state ? (RELAY_ACTIVE_LOW ? LOW : HIGH) : (RELAY_ACTIVE_LOW ? HIGH : LOW));
+  if (state) relayOnTimeMs = millis();
+}
+
+long getCooldownRemaining() {
+  if (st.tripEpoch == 0) return 0;
+  time_t now_t = time(nullptr);
+  if (now_t > 1000000000L) {
+      long elapsed = (long)(now_t - st.tripEpoch);
+      long rem = (long)settings.cooldownSec - elapsed;
+      return rem > 0 ? rem : 0;
   }
-  int onM = settings.relayOnHour * 60 + settings.relayOnMinute;
-  int offM = settings.relayOffHour * 60 + settings.relayOffMinute;
-  int currM = timeClient.getHours() * 60 + timeClient.getMinutes();
+  long elapsed = (long)(millis() / 1000UL);
+  long rem = (long)settings.cooldownSec - elapsed;
+  return rem > 0 ? rem : 0;
+}
+
+void executeTrip(TripReason reason) {
+    setRelay(false);
+    st.faultLatched = true;
+    st.tripReason   = reason;
+    st.confirmCounter = 0;
+    time_t now_t = time(nullptr);
+    st.tripEpoch    = (now_t > 1000000000L) ? now_t : 0;
+    saveSystemState();
+    addLog("INA219 保护跳闸触发！原因代码: " + String((int)reason));
+}
+
+void forceOnSystem() {
+    st.faultLatched   = false;
+    st.tripReason     = TripReason::NONE;
+    st.tripEpoch      = 0;
+    st.confirmCounter = 0;
+    setRelay(true);
+    saveSystemState();
+    addLog("用户手动强制开启继电器。");
+}
+
+void resetSystem() {
+    st.faultLatched   = false;
+    st.tripReason     = TripReason::NONE;
+    st.tripEpoch      = 0;
+    st.confirmCounter = 0;
+    if (st.busVoltage > settings.turnOnVoltage) {
+        setRelay(true);
+        addLog("故障已被重置，当前电压满足开启要求，继电器吸合。");
+    } else {
+        setRelay(false);
+        addLog("故障已被重置，但当前电压低于开启阈值，保持关闭。");
+    }
+    saveSystemState();
+}
+
+void loadSystemState() {
+  if (!LittleFS.exists(stateFile)) return;
+  File file = LittleFS.open(stateFile, "r");
+  if (!file) return;
+  StaticJsonDocument<512> doc;
+  if (!deserializeJson(doc, file)) {
+      st.relayOn      = doc["relayOn"] | false; 
+      st.faultLatched = doc["faultLatched"] | false;
+      st.tripReason   = static_cast<TripReason>(doc["tripReason"] | 0);
+      st.tripEpoch    = doc["tripEpoch"] | 0;
+      st.cumulativeWh = doc["cumulativeWh"] | 0.0;
+  }
+  file.close();
+}
+
+void saveSystemState() {
+  File file = LittleFS.open(stateFile, "w");
+  if (!file) return;
+  StaticJsonDocument<512> doc;
+  doc["relayOn"]      = st.relayOn;
+  doc["faultLatched"] = st.faultLatched;
+  doc["tripReason"]   = static_cast<uint8_t>(st.tripReason);
+  doc["tripEpoch"]    = st.tripEpoch;
+  doc["cumulativeWh"] = st.cumulativeWh;
+  serializeJson(doc, file); file.close();
+}
+
+void updateRelayLogic() {
+  unsigned long now = millis();
   
-  if (onM < offM) {
-    return (currM >= onM && currM < offM);
+  if (now < 60000UL) {
+    st.confirmCounter = 0;
+    return;
+  }
+
+  if (!st.relayOn) {
+    if (st.tripReason != TripReason::MANUAL && st.busVoltage > settings.turnOnVoltage && getCooldownRemaining() <= 0) {
+      if (++st.confirmCounter >= 3) {
+        setRelay(true);
+        st.faultLatched = false;
+        st.tripReason = TripReason::NONE;
+        st.confirmCounter = 0;
+        saveSystemState();
+        addLog("电压高于阈值且冷却结束，自动开启继电器。");
+      }
+    } else {
+      st.confirmCounter = 0;
+    }
   } else {
-    return (currM >= onM || currM < offM);
+    TripReason pending = TripReason::NONE;
+    if (st.busVoltage < settings.underVoltage && st.busVoltage > 0.5f) {
+      pending = TripReason::UNDERVOLTAGE;
+    } else if ((settings.underPower > 0.05f) && (now - relayOnTimeMs > 10000UL) && (st.power_mW < settings.underPower * 1000.f)) {
+      pending = TripReason::OVERCURRENT; 
+    }
+
+    if (pending != TripReason::NONE) {
+      if (++st.confirmCounter >= 3) executeTrip(pending);
+    } else {
+      st.confirmCounter = 0;
+    }
+  }
+
+  if (settings.tempCtrlEnabled && !st.faultLatched && !isnan(dhtTemp)) {
+    if (dhtTemp > settings.tempThreshold && !relayState) setRelay(true);
+    else if (dhtTemp < settings.tempThresholdOff && relayState) setRelay(false);
   }
 }
 
-// 核心计算：温控优先级大于定时优先级
-void updateRelayLogic() {
-  // 未联网获取到有效时间前，不做自动动作判定
-  if (timeClient.getEpochTime() <= 0) {
+// ==================== Main Setup & Loop ====================
+void setup() {
+  Serial.begin(115200);
+  irsend.begin();
+  dht.begin();
+  
+  digitalWrite(RELAY_PIN, RELAY_ACTIVE_LOW ? HIGH : LOW);
+  pinMode(RELAY_PIN, OUTPUT);
+  setRelay(false); 
+  
+  pinMode(TFT_BL, OUTPUT);
+  digitalWrite(TFT_BL, HIGH);
+  
+  if (!LittleFS.begin(true)) {
+    Serial.println("LittleFS 挂载失败");
     return;
   }
+  
+  loadSettings(); 
+  loadSystemState();
 
-  // 【核心修复点】：仅在已经发生过动作（lastRelaySwitchTime != 0）且动作间隔小于 20 秒时阻断，防止开机首分钟发生控制死锁
-  if (lastRelaySwitchTime != 0 && (millis() - lastRelaySwitchTime < 20000)) {
-    return;
+  st.relayOn = false;
+  relayState = false;
+  setRelay(false);
+
+  if (!inaSensor.begin()) {
+    Serial.println("[INA219] 初始化失败");
+  } else {
+    Serial.println("[INA219] 硬件上线正常");
   }
 
-  bool targetState = relayState; // 默认维持当前物理状态
+  SPI.begin(TFT_SCK, TFT_MISO, TFT_MOSI);
+  tft.begin();
+  ts.begin();
+  tft.setRotation(0); 
 
-  // 1. 如果开启了智能温控（温控具有最高优先级）
-  if (settings.tempCtrlEnabled) {
-    if (!isnan(dhtTemp)) {
-      if (dhtTemp > settings.tempThreshold) {
-        targetState = true;  // 高于开启阈值 -> 开启继电器
-      } else if (dhtTemp < settings.tempThresholdOff) {
-        targetState = false; // 低于关闭阈值 -> 关闭继电器
+  exitStandby(false); 
+  addLog("ESP32-C3 控制台 v9.2 上电启动。");
+}
+
+void loop() {
+  handleTouch(); 
+
+  unsigned long now = millis();
+
+  static unsigned long lastSample = 0;
+  static unsigned long lastValidDhtTime = 0;
+
+  if (now - lastSample >= 2500) {
+    lastSample = now;
+    
+    inaSensor.update(st); 
+
+    if (st.relayOn) {
+      st.todayOnSec += 2;
+      st.cumulativeWh += (st.power_mW / 1000.f) * (2.5 / 3600.0);
+    }
+
+    float t = NAN, h = NAN;
+    bool success = dht.read(t, h);
+
+    if (!success) {
+      delay(100);
+      success = dht.read(t, h);
+    }
+
+    if (success) {
+      dhtTemp = t;
+      dhtHum = h;
+      lastValidDhtTime = now;
+    } else {
+      if (now - lastValidDhtTime > 30000 && lastValidDhtTime > 0) {
+        dhtTemp = NAN;
+        dhtHum = NAN;
       }
     }
-  } 
-  // 2. 如果温控未启动，但开启了继电器的专用定时开关
-  else if (settings.relayTimerEnabled) {
-    targetState = isRelayTimerActive(); // 在设定时间范围内开启，范围外关闭
+
+    updateRelayLogic(); 
   }
 
-  // 状态改变判定：若计算出的期望状态与物理电平不符，则执行硬件切换
-  if (targetState != relayState) {
-    setRelay(targetState);
-    addLog("继电器电平自动更新: " + String(relayState ? "ON" : "OFF") + 
-           (settings.tempCtrlEnabled ? " (温控高优先级触发)" : " (独立定时触发)"));
-    if (currentScreen == SCREEN_CONTROL && !isInStandby) {
-      drawControlScreen();
+  if (!isInStandby) {
+    server.handleClient();
+
+    if (now - lastStatusUpdate > 1000) {
+      if (WiFi.status() == WL_CONNECTED) timeClient.update();
+      if (currentScreen == SCREEN_CLOCK) updateClockTime();
+      else updateStatusLine();
+      lastStatusUpdate = now;
     }
+
+    // ⭐️ 核心点：限定仅在【天气页】与【时钟页】2 页之间自动轮播
+    if (!pauseRotation) {
+      if (currentScreen == SCREEN_CONTROL) {
+        currentScreen = SCREEN_WEATHER;
+        drawCurrentScreen(true);
+      }
+      if (now - lastScreenSwitchTime > 5000) {
+        if (currentScreen == SCREEN_WEATHER) currentScreen = SCREEN_CLOCK;
+        else currentScreen = SCREEN_WEATHER;
+        drawCurrentScreen(true);
+        lastScreenSwitchTime = now;
+      }
+    } else if (now - lastActivityTime > 10000) {
+      // 在控制台界面无操作满 10 秒后，自动恢复天气与时钟两页轮播
+      pauseRotation = false;
+      currentScreen = SCREEN_WEATHER;
+      drawCurrentScreen(true);
+    }
+
+    if (WiFi.status() == WL_CONNECTED && (now - lastWeatherUpdate > WEATHER_UPDATE_INTERVAL || lastWeatherUpdate == 0)) {
+      updateWeather();
+    }
+
+    if (isSleepTime() && (now - lastActivityTime > standbyDelay)) {
+      enterStandby();
+    }
+
+  } else {
+    if (!isSleepTime() && timeClient.getEpochTime() > 0) {
+      exitStandby(false);
+    }
+    delay(200);
   }
 }

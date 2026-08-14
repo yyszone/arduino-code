@@ -3,7 +3,6 @@
 
 #include <Arduino.h>
 
-// ==================== 共享数据结构与枚举定义 ====================
 struct LogEntry { 
   String timestamp; 
   String message; 
@@ -16,48 +15,42 @@ enum ScreenMode {
   SCREEN_CLOCK 
 };
 
-// ==================== 用户自定义配置区域 =========================
+enum class TripReason : uint8_t {
+  NONE = 0,
+  UNDERVOLTAGE = 1,
+  OVERCURRENT  = 2, 
+  MANUAL       = 3
+};
+
 const char* ssid = "yang1234";
 const char* password = "y123456789";
-const unsigned long standbyDelay = 60000; // 60秒无操作后进入待机模式
-
-// Home Assistant 配置
-const char* ha_host = "192.168.31.22";
-const int ha_port = 8123;
-const char* ha_token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiIwYjU4YTMwOWMzNmE0ZDE2ODBjOGI2MzI4YzAwMTlkZCIsImlhdCI6MTc1ODk3NDgwMCwiZXhwIjoyMDc0MzM4ODAwfQ.e1e_iE6iIpdB2EG0d0VXZcb5bjePSoI8m8qTDEFTJ-w";
-const char* ha_entity_id = "switch.sonoff_1000a68f48";
+const unsigned long standbyDelay = 60000; 
 
 // HTTP 控制配置
 const char* led_on_url = "http://192.168.31.162/LED-Control?ledPwm=3";
 const char* led_off_url = "http://192.168.31.162/LED-Control?ledPwm=4";
 
-// 配置文件存储路径
 const char* configFile = "/config.json"; 
+const char* stateFile  = "/state.json";
 
-
-// ==================== ESP32-C3 引脚重新定义 ====================
 #define TFT_MISO 5
 #define TFT_MOSI 6
 #define TFT_SCK  4
-
 #define TFT_CS   7
 #define TFT_DC   3
 #define TFT_RST  2
-#define TFT_BL   1   // 屏幕背光控制引脚
-#define T_CS     0
+#define TFT_BL   1   
+#define T_CS     0   
 
-// 红外管改回原本的引脚 GPIO 10
+#define I2C_SDA_PIN  8
+#define I2C_SCL_PIN  9
+
 const uint16_t kIrLedPin = 10; 
-
-// ==================== 物理引脚与触发电平优化 ====================
-// 【硬件对齐】：强制换回您开发板的物理硬线引脚，DHT11接20，继电器接21
 #define DHTPIN       20   
 #define RELAY_PIN    21   
 
-// 高电平触发继电器，开机默认低电平（安全关闭）
-#define RELAY_ACTIVE_LOW  false  
+#define RELAY_ACTIVE_LOW  false 
 
-// ============== 赛博风格配色定义 ==============
 #define C_BG        0x0000
 #define C_GREEN     0x07E0
 #define C_CYAN      0x07FF
@@ -69,35 +62,62 @@ const uint16_t kIrLedPin = 10;
 #define C_DARK_GREY 0x31A6
 #define C_YELLOW    0xFFE0
 
-// 默认红外编码
 const unsigned long DEFAULT_CODE_ON          = 0x1FE48B7;
 const unsigned long DEFAULT_CODE_OFF         = 0x1FE7887;
 const unsigned long DEFAULT_CODE_BRIGHT_UP   = 0x1FE609F;
 const unsigned long DEFAULT_CODE_BRIGHT_DOWN = 0x1FEA05F;
-const unsigned long DEFAULT_CODE_AUTO        = 0x1FE807F;
-const unsigned long DEFAULT_CODE_TIMER_3H    = 0x1FE58A7;
-const unsigned long DEFAULT_CODE_TIMER_5H    = 0x1FE40BF;
-const unsigned long DEFAULT_CODE_TIMER_8H    = 0x1FEC03F;
 
-// ============== 永久保存设置结构体 ==============
 struct Settings {
   uint8_t sleepHour = 22, sleepMinute = 0;
   uint8_t wakeHour = 6, wakeMinute = 0;
-  unsigned long ir_on, ir_off, ir_bright_up, ir_bright_down, ir_auto, ir_timer_3h, ir_timer_5h, ir_timer_8h;
-  char weatherCity[32];
-  char weatherApiKey[64];
   
-  // 温控保存项
-  bool tempCtrlEnabled = false;   // 是否启用温控
-  float tempThreshold = 28.0;     // 温度控制开启阈值
-  float tempThresholdOff = 27.0;  // 温度控制关闭阈值
+  unsigned long ir_on = DEFAULT_CODE_ON, ir_off = DEFAULT_CODE_OFF, ir_bright_up = DEFAULT_CODE_BRIGHT_UP, ir_bright_down = DEFAULT_CODE_BRIGHT_DOWN;
   
-  // 继电器专用定时保存项
-  bool relayTimerEnabled = false; // 是否启用继电器定时
-  uint8_t relayOnHour = 8, relayOnMinute = 0;   // 继电器开启时间
-  uint8_t relayOffHour = 22, relayOffMinute = 0; // 继电器关闭时间
+  char weatherCity[32] = "zhumadian";
+  char weatherApiKey[64] = "";
+  
+  // ⭐️ 新增：Home Assistant 动态磁盘保存配置
+  char haHost[32] = "192.168.31.22";
+  int haPort = 8123;
+  char haEntity[64] = "switch.sonoff_1000a68f48";
+  char haToken[256] = ""; // 存放动态 Token
+
+  bool tempCtrlEnabled = false;  
+  float tempThreshold = 28.0;    
+  float tempThresholdOff = 27.0; 
+  
+  bool relayTimerEnabled = false;
+  uint8_t relayOnHour = 8, relayOnMinute = 0;  
+  uint8_t relayOffHour = 22, relayOffMinute = 0;
+
+  float turnOnVoltage = 13.5f;   
+  float underVoltage  = 11.5f;   
+  float underPower    = 2.0f;    
+  uint32_t cooldownSec = 3600UL; 
   
   int magic_key = 80101; 
 };
 
-#endif
+struct SystemState {
+  float busVoltage   = 0.0f; 
+  float shuntVoltage = 0.0f; 
+  float current_mA   = 0.0f; 
+  float power_mW     = 0.0f; 
+
+  bool relayOn        = false; 
+  bool faultLatched   = false; 
+  TripReason tripReason = TripReason::NONE; 
+  uint32_t tripEpoch  = 0;     
+  uint8_t retryCount  = 0;
+  uint8_t confirmCounter = 0;  
+
+  uint32_t todayOnSec     = 0; 
+  uint32_t yesterdayOnSec = 0;
+  double cumulativeWh     = 0.0;
+  char lastLoggedDate[16] = "";
+
+  unsigned long lastSampleMs = 0;
+  unsigned long lastSaveMs   = 0;
+};
+
+#endif // CONFIG_H

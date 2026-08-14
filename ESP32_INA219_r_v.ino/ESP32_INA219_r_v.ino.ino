@@ -23,6 +23,7 @@ I2C 传感器	INA219 SCL	GPIO 5	避开 GPIO 9 以防上电异常
 #include <LittleFS.h>
 #include <Update.h>            // 【修改】引入 ESP32 固件更新支持
 #include "MatrixClock.h" 
+#include "notify.h"
 #include "logs.h" 
 
 // ============== 用户 WiFi 配置 ==============
@@ -36,6 +37,8 @@ bool pendingTestEmail = false;
 String testEmailResult = "idle"; 
 bool pendingWarningEmail  = false;
 bool pendingLockoutEmail  = false;
+bool pendingNotifyWarning = false;
+
 String pendingEmailSubject = "";
 String pendingEmailBody    = "";
 
@@ -134,12 +137,42 @@ const char MAIN_HTML_PART1[] PROGMEM = R"HTML(
 )HTML";
 
 const char MAIN_HTML_PART2[] PROGMEM = R"HTML(
-<div class="card"><h2>邮件通知设置</h2><div class="input-group"><label>SMTP服务器</label><input type="text" id="smtpHost" placeholder="如: smtp.qq.com"></div><div class="input-group"><label>SMTP端口</label><input type="number" id="smtpPort" placeholder="465"></div><div class="input-group"><label>发件邮箱</label><input type="text" id="authEmail" placeholder="xxxx@qq.com"></div><div class="input-group"><label>授权码/密码</label><input type="password" id="authPass"></div><div class="input-group"><label>收件邮箱</label><input type="text" id="recvEmail" placeholder="接收通知的邮箱"></div><div style="text-align:right;margin-top:10px;"><button class="btn-save" onclick="saveEmailConfig()">保存邮件配置</button></div></div><div class="card"><h2>系统信息与更新</h2>
+<div class="card"><h2>邮件通知设置</h2><div class="input-group"><label>SMTP服务器</label><input type="text" id="smtpHost" placeholder="如: smtp.qq.com"></div><div class="input-group"><label>SMTP端口</label><input type="number" id="smtpPort" placeholder="465"></div><div class="input-group"><label>发件邮箱</label><input type="text" id="authEmail" placeholder="xxxx@qq.com"></div><div class="input-group"><label>授权码/密码</label><input type="password" id="authPass"></div><div class="input-group"><label>收件邮箱</label><input type="text" id="recvEmail" placeholder="接收通知的邮箱"></div><div style="text-align:right;margin-top:10px;"><button class="btn-save" onclick="saveEmailConfig()">保存邮件配置</button></div></div>
+
+<div class="card">
+  <h2>API 通知设置</h2>
+
+  <div class="input-group">
+    <label>通知 API</label>
+    <input
+      type="text"
+      id="notifyApi"
+      placeholder="https://notify.yysresume.work/api/send">
+  </div>
+
+  <p style="font-size:0.8em;color:var(--muted-text);">
+    用于电压警告 API 推送通知
+  </p>
+
+  <div style="text-align:right;margin-top:10px;">
+    <button class="btn-save" onclick="saveNotifyConfig()">
+      保存 API 配置
+    </button>
+  </div>
+
+  <p id="notifyStatus"
+     style="font-size:0.8em;text-align:right;margin:8px 0 0;">
+  </p>
+</div>
+
+<div class="card"><h2>系统信息与更新</h2>
 <a href="/clock" style="display:block; text-align:center; background:linear-gradient(90deg, #ff007f, #7f00ff); color:#fff; padding:12px; border-radius:8px; text-decoration:none; margin-bottom:15px; font-weight:bold; box-shadow: 0 4px 10px rgba(255,0,127,0.3);">✨ 进入矩阵时钟控制台</a><div id="sysinfo">加载中...</div><h4>固件更新 (OTA)</h4><div id="otaUi"><form id="otaForm" method="POST" action="/update" enctype="multipart/form-data"><input type="file" name="update" accept=".bin,.bin.gz" required><button type="submit" class="btn-save" style="margin-top:10px;">上传并更新</button></form></div><div id="otaStatus"></div></div><div class="card chart-card"><h2>24小时电压曲线</h2><div id="voltageChart" style="width: 100%; height: 250px;"></div></div>
 <a href="/logs" style="display:block;text-align:center;background:#1f2937;
 color:#34d399;padding:10px;border-radius:8px;text-decoration:none;
 margin-bottom:10px;font-size:13px;">📋 查看系统日志</a>
 </div>
+
+
 <script>
 var echartInstance;
 var latestDeviceTimeStr = "--:--:--";
@@ -155,6 +188,7 @@ function updateStatus(data){
   $('relayBtn').className=relayOn?'btn off':'btn on';
   if(data.lockout){$('lockoutStatus').style.display='block';$('lockoutStatus').textContent='电压警告中！剩余 '+data.lockout_rem+' 分钟可自动恢复。'}else{$('lockoutStatus').style.display='none';}
 }
+
 function fetchData(){fetchJson('/getData').then(data=>{
   $('v').textContent=data.voltage.toFixed(2);
   $('v').style.color=data.voltage_warning?'var(--warning-color)':'var(--accent-color)';
@@ -173,6 +207,7 @@ function fetchInitialState(){fetchJson('/getStatus').then(data=>{
   $('authEmail').value = data.mail_user;
   $('authPass').value = data.mail_pass;
   $('recvEmail').value = data.mail_to;
+  $('notifyApi').value = data.notify_api || '';
   if(data.mail_to && data.mail_to.length > 3) $('dispRecvEmail').textContent = data.mail_to;
 })}
 function saveSettings(){
@@ -272,8 +307,37 @@ async function updateChart(){ if(!echartInstance)return; try { const chartData=a
 
 document.addEventListener('DOMContentLoaded', (event) => { fetchInitialState(); fetchData(); initChart(); });
 setInterval(fetchData,5000); setInterval(updateChart,120000);
-</script></body></html>
+
+function saveNotifyConfig() {
+  const url = $('notifyApi').value.trim();
+
+  if (!url.startsWith('http://') && !url.startsWith('https://')) {
+    $('notifyStatus').style.color = 'var(--red-color)';
+    $('notifyStatus').textContent = 'API 地址格式错误';
+    return;
+  }
+
+  fetch('/setNotifyApi?url=' + encodeURIComponent(url))
+    .then(r => {
+      if (!r.ok) {
+        return r.text().then(t => {
+          throw new Error(t);
+        });
+      }
+
+      $('notifyStatus').style.color = 'var(--green-color)';
+      $('notifyStatus').textContent = '✓ API 配置已保存';
+    })
+    .catch(e => {
+      $('notifyStatus').style.color = 'var(--red-color)';
+      $('notifyStatus').textContent = '✗ 保存失败: ' + e;
+    });
+}
+
+</script>
+</body></html>
 )HTML";
+
 
 const char OTA_SUCCESS_HTML[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><title>更新成功</title><style>body{background-color:#111827;color:#d1d5db;font-family:system-ui;text-align:center;padding-top:50px;}div{background-color:#1f2937;padding:30px;border-radius:12px;display:inline-block;}h1{color:#22c55e;}</style></head><body><div><h1>更新成功!</h1><p>设备正在重启，请在约1分钟后重新连接。</p></div></body></html>)HTML";
 const char OTA_FAIL_HTML[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><title>更新失败</title><style>body{background-color:#111827;color:#d1d5db;font-family:system-ui;text-align:center;padding-top:50px;}div{background-color:#1f2937;padding:30px;border-radius:12px;display:inline-block;}h1{color:#ef4444;}</style></head><body><div><h1>更新失败!</h1><p>请检查上传的固件文件(.bin)是否正确，然后返回重试。</p></div></body></html>)HTML";
@@ -450,6 +514,7 @@ void checkVoltageProtection() {
           pendingEmailSubject = "[电压警告] " + String(deviceName);
           pendingEmailBody    = "电压为 " + String(busVoltage, 2) + "V，低于警告值 " + String(warningVoltageThreshold, 2) + "V。";
           pendingWarningEmail = true;
+          pendingNotifyWarning = true;
 
       }
   } else if (busVoltage > (warningVoltageThreshold + WARNING_HYSTERESIS_V)) {
@@ -495,6 +560,28 @@ void checkVoltageProtection() {
 }
 
 // ============== Web路由处理 ==============
+void handleSetNotifyApi() {
+  if (!server.hasArg("url")) {
+    server.send(400, "text/plain", "缺少 url");
+    return;
+  }
+
+  String url = server.arg("url");
+  url.trim();
+
+  if (!url.startsWith("http://") &&
+      !url.startsWith("https://")) {
+    server.send(400, "text/plain", "API URL 无效");
+    return;
+  }
+
+  if (!Notify::saveConfig(url)) {
+    server.send(500, "text/plain", "保存失败");
+    return;
+  }
+
+  server.send(200, "text/plain", "OK");
+}
 void handleTestEmail() {
   if (author_email.length() < 5 || recipient_email.length() < 5) {
     server.send(400, "text/plain", "未配置邮件"); return;
@@ -510,9 +597,12 @@ void handleTestEmailResult() {
 void handleRoot() {
   server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+
   server.send(200, "text/html", "");
+
   server.sendContent_P(MAIN_HTML_PART1);
   server.sendContent_P(MAIN_HTML_PART2);
+
   server.sendContent("");
 }
 
@@ -553,6 +643,7 @@ void handleGetStatus() {
   json += "\"mail_user\":\"" + author_email + "\",";
   json += "\"mail_pass\":\"" + author_pass + "\",";
   json += "\"mail_to\":\"" + recipient_email + "\"";
+  json += ",\"notify_api\":\"" + Notify::getApiUrl() + "\"";
   json += "}";
   server.send(200, "application/json", json);
 }
@@ -636,6 +727,8 @@ void setup() {
       vlogFile.close();
     }
     loadSettings();
+      Notify::loadConfig();
+
   }
   
   // 2. 引脚配置
@@ -710,7 +803,14 @@ void setup() {
     Serial.printf(" time=%lu\n", (unsigned long)time(nullptr));
   }
 
-  // 8. 决策与状态恢复
+  // 8.notify通知
+  server.on(
+    "/setNotifyApi",
+    HTTP_GET,
+    handleSetNotifyApi
+  );
+
+  // 9. 决策与状态恢复
   {
     unsigned long offlineSec = 0;
     bool offlineTimeKnown = false;
@@ -739,6 +839,8 @@ void setup() {
       Serial.printf("[Boot] 正常重启(离线%lus), %.2fV ≤ %.2fV → 强制关机\n", offlineSec, busVoltage, warningVoltageThreshold);
     }
     setRelay(bootRelayOn);
+
+
   }
 
 SETUP_NETWORK_DONE:
@@ -821,8 +923,37 @@ void loop() {
   if (pendingWarningEmail || pendingLockoutEmail) {
       pendingWarningEmail = false;
       pendingLockoutEmail = false;
+      
       sendEmailNotification(pendingEmailSubject, pendingEmailBody);
   }
+  if (pendingNotifyWarning) {
+      pendingNotifyWarning = false;
+
+      String title = "🚨 逆变器低电压警告";
+
+      String message =
+          "逆变器电压异常，当前电压 " +
+          String(busVoltage, 2) +
+          "V，警告阈值 " +
+          String(warningVoltageThreshold, 2) +
+          "V";
+
+      bool ok = Notify::send(
+          title,
+          message,
+          String(deviceName),
+          "critical",
+          "逆变器",
+          3600
+      );
+
+      if (ok) {
+          Serial.println("[Notify] 电压警告 API 发送成功");
+      } else {
+          Serial.println("[Notify] 电压警告 API 发送失败");
+      }
+  }
+
   myClock.setBatteryVoltage(busVoltage);  
   myClock.loop(); 
 

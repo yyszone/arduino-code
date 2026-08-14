@@ -7,10 +7,10 @@
 #include <NTPClient.h>  
 #include "config.h"
 
-// ==================== 建立与主 ino 全局变量的一对一 extern 映射映射 ====================
 extern Adafruit_ILI9341 tft;
 extern XPT2046_Touchscreen ts;
 extern Settings settings;
+extern SystemState st;
 extern NTPClient timeClient; 
 
 extern bool haDeviceState;
@@ -34,10 +34,9 @@ extern int lastMinute;
 extern int lastSecond;
 extern int lastDay;
 
-// 主程序中声明的、需要跨模块调用的辅助函数
 extern void updateStatusLine();
-
-// ==================== 所有绘图函数实现（彻底去除了 inline） ====================
+extern long getCooldownRemaining();
+void updateClockTime();
 
 void drawGridBackground() {
   for (int i = 0; i < 320; i += 40) {
@@ -69,37 +68,6 @@ void drawCyberFrame(int x, int y, int w, int h, uint16_t color, String label) {
     tft.setTextColor(color);
     tft.setCursor(x + 15, y - (text_h / 2));
     tft.print(label);
-  }
-}
-
-void drawWeatherIcon(String weather, int x, int y) {
-  weather.toLowerCase();
-  if (weather.indexOf("rain") >= 0 || weather.indexOf("drizzle") >= 0) {
-    tft.fillCircle(x, y - 5, 20, C_DARK_GREY);
-    tft.fillCircle(x - 10, y + 5, 15, C_DARK_GREY);
-    tft.fillCircle(x + 10, y + 5, 15, C_DARK_GREY);
-    for (int i=0; i<3; i++) {
-      tft.drawLine(x - 12 + i*12, y + 15, x - 17 + i*12, y + 30, C_CYAN);
-    }
-  } else if (weather.indexOf("snow") >= 0) {
-    tft.fillCircle(x, y - 5, 20, C_DARK_GREY);
-    for (int i=0; i<3; i++) {
-      tft.drawCircle(x - 10 + i*10, y + 20, 2, C_WHITE);
-    }
-  } else if (weather.indexOf("cloud") >= 0) {
-    tft.fillCircle(x, y - 5, 22, C_DARK_GREY);
-    tft.fillCircle(x - 15, y + 5, 18, C_DARK_GREY);
-    tft.fillCircle(x + 18, y + 5, 18, C_WHITE);
-  } else if (weather.indexOf("clear") >= 0) {
-    tft.fillCircle(x, y, 22, C_YELLOW);
-    for (float i=0; i<360; i+= 45) {
-      float r = i * 3.14159 / 180;
-      tft.drawLine(x + 26*cos(r), y + 26*sin(r), x + 34*cos(r), y + 34*sin(r), C_ORANGE);
-    }
-  } else { 
-    for (int i=0; i<3; i++) {
-      tft.drawFastHLine(x-20, y-10+i*8, 40, C_DARK_GREY);
-    }
   }
 }
 
@@ -153,23 +121,27 @@ void drawWeatherScreen() {
   tft.setCursor(130, 9);
   tft.print(settings.weatherCity);
   
+  // 室外温度 - 7 号巨型大字
   tft.setTextColor(C_WHITE);
-  tft.setTextSize(5); 
+  tft.setTextSize(7); 
   int16_t x1, y1;
   uint16_t w, h;
   tft.getTextBounds(weather_temp, 0, 0, &x1, &y1, &w, &h);
-  tft.setCursor(120 - w/2, 35);
+  
+  int startX = 110 - w / 2;
+  tft.setCursor(startX, 35);
   tft.print(weather_temp);
-  tft.setTextSize(2);
-  tft.drawCircle(tft.getCursorX() + 8, 40, 4, C_WHITE);
+
+  tft.setTextSize(3);
+  tft.drawCircle(startX + w + 12, 42, 5, C_WHITE);
+  tft.setCursor(startX + w + 22, 45);
+  tft.print("C");
 
   tft.setTextSize(2);
   tft.setTextColor(C_CYAN);
   tft.getTextBounds(weather_desc, 0, 0, &x1, &y1, &w, &h);
-  tft.setCursor(120 - w/2, 85);
+  tft.setCursor(120 - w/2, 98);
   tft.print(weather_desc);
-
-  drawWeatherIcon(weather_main, 120, 140);
 
   drawCyberFrame(10, 185, 220, 110, C_GREEN, "INDOOR CLIMATE");
   
@@ -178,58 +150,19 @@ void drawWeatherScreen() {
   
   tft.setCursor(25, 210);
   tft.print("TEMP: ");
-  if (isnan(dhtTemp)) {
-    tft.print("-- C");
-  } else {
-    tft.print(dhtTemp, 1);
-    tft.print(" C");
-  }
+  if (isnan(dhtTemp)) tft.print("-- C");
+  else { tft.print(dhtTemp, 1); tft.print(" C"); }
 
   tft.setCursor(25, 240);
   tft.print("HUMI: ");
-  if (isnan(dhtHum)) {
-    tft.print("-- %");
-  } else {
-    tft.print(dhtHum, 1);
-    tft.print(" %");
-  }
+  if (isnan(dhtHum)) tft.print("-- %");
+  else { tft.print(dhtHum, 1); tft.print(" %"); }
 
   tft.setTextSize(1);
   tft.setTextColor(C_CYAN);
   tft.setCursor(25, 275);
   tft.print("RELAY: ");
   tft.print(relayState ? "ACTIVE" : "INACTIVE");
-  if (settings.tempCtrlEnabled) {
-    tft.print(" (AUTO ");
-    tft.print(settings.tempThreshold, 0);
-    tft.print("~");
-    tft.print(settings.tempThresholdOff, 0);
-    tft.print("C)");
-  } else if (settings.relayTimerEnabled) {
-    tft.print(" (TIMER)");
-  } else {
-    tft.print(" (MANUAL)");
-  }
-}
-
-void drawCurrentScreen(bool forceRedraw) {
-    if (isInStandby) return;
-    
-    switch(currentScreen) {
-        case SCREEN_CONTROL:
-            drawControlScreen();
-            break;
-        case SCREEN_WEATHER:
-            drawWeatherScreen();
-            break;
-        case SCREEN_CLOCK:
-            drawClockScreen(true);
-            break;
-    }
-    
-    if (currentScreen != SCREEN_CLOCK) {
-      updateStatusLine();
-    }
 }
 
 void drawClockScreen(bool isInitialDraw) {
@@ -241,17 +174,16 @@ void drawClockScreen(bool isInitialDraw) {
     tft.fillRect(0, 0, 240, 24, C_CYAN);
     tft.setTextColor(C_BG);
     tft.setTextSize(2);
-    tft.setCursor(30, 5);
-    tft.print("[SYSTEM CHRONOMETER]");
+    tft.setCursor(20, 5);
+    tft.print("[TIME & POWER Core]");
 
-    drawCyberFrame(20, 250, 200, 40, C_GREEN, "");
-    drawCyberFrame(20, 210, 200, 15, C_ORANGE, "");
+    drawCyberFrame(10, 160, 220, 100, C_YELLOW, "INA219 POWER MONITOR");
+    drawCyberFrame(20, 270, 200, 25, C_ORANGE, "");
     
     lastMinute = -1;
     lastSecond = -1;
     lastDay = -1;
     updateClockTime();
-    updateStatusLine();
 }
 
 void updateClockTime() {
@@ -262,48 +194,95 @@ void updateClockTime() {
         lastDay = ti->tm_mday;
         char dateBuf[20];
         sprintf(dateBuf, "%04d.%02d.%02d", ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday);
-        tft.fillRect(10, 40, 220, 25, C_BG);
+        tft.fillRect(10, 30, 220, 20, C_BG);
         tft.setTextColor(C_GREEN);
         tft.setTextSize(2);
-        tft.setCursor(55, 45);
+        tft.setCursor(60, 32);
         tft.print(dateBuf);
-        
-        const char* weeks[] = {"SUNDAY", "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY"};
-        tft.fillRect(22, 252, 196, 36, C_BG);
-        tft.setTextColor(C_CYAN);
-        tft.setTextSize(3);
-        int16_t x1, y1;
-        uint16_t w, h;
-        tft.getTextBounds(weeks[ti->tm_wday], 0, 0, &x1, &y1, &w, &h);
-        tft.setCursor(120 - w / 2, 260);
-        tft.print(weeks[ti->tm_wday]);
     }
     
     if (ti->tm_min != lastMinute) {
         lastMinute = ti->tm_min;
         char timeBuf[6];
         sprintf(timeBuf, "%02d:%02d", ti->tm_hour, ti->tm_min);
-        tft.fillRect(5, 80, 230, 80, C_BG);
+        tft.fillRect(10, 55, 220, 50, C_BG);
         tft.setTextColor(C_WHITE);
-        tft.setTextSize(7);
-        tft.setCursor(20, 100);
+        tft.setTextSize(6);
+        tft.setCursor(30, 60);
         tft.print(timeBuf);
     }
 
     if (ti->tm_sec != lastSecond) {
         lastSecond = ti->tm_sec;
-        int barWidth = map(ti->tm_sec, 0, 59, 0, 198);
-        tft.fillRect(21, 211, 198, 13, C_DARK_GREY);
-        tft.fillRect(21, 211, barWidth, 13, C_ORANGE);
+        int barWidth = map(ti->tm_sec, 0, 59, 0, 196);
+        tft.fillRect(22, 272, 196, 21, C_DARK_GREY);
+        tft.fillRect(22, 272, barWidth, 21, C_ORANGE);
         
         char secBuf[3];
         sprintf(secBuf, "%02d", ti->tm_sec);
-        tft.fillRect(105, 185, 30, 16, C_BG);
+        tft.fillRect(105, 120, 30, 16, C_BG);
         tft.setTextSize(2);
         tft.setTextColor(C_ORANGE);
-        tft.setCursor(105, 185);
+        tft.setCursor(105, 120);
         tft.print(secBuf);
+
+        tft.fillRect(15, 172, 210, 83, C_BG); 
+
+        tft.setTextSize(3);
+        tft.setTextColor(C_CYAN);
+        tft.setCursor(20, 175);
+        tft.print("V:");
+        tft.print(st.busVoltage, 2);
+        tft.print("V");
+
+        tft.setTextSize(2);
+        tft.setTextColor(C_WHITE);
+        tft.setCursor(20, 210);
+        tft.print("I:");
+        tft.print(st.current_mA / 1000.f, 1);
+        tft.print("A");
+
+        tft.setCursor(125, 210); 
+        tft.print("P:");
+        tft.print(st.power_mW / 1000.f, 1);
+        tft.print("W");
+
+        tft.setTextSize(1);
+        tft.setCursor(20, 238);
+        unsigned long nowMs = millis();
+        
+        if (nowMs < 60000UL) {
+            long remWarm = (60000UL - nowMs) / 1000UL;
+            tft.setTextColor(C_ORANGE);
+            tft.print("STATUS: WARMUP (");
+            tft.print(remWarm);
+            tft.print("s LEFT)");
+        } else if (st.relayOn) {
+            tft.setTextColor(C_GREEN);
+            tft.print("STATUS: RUNNING (ON)");
+        } else {
+            long rem = getCooldownRemaining();
+            if (rem > 0) {
+                tft.setTextColor(C_RED);
+                tft.print("LOCKOUT: "); tft.print(rem); tft.print("s LEFT");
+            } else {
+                tft.setTextColor(C_YELLOW);
+                tft.print("STATUS: STANDBY (OFF)");
+            }
+        }
     }
+}
+
+void drawCurrentScreen(bool forceRedraw) {
+    if (isInStandby) return;
+    
+    switch(currentScreen) {
+        case SCREEN_CONTROL: drawControlScreen(); break;
+        case SCREEN_WEATHER: drawWeatherScreen(); break;
+        case SCREEN_CLOCK:   drawClockScreen(true); break;
+    }
+    
+    updateStatusLine(); // 统一重绘底部状态栏与按键提示
 }
 
 #endif // GUI_H
