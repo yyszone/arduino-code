@@ -26,7 +26,6 @@ const char* ssid = "yang1234";
 const char* password = "y123456789";
 const unsigned long standbyDelay = 60000; 
 
-// HTTP 控制配置
 const char* led_on_url = "http://192.168.31.162/LED-Control?ledPwm=3";
 const char* led_off_url = "http://192.168.31.162/LED-Control?ledPwm=4";
 
@@ -76,11 +75,10 @@ struct Settings {
   char weatherCity[32] = "zhumadian";
   char weatherApiKey[64] = "";
   
-  // ⭐️ 新增：Home Assistant 动态磁盘保存配置
   char haHost[32] = "192.168.31.22";
   int haPort = 8123;
   char haEntity[64] = "switch.sonoff_1000a68f48";
-  char haToken[256] = ""; // 存放动态 Token
+  char haToken[256] = ""; 
 
   bool tempCtrlEnabled = false;  
   float tempThreshold = 28.0;    
@@ -108,6 +106,7 @@ struct SystemState {
   bool faultLatched   = false; 
   TripReason tripReason = TripReason::NONE; 
   uint32_t tripEpoch  = 0;     
+  unsigned long tripMillis = 0; // ⭐️ 本地高精度倒计时时间戳
   uint8_t retryCount  = 0;
   uint8_t confirmCounter = 0;  
 

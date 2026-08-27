@@ -42,7 +42,6 @@ LogEntry logBuffer[MAX_LOG_ENTRIES];
 int currentLogIndex = 0;
 bool logBufferFull = false;
 
-// 默认直接显示天气页
 ScreenMode currentScreen = SCREEN_WEATHER;
 unsigned long lastScreenSwitchTime = 0;
 bool pauseRotation = false; 
@@ -105,17 +104,31 @@ void setRelay(bool state) {
   if (state) relayOnTimeMs = millis();
 }
 
+// ⭐️ 绝对精准倒计时：优先使用 millis() 毫秒级倒计时，解绑 NTP 网络依赖
 long getCooldownRemaining() {
-  if (st.tripEpoch == 0) return 0;
-  time_t now_t = time(nullptr);
-  if (now_t > 1000000000L) {
+  if (st.tripReason == TripReason::NONE || st.tripReason == TripReason::MANUAL) return 0;
+
+  // 1. 本次运行期间优先使用 millis() 高精度倒计时
+  if (st.tripMillis > 0) {
+    unsigned long elapsedSec = (millis() - st.tripMillis) / 1000UL;
+    if (elapsedSec < settings.cooldownSec) {
+      return (long)(settings.cooldownSec - elapsedSec);
+    } else {
+      return 0;
+    }
+  }
+
+  // 2. 重启后尝试使用绝绝对时间戳
+  if (st.tripEpoch > 0) {
+    time_t now_t = time(nullptr);
+    if (now_t > 1000000000L) {
       long elapsed = (long)(now_t - st.tripEpoch);
       long rem = (long)settings.cooldownSec - elapsed;
       return rem > 0 ? rem : 0;
+    }
   }
-  long elapsed = (long)(millis() / 1000UL);
-  long rem = (long)settings.cooldownSec - elapsed;
-  return rem > 0 ? rem : 0;
+
+  return 0;
 }
 
 void executeTrip(TripReason reason) {
@@ -123,16 +136,21 @@ void executeTrip(TripReason reason) {
     st.faultLatched = true;
     st.tripReason   = reason;
     st.confirmCounter = 0;
+    st.tripMillis   = millis(); // 记录跳闸时刻的毫秒数，防止倒计时归零
+    
     time_t now_t = time(nullptr);
     st.tripEpoch    = (now_t > 1000000000L) ? now_t : 0;
     saveSystemState();
-    addLog("INA219 保护跳闸触发！原因代码: " + String((int)reason));
+    
+    String rStr = (reason == TripReason::UNDERVOLTAGE) ? "欠压保护" : "低功率保护";
+    addLog("INA219 保护切断动作! 原因: " + rStr + " | 电压: " + String(st.busVoltage, 2) + "V");
 }
 
 void forceOnSystem() {
     st.faultLatched   = false;
     st.tripReason     = TripReason::NONE;
     st.tripEpoch      = 0;
+    st.tripMillis     = 0;
     st.confirmCounter = 0;
     setRelay(true);
     saveSystemState();
@@ -143,6 +161,7 @@ void resetSystem() {
     st.faultLatched   = false;
     st.tripReason     = TripReason::NONE;
     st.tripEpoch      = 0;
+    st.tripMillis     = 0;
     st.confirmCounter = 0;
     if (st.busVoltage > settings.turnOnVoltage) {
         setRelay(true);
@@ -181,6 +200,7 @@ void saveSystemState() {
   serializeJson(doc, file); file.close();
 }
 
+// ════════════ 电源与温控逻辑评估 ════════════
 void updateRelayLogic() {
   unsigned long now = millis();
   
@@ -189,24 +209,36 @@ void updateRelayLogic() {
     return;
   }
 
+  // 1. 如果继电器当前处于断开状态
   if (!st.relayOn) {
-    if (st.tripReason != TripReason::MANUAL && st.busVoltage > settings.turnOnVoltage && getCooldownRemaining() <= 0) {
+    // 自动吸合必须满足：非手动断开 + 电压大于开启阈值 + 冷却倒计时完全归零(<=0)
+    if (st.tripReason != TripReason::MANUAL && 
+        st.busVoltage > settings.turnOnVoltage && 
+        getCooldownRemaining() <= 0) {
       if (++st.confirmCounter >= 3) {
         setRelay(true);
         st.faultLatched = false;
         st.tripReason = TripReason::NONE;
         st.confirmCounter = 0;
         saveSystemState();
-        addLog("电压高于阈值且冷却结束，自动开启继电器。");
+        addLog("电压高于阈值且冷却完毕，自动开启继电器。");
       }
     } else {
       st.confirmCounter = 0;
     }
-  } else {
+  } 
+  // 2. 如果继电器当前处于吸合状态
+  else {
     TripReason pending = TripReason::NONE;
+
+    // 欠压判定：电压低于阈值且 > 0.5V
     if (st.busVoltage < settings.underVoltage && st.busVoltage > 0.5f) {
       pending = TripReason::UNDERVOLTAGE;
-    } else if ((settings.underPower > 0.05f) && (now - relayOnTimeMs > 10000UL) && (st.power_mW < settings.underPower * 1000.f)) {
+    } 
+    // 低功率保护：开启且吸合满 10 秒后，功率低于阈值
+    else if ((settings.underPower > 0.05f) && 
+             (now - relayOnTimeMs > 10000UL) && 
+             (st.power_mW < settings.underPower * 1000.f)) {
       pending = TripReason::OVERCURRENT; 
     }
 
@@ -217,13 +249,13 @@ void updateRelayLogic() {
     }
   }
 
+  // 3. 温控判定
   if (settings.tempCtrlEnabled && !st.faultLatched && !isnan(dhtTemp)) {
     if (dhtTemp > settings.tempThreshold && !relayState) setRelay(true);
     else if (dhtTemp < settings.tempThresholdOff && relayState) setRelay(false);
   }
 }
 
-// ==================== Main Setup & Loop ====================
 void setup() {
   Serial.begin(115200);
   irsend.begin();
@@ -313,7 +345,6 @@ void loop() {
       lastStatusUpdate = now;
     }
 
-    // ⭐️ 核心点：限定仅在【天气页】与【时钟页】2 页之间自动轮播
     if (!pauseRotation) {
       if (currentScreen == SCREEN_CONTROL) {
         currentScreen = SCREEN_WEATHER;
@@ -326,7 +357,6 @@ void loop() {
         lastScreenSwitchTime = now;
       }
     } else if (now - lastActivityTime > 10000) {
-      // 在控制台界面无操作满 10 秒后，自动恢复天气与时钟两页轮播
       pauseRotation = false;
       currentScreen = SCREEN_WEATHER;
       drawCurrentScreen(true);

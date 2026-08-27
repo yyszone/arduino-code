@@ -63,6 +63,18 @@ void handleLogs();
 void controlHA(bool state);
 void controlHttp(bool state);
 
+// 格式化秒数为人性化时间（如：15分30秒）
+String formatSeconds(long secs) {
+  if (secs <= 0) return "0秒";
+  if (secs < 60) return String(secs) + "秒";
+  long mins = secs / 60;
+  long rsecs = secs % 60;
+  if (mins < 60) return String(mins) + "分" + String(rsecs) + "秒";
+  long hrs = mins / 60;
+  long rmins = mins % 60;
+  return String(hrs) + "小时" + String(rmins) + "分" + String(rsecs) + "秒";
+}
+
 void addLog(String m) {
   if (WiFi.status() == WL_CONNECTED && timeClient.getEpochTime() > 0) {
     logBuffer[currentLogIndex] = {timeClient.getFormattedTime(), m, timeClient.getEpochTime()}; 
@@ -152,7 +164,6 @@ void updateWeather() {
   }
 }
 
-// ════════════ 状态栏更新：去时间，加按键提示 ════════════
 void updateStatusLine() {
   tft.fillRect(0, 305, 240, 15, C_BG);
   tft.drawFastHLine(0, 304, 240, C_CYAN);
@@ -167,7 +178,6 @@ void updateStatusLine() {
     tft.print("NET_ERR");
   }
   
-  // 右下角去除时间，改为进入控制台的醒目提示
   tft.setTextColor(C_ORANGE);
   tft.setCursor(150, 308);
   tft.print("[TOUCH: MENU]");
@@ -268,23 +278,42 @@ void handleIrCommand() {
   server.send(302, "text/plain", "");
 }
 
-void handleApiStatus() {
+// ⭐️ 生成网页与 API 状态 HTML
+String buildStatusHtml() {
   unsigned long nowMs = millis();
-  String statusHtml = "";
-  
   if (nowMs < 60000UL) {
     long remWarm = (60000UL - nowMs) / 1000UL;
-    statusHtml = "<span style='color:#f0883e;font-weight:bold;'>⏳ 系统开机预热中（剩余 " + String(remWarm) + " 秒）</span>";
-  } else if (st.relayOn) {
-    statusHtml = "<span style='color:#3fb950;font-weight:bold;'>✔ 继电器吸合（正常运行）</span>";
-  } else {
-    long rem = getCooldownRemaining();
-    if (rem > 0) {
-      statusHtml = "<span style='color:#d29922;font-weight:bold;'>⌛ 保护待机锁定中（剩余冷却 " + String(rem) + " 秒）</span>";
-    } else {
-      statusHtml = "<span style='color:#da3633;font-weight:bold;'>⛔ 待机/断开状态</span>";
-    }
+    return "<span style='color:#f0883e;font-weight:bold;'>⏳ 系统开机预热中（剩余 " + String(remWarm) + " 秒）</span>";
+  } 
+  
+  if (st.relayOn) {
+    return "<span style='color:#3fb950;font-weight:bold;'>✔ 继电器吸合（正常运行）</span>";
   }
+
+  if (st.tripReason == TripReason::MANUAL) {
+    return "<span style='color:#da3633;font-weight:bold;'>⛔ 手动安全切断锁定（请点击“故障重置”解锁）</span>";
+  }
+
+  long rem = getCooldownRemaining();
+  if (rem > 0) {
+    String rText = (st.tripReason == TripReason::UNDERVOLTAGE) ? "欠压保护切断" :
+                   (st.tripReason == TripReason::OVERCURRENT)  ? "低功率保护切断" : "保护触发";
+    return "<div style='color:#d29922;font-weight:bold;line-height:1.6;'>"
+           "🛡️ <b>" + rText + "</b><br>"
+           "⏳ <b>冷却锁定倒计时：<span style='color:#ffea00;font-size:1.1em;'>" + formatSeconds(rem) + "</span></b><br>"
+           "<small style='color:#8b949e;font-size:0.8em;'>在此期间防频繁通断保护中，无法自动吸合</small>"
+           "</div>";
+  }
+
+  if (st.busVoltage > settings.turnOnVoltage) {
+    return "<span style='color:#58a6ff;font-weight:bold;'>⏳ 电压高于开启阈值，正在确认采样...</span>";
+  }
+
+  return "<span style='color:#8b949e;font-weight:bold;'>🔍 待机监测中（待电压高于 " + String(settings.turnOnVoltage, 1) + "V 自动吸合）</span>";
+}
+
+void handleApiStatus() {
+  String statusHtml = buildStatusHtml();
 
   String json = "{";
   json += "\"v\":"  + String(st.busVoltage, 3) + ",";
@@ -307,19 +336,7 @@ void handleRoot() {
   page.replace("##POWER##", String(st.power_mW / 1000.f, 2));
   page.replace("##SHUNT_MV##", String(st.shuntVoltage, 2));
 
-  unsigned long nowMs = millis();
-  String statusHtml = "";
-  if (nowMs < 60000UL) {
-    long remWarm = (60000UL - nowMs) / 1000UL;
-    statusHtml = "<span style='color:#f0883e;font-weight:bold;'>⏳ 系统开机预热中（剩余 " + String(remWarm) + " 秒）</span>";
-  } else if (st.relayOn) {
-    statusHtml = "<span style='color:#3fb950;font-weight:bold;'>✔ 继电器吸合（正常运行）</span>";
-  } else {
-    long rem = getCooldownRemaining();
-    if (rem > 0) statusHtml = "<span style='color:#d29922;font-weight:bold;'>⌛ 保护待机锁定中（剩余冷却 " + String(rem) + " 秒）</span>";
-    else statusHtml = "<span style='color:#da3633;font-weight:bold;'>⛔ 待机/断开状态</span>";
-  }
-  page.replace("##PROTECT_STATUS##", statusHtml);
+  page.replace("##PROTECT_STATUS##", buildStatusHtml());
 
   page.replace("##TURN_ON_V##", String(settings.turnOnVoltage, 1));
   page.replace("##UNDER_V##", String(settings.underVoltage, 1));
@@ -439,7 +456,6 @@ void handleLogs() {
   server.send(200, "text/html; charset=UTF-8", h);
 }
 
-// ════════════ 触摸逻辑：任意位置点击进入控制台 ════════════
 void handleTouch() {
   if (ts.touched()) {
     static unsigned long lastTouchDebounce = 0;
@@ -452,7 +468,6 @@ void handleTouch() {
       return;
     }
 
-    // ⭐️ 核心点：若在天气或时钟页，点击屏幕任意地方直接进入电器控制页
     if (currentScreen != SCREEN_CONTROL) {
       pauseRotation = true;
       currentScreen = SCREEN_CONTROL; 
@@ -460,7 +475,6 @@ void handleTouch() {
       return;
     }
 
-    // 在控制界面下，响应 4 按键
     TS_Point p = ts.getPoint();
     int sx = map(p.y, 295, 3750, 0, 240); 
     int sy = map(p.x, 358, 3810, 0, 320);
