@@ -23,6 +23,9 @@ extern bool haDeviceState;
 extern bool httpDeviceState;
 extern bool irLightState;
 extern bool relayState;
+extern bool manualOff;
+extern unsigned long manualOffMillis;
+extern time_t manualOffEpoch;
 extern bool isInStandby;
 
 extern float dhtTemp;
@@ -51,7 +54,9 @@ extern void resetSystem();
 extern void drawWeatherScreen();
 extern void drawControlScreen();
 extern void drawCurrentScreen(bool forceRedraw);
+extern void manualSafeOff();
 extern long getCooldownRemaining();
+extern long getManualOffRemaining();
 
 void handleRoot();
 void handleApiStatus();
@@ -185,52 +190,195 @@ void updateStatusLine() {
 
 void enterStandby() {
   if (isInStandby) return;
+
   isInStandby = true;
-  addLog("屏幕待机：进入省电模式。");
+  addLog("进入待机模式。");
+
+  // 先关闭背光
   digitalWrite(TFT_BL, LOW);
-  tft.fillScreen(ILI9341_BLACK);
+  delay(20);
+
+  // 让触摸和 TFT 都释放 SPI 总线
+  pinMode(TFT_CS, OUTPUT);
+  digitalWrite(TFT_CS, HIGH);
+
+  pinMode(T_CS, OUTPUT);
+  digitalWrite(T_CS, HIGH);
+
+  // ILI9341 进入睡眠
   tft.writeCommand(ILI9341_SLPIN);
-  
+  delay(120);
+
+  // 停止网络
   server.stop();
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
+
+  // 降低 CPU 频率
+  setCpuFrequencyMhz(80);
 }
 
 void setupWifiAndServices(bool wifiAlreadyConnected);
 
 void exitStandby(bool wifiAlreadyConnected) {
-  digitalWrite(TFT_BL, HIGH);
-  tft.begin(); 
+
+  // 先恢复 CPU
+  setCpuFrequencyMhz(160);
+  delay(20);
+
+  // 背光先保持关闭
+  digitalWrite(TFT_BL, LOW);
+
+  // 释放 SPI
+  pinMode(TFT_CS, OUTPUT);
+  digitalWrite(TFT_CS, HIGH);
+
+  pinMode(T_CS, OUTPUT);
+  digitalWrite(T_CS, HIGH);
+
+  // ===== 完整重建 SPI =====
+  SPI.end();
+  delay(20);
+
+  SPI.begin(TFT_SCK, TFT_MISO, TFT_MOSI);
+  delay(20);
+
+  // ===== 硬件复位 ILI9341 =====
+  pinMode(TFT_RST, OUTPUT);
+
+  digitalWrite(TFT_RST, LOW);
+  delay(50);
+
+  digitalWrite(TFT_RST, HIGH);
+  delay(150);
+
+  // ===== 重新初始化 TFT =====
+  tft.begin(20000000);
+  delay(20);
+
   tft.setRotation(0);
+
+  // 重新初始化触摸
+  ts.begin();
+  delay(20);
+
+  // 明确退出睡眠
   tft.writeCommand(ILI9341_SLPOUT);
-  
+  delay(120);
+
+  tft.writeCommand(ILI9341_DISPON);
+  delay(20);
+
+  // 先清屏
+  tft.fillScreen(C_BG);
+
+  // 到这里才打开背光
+  digitalWrite(TFT_BL, HIGH);
+  delay(30);
+
   isInStandby = false;
   lastActivityTime = millis();
-  addLog("屏幕唤醒，恢复服务。");
+
+  // 强制下一次重新绘制
+  lastScreenSwitchTime = millis();
+
+  addLog("退出待机模式，TFT 已完整重新初始化。");
+
   setupWifiAndServices(wifiAlreadyConnected);
+
+  // 网络初始化完成后立即重绘
+  drawCurrentScreen(true);
 }
 
 void setupWifiAndServices(bool wifiAlreadyConnected) {
+
   if (!wifiAlreadyConnected) {
+
     tft.fillScreen(C_BG);
     tft.setTextColor(C_GREEN);
-    tft.setTextSize(2); 
+    tft.setTextSize(2);
     tft.setCursor(10, 100);
     tft.print("CONNECTING NETWORK...");
-    
-    WiFi.disconnect(true);
+
+    Serial.println();
+    Serial.println("========== WiFi 连接开始 ==========");
+
+    // 不要使用 disconnect(true)
+    // true 会清除底层连接配置/状态，没必要每次都这么做
+    WiFi.disconnect(false);
+    delay(300);
+
     WiFi.mode(WIFI_STA);
+
+    // 允许 ESP32 自动重连
+    WiFi.setAutoReconnect(true);
+
+    // 不让 WiFi 配置频繁写 Flash
+    WiFi.persistent(false);
+
+    Serial.print("[WiFi] SSID: ");
+    Serial.println(ssid);
+
     WiFi.begin(ssid, password);
-    
-    int retry = 0;
-    while (WiFi.status() != WL_CONNECTED && retry < 15) {
-      delay(500);
-      retry++;
+
+    unsigned long start = millis();
+    unsigned long lastPrint = 0;
+
+    // 最多等待 20 秒
+    while (WiFi.status() != WL_CONNECTED &&
+           millis() - start < 20000UL) {
+
+      delay(250);
+
+      if (millis() - lastPrint >= 1000) {
+        lastPrint = millis();
+
+        Serial.printf(
+          "[WiFi] 等待中... status=%d RSSI=%d\n",
+          WiFi.status(),
+          WiFi.RSSI()
+        );
+      }
+    }
+
+    Serial.println();
+
+    if (WiFi.status() == WL_CONNECTED) {
+
+      Serial.println("========== WiFi 连接成功 ==========");
+      Serial.print("[WiFi] IP: ");
+      Serial.println(WiFi.localIP());
+
+      Serial.print("[WiFi] RSSI: ");
+      Serial.print(WiFi.RSSI());
+      Serial.println(" dBm");
+
+      Serial.print("[WiFi] Gateway: ");
+      Serial.println(WiFi.gatewayIP());
+
+      Serial.print("[WiFi] DNS: ");
+      Serial.println(WiFi.dnsIP());
+
+    } else {
+
+      Serial.println("========== WiFi 连接失败 ==========");
+
+      Serial.printf(
+        "[WiFi] 最终状态码: %d\n",
+        WiFi.status()
+      );
+
+      Serial.println("[WiFi] 之后由后台自动重连");
     }
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-    addLog("WiFi 已连接, IP: " + WiFi.localIP().toString());
+
+    addLog(
+      "WiFi 已连接, IP: " +
+      WiFi.localIP().toString()
+    );
+
     timeClient.begin();
     timeClient.update();
 
@@ -240,15 +388,90 @@ void setupWifiAndServices(bool wifiAlreadyConnected) {
     server.on("/save_ina", HTTP_POST, handleSaveINA);
     server.on("/save_ir", HTTP_POST, handleSaveIR);
     server.on("/ir", HTTP_GET, handleIrCommand);
-    server.on("/on", HTTP_GET, [](){ forceOnSystem(); server.sendHeader("Location","/",true); server.send(302,"text/plain",""); });
-    server.on("/off", HTTP_GET, [](){ executeTrip(TripReason::MANUAL); server.sendHeader("Location","/",true); server.send(302,"text/plain",""); });
-    server.on("/reset", HTTP_GET, [](){ resetSystem(); server.sendHeader("Location","/",true); server.send(302,"text/plain",""); });
+
+    server.on("/on", HTTP_GET, [](){
+      forceOnSystem();
+      server.sendHeader("Location", "/", true);
+      server.send(302, "text/plain", "");
+    });
+
+    server.on("/off", HTTP_GET, [](){
+      executeTrip(TripReason::MANUAL);
+      server.sendHeader("Location", "/", true);
+      server.send(302, "text/plain", "");
+    });
+
+    server.on("/reset", HTTP_GET, [](){
+      resetSystem();
+      server.sendHeader("Location", "/", true);
+      server.send(302, "text/plain", "");
+    });
+
     server.on("/logs", HTTP_GET, handleLogs);
+    server.on("/tft-reset", HTTP_GET, []() {
+      Serial.println("[TFT] HTTP 强制恢复");
+
+      digitalWrite(TFT_BL, LOW);
+
+      pinMode(TFT_CS, OUTPUT);
+      digitalWrite(TFT_CS, HIGH);
+
+      pinMode(T_CS, OUTPUT);
+      digitalWrite(T_CS, HIGH);
+
+      SPI.end();
+      delay(20);
+
+      SPI.begin(TFT_SCK, TFT_MISO, TFT_MOSI);
+      delay(20);
+
+      pinMode(TFT_RST, OUTPUT);
+
+      digitalWrite(TFT_RST, LOW);
+      delay(50);
+
+      digitalWrite(TFT_RST, HIGH);
+      delay(150);
+
+      tft.begin(20000000);
+      tft.setRotation(0);
+
+      ts.begin();
+
+      delay(30);
+
+      tft.writeCommand(ILI9341_SLPOUT);
+      delay(120);
+
+      tft.writeCommand(ILI9341_DISPON);
+      delay(20);
+
+      tft.fillScreen(C_BG);
+
+      digitalWrite(TFT_BL, HIGH);
+
+      drawCurrentScreen(true);
+
+      server.send(200, "text/plain", "TFT RESET OK");
+    });
 
     httpUpdater.setup(&server);
     server.begin();
-    updateWeather(); 
+
+    updateWeather();
+
+    addLog(
+      "网络服务启动成功，IP: " +
+      WiFi.localIP().toString()
+    );
+
+  } else {
+
+    addLog(
+      "WiFi 连接失败，等待后台自动重连。"
+    );
   }
+
   drawCurrentScreen(true);
 }
 
@@ -280,36 +503,72 @@ void handleIrCommand() {
 
 // ⭐️ 生成网页与 API 状态 HTML
 String buildStatusHtml() {
+
   unsigned long nowMs = millis();
+
   if (nowMs < 60000UL) {
     long remWarm = (60000UL - nowMs) / 1000UL;
-    return "<span style='color:#f0883e;font-weight:bold;'>⏳ 系统开机预热中（剩余 " + String(remWarm) + " 秒）</span>";
-  } 
-  
-  if (st.relayOn) {
-    return "<span style='color:#3fb950;font-weight:bold;'>✔ 继电器吸合（正常运行）</span>";
+
+    return "<span style='color:#f0883e;font-weight:bold;'>"
+           "⏳ 系统开机预热中（剩余 " +
+           String(remWarm) +
+           " 秒）</span>";
   }
 
-  if (st.tripReason == TripReason::MANUAL) {
-    return "<span style='color:#da3633;font-weight:bold;'>⛔ 手动安全切断锁定（请点击“故障重置”解锁）</span>";
+  if (st.relayOn) {
+    return "<span style='color:#3fb950;font-weight:bold;'>"
+           "✔ 继电器吸合（正常运行）</span>";
+  }
+
+  // 手动安全断开冷却
+  long manualRemain = getManualOffRemaining();
+
+  if (manualOff || manualRemain > 0) {
+
+    return "<div style='color:#d29922;font-weight:bold;line-height:1.6;'>"
+           "🛑 <b>手动安全断开</b><br>"
+           "⏳ <b>冷却倒计时："
+           "<span style='color:#ffea00;font-size:1.1em;'>"
+           + formatSeconds(manualRemain) +
+           "</span></b><br>"
+           "<small style='color:#8b949e;font-size:0.8em;'>"
+           "冷却结束后自动恢复控制"
+           "</small>"
+           "</div>";
   }
 
   long rem = getCooldownRemaining();
+
   if (rem > 0) {
-    String rText = (st.tripReason == TripReason::UNDERVOLTAGE) ? "欠压保护切断" :
-                   (st.tripReason == TripReason::OVERCURRENT)  ? "低功率保护切断" : "保护触发";
+
+    String rText =
+        (st.tripReason == TripReason::UNDERVOLTAGE)
+        ? "欠压保护切断"
+        : (st.tripReason == TripReason::OVERCURRENT)
+        ? "低功率保护切断"
+        : "保护触发";
+
     return "<div style='color:#d29922;font-weight:bold;line-height:1.6;'>"
            "🛡️ <b>" + rText + "</b><br>"
-           "⏳ <b>冷却锁定倒计时：<span style='color:#ffea00;font-size:1.1em;'>" + formatSeconds(rem) + "</span></b><br>"
-           "<small style='color:#8b949e;font-size:0.8em;'>在此期间防频繁通断保护中，无法自动吸合</small>"
+           "⏳ <b>冷却锁定倒计时："
+           "<span style='color:#ffea00;font-size:1.1em;'>"
+           + formatSeconds(rem) +
+           "</span></b><br>"
+           "<small style='color:#8b949e;font-size:0.8em;'>"
+           "在此期间防频繁通断保护中，无法自动吸合"
+           "</small>"
            "</div>";
   }
 
   if (st.busVoltage > settings.turnOnVoltage) {
-    return "<span style='color:#58a6ff;font-weight:bold;'>⏳ 电压高于开启阈值，正在确认采样...</span>";
+    return "<span style='color:#58a6ff;font-weight:bold;'>"
+           "⏳ 电压高于开启阈值，正在确认采样...</span>";
   }
 
-  return "<span style='color:#8b949e;font-weight:bold;'>🔍 待机监测中（待电压高于 " + String(settings.turnOnVoltage, 1) + "V 自动吸合）</span>";
+  return "<span style='color:#8b949e;font-weight:bold;'>"
+         "🔍 待机监测中（待电压高于 " +
+         String(settings.turnOnVoltage, 1) +
+         "V 自动吸合）</span>";
 }
 
 void handleApiStatus() {
@@ -458,9 +717,19 @@ void handleLogs() {
 
 void handleTouch() {
   if (ts.touched()) {
+    TS_Point p = ts.getPoint();
+
+    // 1. 严格过滤伪触摸（杂波时直接返回，不刷新活跃时间，不中断屏保/轮播）
+    if (p.z < 400 || p.z > 3800 || p.x < 100 || p.x > 3900 || p.y < 100 || p.y > 3900) {
+      return; 
+    }
+
+    // 2. 防抖
     static unsigned long lastTouchDebounce = 0;
-    if (millis() - lastTouchDebounce < 300) return; 
+    if (millis() - lastTouchDebounce < 400) return; 
     lastTouchDebounce = millis(); 
+
+    // 3. 只有确认是人手真触摸，才更新活跃时间
     lastActivityTime = millis();
 
     if (isInStandby) {
@@ -475,7 +744,6 @@ void handleTouch() {
       return;
     }
 
-    TS_Point p = ts.getPoint();
     int sx = map(p.y, 295, 3750, 0, 240); 
     int sy = map(p.x, 358, 3810, 0, 320);
 
@@ -489,9 +757,13 @@ void handleTouch() {
         controlHttp(httpDeviceState);
       } 
       else if (sy > 165 && sy < 220) {
-        if (relayState) executeTrip(TripReason::MANUAL);
-        else forceOnSystem();
-      } 
+          if (relayState) {
+              manualSafeOff();
+          } else {
+              forceOnSystem();
+          }
+      }
+
       else if (sy > 230 && sy < 285) {
         irLightState = !irLightState;
         irsend.sendNEC(irLightState ? settings.ir_on : settings.ir_off);

@@ -29,11 +29,16 @@ public:
 
     void update(SystemState &st) {
         if (!isReady) return;
-        st.busVoltage   = ina.getVoltage();
-        st.shuntVoltage = ina.getShuntVoltage() * 1000.f; // 转为 mV
-        st.current_mA   = ina.getCurrent()      * 1000.f; // 转为 mA
-        st.power_mW     = ina.getPower()        * 1000.f; // 转为 mW
+        float v = ina.getVoltage();
+        // 简单合理性过滤，防止偶发总线抖动读出负几千伏或 NaN
+        if (!isnan(v) && v >= 0.0f && v < 36.0f) {
+            st.busVoltage   = v;
+            st.shuntVoltage = ina.getShuntVoltage() * 1000.f; 
+            st.current_mA   = ina.getCurrent()      * 1000.f; 
+            st.power_mW     = ina.getPower()        * 1000.f; 
+        }
     }
+
 };
 
 #endif // INA219_SENSOR_H

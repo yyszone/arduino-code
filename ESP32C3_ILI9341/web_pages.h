@@ -7,7 +7,7 @@ const char MAIN_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>ESP32-C3 电源监控控制台</title><style>body, html { margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; background-color: #0d1117; color: #c9d1d9; } .header { text-align: center; padding: 2rem 1rem 1rem 1rem; } .header h1 { font-size: 1.8rem; color: #58a6ff; display: flex; align-items: center; justify-content: center; gap: 10px; margin: 0; } .header .check-mark { color: #3fb950; } .container { display: flex; flex-wrap: wrap; justify-content: center; gap: 1.5rem; padding: 0 1rem 2rem 1rem; } .card { background-color: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 1.5rem; width: 100%; max-width: 450px; box-sizing: border-box; } .card h2 { margin-top: 0; margin-bottom: 1.2rem; font-size: 1.2rem; color: #8b949e; display: flex; align-items: center; gap: 8px; border-bottom: 1px dashed #30363d; padding-bottom: 8px; } .btn-group { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 10px; } .btn { text-decoration: none; display: inline-block; padding: 10px 15px; font-size: 0.95rem; font-weight: 500; border-radius: 6px; border: 1px solid #30363d; cursor: pointer; transition: all 0.2s ease-in-out; text-align: center; box-sizing: border-box; width: 100%; } .btn-primary { background-color: #238636; color: white; border-color: #3fb950; } .btn-primary:hover { background-color: #2ea043; } .btn-secondary { background-color: #21262d; color: #c9d1d9; } .btn-secondary:hover { border-color: #8b949e; } .btn-danger { background-color: #da3633; color: white; border-color: #d0302d; } .btn-danger:hover { background-color: #e04442; } .btn-warning { background-color: #d29922; color: #161b22; border-color: #f0883e; font-weight: bold; } .form-group { margin-bottom: 1rem; } .form-group label { display: block; margin-bottom: 0.4rem; font-size: 0.85rem; color: #8b949e; } .input-field { width: 100%; background-color: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 8px 10px; color: #c9d1d9; font-size: 0.95rem; box-sizing: border-box; } .val-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; text-align: center; margin-bottom: 15px; } .val-card { background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 10px 5px; } .val-num { font-size: 1.3rem; font-weight: bold; color: #58a6ff; } .val-lbl { font-size: 0.75rem; color: #8b949e; margin-top: 4px; } .ir-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; } .footer { text-align: center; padding: 1.5rem 1rem; font-size: 0.85rem; color: #8b949e; border-top: 1px solid #30363d; margin-top: 2rem; width: 100%; } </style></head><body>
 
 <div class="header">
-  <h1><span class="check-mark">⚡</span> ESP32-C3 电源监控核心 v9.2</h1>
+  <h1><span class="check-mark">⚡</span> ESP32-C3 电源监控核心 v9.3</h1>
 </div>
 
 <div class="container">
@@ -52,11 +52,55 @@ const char MAIN_HTML[] PROGMEM = R"HTML(
 <div class="card">
   <form action="/save_ina" method="post">
     <h2>🛡️ INA219 电力保护配置</h2>
-    <div class="form-group"><label>高于此电压自动复位吸合 (V)</label><input type="number" step="0.1" name="tonv" class="input-field" value="##TURN_ON_V##" required></div>
-    <div class="form-group"><label>欠压切断保护阈值 (V)</label><input type="number" step="0.1" name="uv" class="input-field" value="##UNDER_V##" required></div>
-    <div class="form-group"><label>低功率保护切断阈值 (W, 设0禁用)</label><input type="number" step="0.1" name="upw" class="input-field" value="##UNDER_P##" required></div>
-    <div class="form-group"><label>保护锁定待机冷却时间 (秒)</label><input type="number" step="1" name="cds" class="input-field" value="##COOLDOWN_S##" required></div>
-    <button type="submit" class="btn btn-primary">保存电源保护设置</button>
+
+    <div class="form-group">
+      <label>自动开启电压阈值（高于此电压才允许自动开启）</label>
+      <input
+        type="number"
+        step="0.1"
+        name="tonv"
+        class="input-field"
+        value="##TURN_ON_V##"
+        required>
+    </div>
+
+    <div class="form-group">
+      <label>欠压保护（低于此电压关闭继电器）</label>
+      <input
+        type="number"
+        step="0.1"
+        name="uv"
+        class="input-field"
+        value="##UNDER_V##"
+        required>
+    </div>
+
+    <div class="form-group">
+      <label>低功率保护（低于此功率关闭继电器，0 = 禁用）</label>
+      <input
+        type="number"
+        step="0.1"
+        name="upw"
+        class="input-field"
+        value="##UNDER_P##"
+        required>
+    </div>
+
+    <div class="form-group">
+      <label>保护/手动断开冷却时间（秒）</label>
+      <input
+        type="number"
+        step="1"
+        min="0"
+        name="cds"
+        class="input-field"
+        value="##COOLDOWN_S##"
+        required>
+    </div>
+
+    <button type="submit" class="btn btn-primary">
+      保存 INA219 保护设置
+    </button>
   </form>
 </div>
 
@@ -110,11 +154,12 @@ const char MAIN_HTML[] PROGMEM = R"HTML(
   <div class="btn-group">
     <a href="/update" class="btn btn-primary">固件更新 🚀</a>
     <a href="/logs" class="btn btn-secondary">查看日志 📋</a>
+    <a href="/tft-reset" class="btn btn-warning">TFT 屏幕恢复 🖥️</a>
   </div>
 </div>
 
 <div class="footer">
-  <p><a href="https://github.com/yyszone/arduino-code/tree/main/ESP32C3_ILI9341" target="_blank" rel="noopener noreferrer">ESP32C3_ILI9341.ino</a> & INA219 Controller v9.2</p>
+  <p><a href="https://github.com/yyszone/arduino-code/tree/main/ESP32C3_ILI9341" target="_blank" rel="noopener noreferrer">ESP32C3_ILI9341.ino</a> & INA219 Controller v9.3</p>
 </div>
 
 </div>
