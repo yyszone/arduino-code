@@ -1,7 +1,7 @@
 #ifndef MATRIX_CLOCK_H
 #define MATRIX_CLOCK_H
 
-#include <WebServer.h> // 【修改】使用 ESP32 通用 WebServer
+#include <WebServer.h>
 #include <time.h>
 #include <LittleFS.h>
 #include <Adafruit_GFX.h>
@@ -30,8 +30,9 @@ const char CLOCK_HTML_TEMPLATE[] PROGMEM = R"=====(
 <title>独立时钟控制台</title><style>
 * { box-sizing: border-box; }
 body { font-family: 'Segoe UI', sans-serif; background: #0f0f0f; color: #fff; padding: 20px; display: flex; justify-content: center; flex-direction: column; align-items: center; margin: 0; }
-.card { background: #1a1a1a; padding: 30px; border-radius: 15px; width: 100%; max-width: 420px; box-shadow: 0 8px 30px rgba(0,0,0,0.9); }
+.card { background: #1a1a1a; padding: 30px; border-radius: 15px; width: 100%; max-width: 440px; box-shadow: 0 8px 30px rgba(0,0,0,0.9); }
 h2 { text-align: center; color: #ff007f; letter-spacing: 2px; margin-top: 0; }
+h3 { margin: 15px 0 5px 0; font-size: 14px; color: #38bdf8; }
 label { display: block; margin-top: 15px; font-size: 13px; color: #aaa; }
 input, select, button { width: 100%; margin-top: 5px; padding: 12px; border-radius: 8px; border: none; box-sizing: border-box; font-size: 15px; }
 input[type=number], select { background: #2a2a2a; color: #fff; }
@@ -45,10 +46,13 @@ button:hover { opacity: 0.8; }
 .batt-bar-wrap { background: #222; border-radius: 6px; height: 14px; margin-top: 6px; overflow: hidden; }
 .batt-bar-fill { height: 100%; border-radius: 6px; transition: width 0.5s ease, background 0.5s ease; }
 .divider { border-top: 1px solid #2a2a2a; margin: 18px 0; }
-.sub-hint { font-size: 11px; color: #555; margin-top: 4px; }
+.sub-hint { font-size: 11px; color: #777; margin-top: 4px; }
 .br-manual-block { transition: opacity 0.2s; }
 .palette-preview { display: flex; gap: 4px; margin-top: 8px; border-radius: 6px; overflow: hidden; }
 .palette-swatch { flex: 1; height: 16px; }
+.time-range-box { display: flex; gap: 10px; align-items: center; margin-top: 5px; }
+.time-range-box input { width: 50%; }
+.tag-night { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px; }
 </style></head><body>
 <div class='card'>
   <h2>✨ 独立时钟控制台</h2>
@@ -60,13 +64,14 @@ button:hover { opacity: 0.8; }
     <span class="stat-value">%BATT_PCT%%&nbsp;&nbsp;(%BATT_V% V)</span>
   </div>
   <div class="batt-bar-wrap"><div class="batt-bar-fill" style="width:%BATT_PCT%%; background:%BATT_COLOR%;"></div></div>
+  <div class="stat-row"><span class="stat-label">🌙 夜间模式状态</span><span class="stat-value">%NIGHT_STATE%</span></div>
 
   <div class="divider"></div>
 
   <form action='/clock/save' method='POST'>
     <label>🖥️ 显示模式:</label>
     <select name='mode'>
-      <option value='0' %MD_0%>🕒 仅显示时间</option>
+      <option value='0' %MD_0%>🕒 仅显示时间 (xx:xx:xx)</option>
       <option value='1' %MD_1%>📅 仅显示日期</option>
       <option value='2' %MD_2%>🕒+📅 同屏双显 (MM.DD HH:MM)</option>
       <option value='3' %MD_3%>🔄 自动交替 (时间+日期滚动)</option>
@@ -83,7 +88,6 @@ button:hover { opacity: 0.8; }
       <option value='0' %TH_0%>⚪ 极简单色 (使用下方自定义)</option>
     </select>
 
-    <!-- 数字彩虹主题色板预览 -->
     <div class="palette-preview" id="palettePrev" style="display:%PALETTE_DISPLAY%">
       <div class="palette-swatch" style="background:#ff3232" title="0"></div>
       <div class="palette-swatch" style="background:#ff8c00" title="1"></div>
@@ -103,7 +107,7 @@ button:hover { opacity: 0.8; }
     <div class="divider"></div>
 
     <!-- 亮度模式 -->
-    <label>☀️ 亮度模式:</label>
+    <label>☀️ 基础亮度模式:</label>
     <select name='bmode' id='bmodeSelect' onchange="toggleBrMode(this.value)">
       <option value='0' %BM_0%>🔧 手动亮度</option>
       <option value='1' %BM_1%>🔋 自动亮度 (跟随电量百分比)</option>
@@ -115,21 +119,50 @@ button:hover { opacity: 0.8; }
       <div class="sub-hint">100 = 硬件安全最高亮度，防烧电源</div>
     </div>
     <div id="brAutoHint" style="display:%BR_AUTO_DISPLAY%; font-size:12px; color:#888; margin-top:8px; padding:8px; background:#111; border-radius:6px;">
-      🔋 自动模式：电量 0% → 最低亮度，电量 100% → 最高亮度<br>
-      电量低于 5% 时屏幕自动关闭。
+      🔋 自动模式：电量 0% → 最低亮度，电量 100% → 最高亮度<br>电量低于 5% 时屏幕自动关闭。
     </div>
 
     <div class="divider"></div>
 
-    <label>⏱️ 秒数显示:</label>
+    <!-- 夜间模式配置 -->
+    <h3>🌙 夜间节能暗光模式</h3>
+    <label>夜间模式开关:</label>
+    <select name='nm_en' id='nmSelect' onchange="toggleNightConfig(this.value)">
+      <option value='1' %NM_ON%>✅ 启用夜间模式</option>
+      <option value='0' %NM_OFF%>❌ 停用夜间模式</option>
+    </select>
+
+    <div id="nightConfigWrap" style="display:%NM_BOX_DISPLAY%;">
+      <label>生效时间区间 (24小时制，支持跨天):</label>
+      <div class="time-range-box">
+        <input type="number" name="nm_sh" min="0" max="23" value="%NM_SH%" placeholder="开始(时)">
+        <span style="color:#aaa;">至</span>
+        <input type="number" name="nm_eh" min="0" max="23" value="%NM_EH%" placeholder="结束(时)">
+      </div>
+      <div class="sub-hint">例如：23 至 7，代表 23:00~次日07:00 自动调暗</div>
+
+      <label>夜间亮度比例 (%，默认50%基础减半):</label>
+      <input type='number' name='nm_scale' min='5' max='100' value='%NM_SCALE%'>
+      <div class="sub-hint">在原亮度基础上乘以该比例 (例如原亮度 20，设 50% 则夜间为 10)</div>
+    </div>
+
+    <div class="divider"></div>
+
+    <label>⏱️ 秒数与冒号样式:</label>
     <select name='sec'>
-      <option value='1' %SEC_ON%>开启 (时:分:秒)</option>
-      <option value='0' %SEC_OFF%>关闭 (时:分)</option>
+      <option value='1' %SEC_ON%>开启秒数 (xx:xx:xx)</option>
+      <option value='0' %SEC_OFF%>仅时分 (xx:xx)</option>
+    </select>
+
+    <label>冒号显示效果:</label>
+    <select name='colon_blink'>
+      <option value='0' %COL_SOLID%>常亮 (稳定显示 xx:xx:xx)</option>
+      <option value='1' %COL_BLINK%>闪烁 (每秒呼吸)</option>
     </select>
 
     <div class="divider"></div>
 
-    <label>🔋 电池类型 (采用智能曲线算法计算电量):</label>
+    <label>🔋 电池类型 (用于智能曲线电量计算):</label>
     <select name='batt'>
       <option value='0' %BT_0%>12V 磷酸铁锂 (放电曲线精确匹配)</option>
       <option value='1' %BT_1%>24V 磷酸铁锂 (放电曲线精确匹配)</option>
@@ -148,6 +181,9 @@ function toggleBrMode(val) {
   if (val === '0') { manual.style.display = 'block'; hint.style.display = 'none'; }
   else             { manual.style.display = 'none';  hint.style.display = 'block'; }
 }
+function toggleNightConfig(val) {
+  document.getElementById('nightConfigWrap').style.display = (val === '1') ? 'block' : 'none';
+}
 function updatePalette(val) {
   document.getElementById('palettePrev').style.display = (val === '5') ? 'flex' : 'none';
 }
@@ -161,15 +197,22 @@ function updatePalette(val) {
 class SmartMatrixClock {
 private:
   Adafruit_NeoMatrix* matrix;
-  WebServer*          webServer; // 【修改】使用通用 WebServer
+  WebServer*          webServer;
 
   int   clockPin;
   int   currentBrightness = 20;   // 0-100 (0=off)
   int   brightnessMode    = 0;    // 0=手动, 1=自动(跟随电量)
   bool  showSeconds       = true;
+  bool  colonBlink        = false; // 默认冒号常亮，彻底杜绝 xx xx xx
   int   currentTheme      = 2;
-  int   displayMode       = 3;
+  int   displayMode       = 0;    // 0=仅时间, 1=仅日期, 2=双显, 3=交替, 4=运行
   uint8_t colorR = 0, colorG = 255, colorB = 255;
+
+  // 夜间模式设置
+  bool  nightModeEnabled      = true; // 默认启用夜间模式
+  int   nightStartHour        = 23;   // 默认 23:00
+  int   nightEndHour          = 7;    // 默认 07:00
+  int   nightBrightnessScale  = 50;   // 默认 50% 减半
 
   // 电池
   int   batteryType    = 0;       // 0=12V LiFePO4, 1=24V LiFePO4
@@ -178,27 +221,47 @@ private:
   bool  isShowingTime  = true;
   unsigned long lastSwitchTime = 0;
   unsigned long lastRefresh    = 0;
+  int   lastEffBr      = -1;
+
+  // ── 判断当前是否属于夜间区间 ──────────────────────────────
+  bool isNightTimeNow() {
+    if (!nightModeEnabled) return false;
+    time_t now = time(nullptr);
+    if (now < 1000000UL) return false; // 未授时暂不触发
+    struct tm* t = localtime(&now);
+    int h = t->tm_hour;
+
+    if (nightStartHour == nightEndHour) {
+      return false; 
+    }
+    if (nightStartHour < nightEndHour) {
+      return (h >= nightStartHour && h < nightEndHour);
+    } else {
+      // 跨夜 (例如 23点 至 7点)
+      return (h >= nightStartHour || h < nightEndHour);
+    }
+  }
 
   // ── 每位数字独立颜色 ──────────────────────────────────────
   uint16_t getDigitColor(int digit) {
     switch (digit) {
-      case 0: return matrix->Color(255,  50,  50); // 红
-      case 1: return matrix->Color(255, 140,   0); // 橙
-      case 2: return matrix->Color(255, 215,   0); // 黄
-      case 3: return matrix->Color(  0, 224,  80); // 绿
-      case 4: return matrix->Color(  0, 220, 200); // 青
-      case 5: return matrix->Color(  0, 150, 255); // 蓝
-      case 6: return matrix->Color( 80,   0, 255); // 靛
-      case 7: return matrix->Color(192,   0, 255); // 紫
-      case 8: return matrix->Color(255,   0, 180); // 粉
-      case 9: return matrix->Color(220, 220, 220); // 白
+      case 0: return matrix->Color(255,  50,  50);
+      case 1: return matrix->Color(255, 140,   0);
+      case 2: return matrix->Color(255, 215,   0);
+      case 3: return matrix->Color(  0, 224,  80);
+      case 4: return matrix->Color(  0, 220, 200);
+      case 5: return matrix->Color(  0, 150, 255);
+      case 6: return matrix->Color( 80,   0, 255);
+      case 7: return matrix->Color(192,   0, 255);
+      case 8: return matrix->Color(255,   0, 180);
+      case 9: return matrix->Color(220, 220, 220);
       default: return matrix->Color(255, 255, 255);
     }
   }
 
   // ── 精准电量百分比计算（磷酸铁锂真实放电曲线） ──────────
   int getBatteryPercent() {
-    if (batteryVoltage < 0.5f) return 0; // 未连接电池
+    if (batteryVoltage < 0.5f) return 0;
 
     float v = batteryVoltage;
     if (batteryType == 1) { 
@@ -209,17 +272,9 @@ private:
     if (v <= 11.0f) return 0;  
 
     const float curve[11][2] = {
-      {13.6, 100},
-      {13.4, 90},
-      {13.3, 80},
-      {13.2, 70},
-      {13.1, 60},
-      {13.0, 50},
-      {12.9, 40},
-      {12.8, 30},
-      {12.5, 20},
-      {12.0, 10},
-      {11.0, 0}
+      {13.6, 100}, {13.4, 90}, {13.3, 80}, {13.2, 70},
+      {13.1, 60},  {13.0, 50}, {12.9, 40}, {12.8, 30},
+      {12.5, 20},  {12.0, 10}, {11.0, 0}
     };
 
     for (int i = 0; i < 10; i++) {
@@ -235,7 +290,7 @@ private:
     return 0;
   }
 
-  // ── 实际发光亮度转换 ──────────────────────────────────────
+  // ── 实际发光亮度转换（加入夜间缩减比例） ──────────────────
   int getEffectiveBrightness() {
     int br100; 
     if (brightnessMode == 1) {
@@ -247,6 +302,13 @@ private:
     }
     
     if (br100 <= 0) return 0;
+
+    // 夜间模式缩减亮度 (默认减半为 50%)
+    if (isNightTimeNow()) {
+      br100 = (br100 * nightBrightnessScale) / 100;
+      if (br100 < 1) br100 = 1; // 保持微光不彻底全黑
+    }
+
     return (int)map(br100, 1, 100, 4, 120);
   }
 
@@ -275,6 +337,14 @@ private:
     readLineU8(colorB);          
     readLine(batteryType);       
     readLine(brightnessMode);    
+
+    // 新增扩展参数兼容读取
+    readLineBool(nightModeEnabled);
+    readLine(nightStartHour);
+    readLine(nightEndHour);
+    readLine(nightBrightnessScale);
+    readLineBool(colonBlink);
+
     f.close();
     Serial.println("[Clock] 设置读取成功！");
   }
@@ -291,6 +361,11 @@ private:
     f.println(colorB);
     f.println(batteryType);
     f.println(brightnessMode);   
+    f.println(nightModeEnabled ? "1" : "0");
+    f.println(nightStartHour);
+    f.println(nightEndHour);
+    f.println(nightBrightnessScale);
+    f.println(colonBlink ? "1" : "0");
     f.close();
     Serial.println("[Clock] 设置保存成功！");
   }
@@ -341,7 +416,7 @@ private:
   }
 
   // ── 运行时长显示 ──────────────────────────────────────────
-  void drawUptime(int y, uint16_t c_h, uint16_t c_m, uint16_t c_s, uint16_t c_c, bool blink) {
+  void drawUptime(int y, uint16_t c_h, uint16_t c_m, uint16_t c_s, uint16_t c_c, bool colonVisible) {
     unsigned long upSec = millis() / 1000UL;
     int totalH = (int)(upSec / 3600);
     int upM    = (int)((upSec % 3600) / 60);
@@ -349,9 +424,9 @@ private:
 
     if (totalH < 100) {
       drawDigit(2,  y, totalH / 10, c_h); drawDigit(6,  y, totalH % 10, c_h);
-      if (blink) drawColon(10, y, c_c);
+      if (colonVisible) drawColon(10, y, c_c);
       drawDigit(12, y, upM / 10,   c_m); drawDigit(16, y, upM % 10,   c_m);
-      if (blink) drawColon(20, y, c_c);
+      if (colonVisible) drawColon(20, y, c_c);
       drawDigit(22, y, upS / 10,   c_s); drawDigit(26, y, upS % 10,   c_s);
     } else {
       int upD  = totalH / 24;
@@ -360,14 +435,12 @@ private:
       drawDigit(1,  y, upD  / 10, c_h); drawDigit(5,  y, upD  % 10, c_h);
       drawDot(9, y, c_c);
       drawDigit(11, y, upHH / 10, c_m); drawDigit(15, y, upHH % 10, c_m);
-      if (blink) drawColon(19, y, c_c);
+      if (colonVisible) drawColon(19, y, c_c);
       drawDigit(21, y, upM  / 10, c_s); drawDigit(25, y, upM  % 10, c_s);
     }
   }
 
   // ── 主刷新 ────────────────────────────────────────────────
-  // private 区新增：
-  int lastEffBr = -1;
   void updateDisplay() {
     yield();
     int effBr = getEffectiveBrightness();
@@ -392,7 +465,12 @@ private:
     int m = tInfo->tm_min;
     int s = tInfo->tm_sec;
 
-    bool blink = (millis() / 500) % 2;
+    // 冒号显示控制：如果不开启闪烁则始终显示常亮，呈现稳健的 xx:xx:xx
+    bool colonVisible = true;
+    if (colonBlink) {
+      colonVisible = ((millis() / 500) % 2) == 0;
+    }
+
     int y = 1;
 
     uint16_t c_main = matrix->Color(colorR, colorG, colorB);
@@ -419,16 +497,17 @@ private:
       currentMode = isShowingTime ? 0 : 1;
     }
 
+    // xx:xx:xx 精准对齐布局
     if (currentMode == 0) {
       if (showSeconds) {
         drawDigit(2,  y, h/10, c_h);    drawDigit(6,  y, h%10, c_h);
-        if (blink) drawColon(10, y, c_c);
+        if (colonVisible) drawColon(10, y, c_c);
         drawDigit(12, y, m/10, c_m);    drawDigit(16, y, m%10, c_m);
-        if (blink) drawColon(20, y, c_c);
+        if (colonVisible) drawColon(20, y, c_c);
         drawDigit(22, y, s/10, c_s_col); drawDigit(26, y, s%10, c_s_col);
       } else {
         drawDigit(7,  y, h/10, c_h);    drawDigit(11, y, h%10, c_h);
-        if (blink) drawColon(15, y, c_c);
+        if (colonVisible) drawColon(15, y, c_c);
         drawDigit(17, y, m/10, c_m);    drawDigit(21, y, m%10, c_m);
       }
     }
@@ -445,16 +524,14 @@ private:
       drawDot(8, y, c_c);
       drawDigit(9,  y, D/10, c_m);  drawDigit(13, y, D%10, c_m);
       drawDigit(17, y, h/10, c_s_col); drawDigit(21, y, h%10, c_s_col);
-      if (blink) drawColon(24, y, c_c);
+      if (colonVisible) drawColon(24, y, c_c);
       drawDigit(25, y, m/10, c_main); drawDigit(29, y, m%10, c_main);
     }
     else if (currentMode == 4) {
-      drawUptime(y, c_h, c_m, c_s_col, c_c, blink);
+      drawUptime(y, c_h, c_m, c_s_col, c_c, colonVisible);
     }
 
     drawBatteryBar();
-
-    // 【修改】ESP32-C3 的 RMT/I2S 驱动无阻塞极快，直接输出，去除 ESP8266 硬件 WDT 开关
     matrix->show();     
     yield();
   }
@@ -477,7 +554,7 @@ private:
   }
 
 public:
-  SmartMatrixClock(int pin, WebServer& srv) { // 【修改】WebServer 引用更改
+  SmartMatrixClock(int pin, WebServer& srv) {
     clockPin  = pin;
     webServer = &srv;
     matrix    = new Adafruit_NeoMatrix(32, 8, clockPin,
@@ -515,6 +592,15 @@ public:
       String battColor = (pct > 60) ? "#00c800" : (pct > 30) ? "#c89600" : "#c80000";
       html.replace("%BATT_COLOR%", battColor);
 
+      // 夜间模式状态显示
+      if (isNightTimeNow()) {
+        html.replace("%NIGHT_STATE%", "<span class='tag-night' style='background:#701a75; color:#f0abfc;'>🌙 调光生效中 (" + String(nightBrightnessScale) + "%)</span>");
+      } else if (nightModeEnabled) {
+        html.replace("%NIGHT_STATE%", "<span class='tag-night' style='background:#14532d; color:#86efac;'>☀️ 正常亮度 (待命)</span>");
+      } else {
+        html.replace("%NIGHT_STATE%", "<span class='tag-night' style='background:#374151; color:#9ca3af;'>已关闭</span>");
+      }
+
       char hexColor[8]; sprintf(hexColor, "#%02x%02x%02x", colorR, colorG, colorB);
       html.replace("%COLOR_HEX%", String(hexColor));
 
@@ -536,6 +622,9 @@ public:
       html.replace("%SEC_ON%",  showSeconds ? "selected" : "");
       html.replace("%SEC_OFF%", !showSeconds ? "selected" : "");
 
+      html.replace("%COL_SOLID%", !colonBlink ? "selected" : "");
+      html.replace("%COL_BLINK%", colonBlink ? "selected" : "");
+
       html.replace("%BT_0%", batteryType == 0 ? "selected" : "");
       html.replace("%BT_1%", batteryType == 1 ? "selected" : "");
 
@@ -543,6 +632,14 @@ public:
       html.replace("%BM_1%", brightnessMode == 1 ? "selected" : "");
       html.replace("%BR_MANUAL_DISPLAY%", brightnessMode == 0 ? "block" : "none");
       html.replace("%BR_AUTO_DISPLAY%",   brightnessMode == 1 ? "block" : "none");
+
+      // 夜间模式变量渲染
+      html.replace("%NM_ON%",  nightModeEnabled ? "selected" : "");
+      html.replace("%NM_OFF%", !nightModeEnabled ? "selected" : "");
+      html.replace("%NM_BOX_DISPLAY%", nightModeEnabled ? "block" : "none");
+      html.replace("%NM_SH%", String(nightStartHour));
+      html.replace("%NM_EH%", String(nightEndHour));
+      html.replace("%NM_SCALE%", String(nightBrightnessScale));
 
       html.replace("%PALETTE_DISPLAY%", currentTheme == 5 ? "flex" : "none");
 
@@ -556,7 +653,15 @@ public:
       if (webServer->hasArg("theme")) currentTheme    = webServer->arg("theme").toInt();
       if (webServer->hasArg("mode"))  displayMode     = webServer->arg("mode").toInt();
       if (webServer->hasArg("sec"))   showSeconds     = webServer->arg("sec").toInt() == 1;
+      if (webServer->hasArg("colon_blink")) colonBlink = webServer->arg("colon_blink").toInt() == 1;
       if (webServer->hasArg("batt"))  batteryType     = webServer->arg("batt").toInt();
+
+      // 夜间模式解析
+      if (webServer->hasArg("nm_en")) nightModeEnabled = webServer->arg("nm_en").toInt() == 1;
+      if (webServer->hasArg("nm_sh")) nightStartHour   = constrain(webServer->arg("nm_sh").toInt(), 0, 23);
+      if (webServer->hasArg("nm_eh")) nightEndHour     = constrain(webServer->arg("nm_eh").toInt(), 0, 23);
+      if (webServer->hasArg("nm_scale")) nightBrightnessScale = constrain(webServer->arg("nm_scale").toInt(), 5, 100);
+
       if (webServer->hasArg("color")) {
         String hex  = webServer->arg("color");
         long number = strtol(&hex[1], NULL, 16);
@@ -574,8 +679,9 @@ public:
   }
 
   void loop() {
-    if (millis() - lastRefresh >= 2000) {
-      lastRefresh += 2000;  
+    // 【核心优化】：将刷新周期优化为 250ms，秒数更新丝滑、冒号状态稳定无闪烁
+    if (millis() - lastRefresh >= 250) {
+      lastRefresh = millis();  
       updateDisplay();
     }
   }
