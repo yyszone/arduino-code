@@ -82,6 +82,7 @@ void forceOnSystem();
 void resetSystem();
 long getCooldownRemaining();
 void updateRelayLogic();
+bool isRelayTimerActive(); 
 
 // 全局硬件实例化
 Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);
@@ -483,141 +484,121 @@ void saveSystemState() {
 // 继电器自动控制
 // 注意：INA219 欠压 / 低功率保护已经独立处理
 // ============================================================
-void updateRelayLogic() {
+// ============================================================
+// 判定当前时间是否处于定时开启时段
+// ============================================================
+bool isRelayTimerActive() {
+  if (!settings.relayTimerEnabled || timeClient.getEpochTime() <= 0) {
+    return false;
+  }
+  
+  int onMinutes  = settings.relayOnHour * 60 + settings.relayOnMinute;
+  int offMinutes = settings.relayOffHour * 60 + settings.relayOffMinute;
+  int curMinutes = timeClient.getHours() * 60 + timeClient.getMinutes();
 
+  if (onMinutes < offMinutes) {
+    // 正常时段 (例如 08:00 到 22:00)
+    return (curMinutes >= onMinutes && curMinutes < offMinutes);
+  } else if (onMinutes > offMinutes) {
+    // 跨天时段 (例如 22:00 到次日 08:00)
+    return (curMinutes >= onMinutes || curMinutes < offMinutes);
+  }
+  return false; // 开关时间相同视为无效
+}
+
+// ============================================================
+// 继电器核心自动控制评估
+// ============================================================
+void updateRelayLogic() {
   unsigned long now = millis();
   
+  // 1. 开机 60 秒预热保护
   if (now < 60000UL) {
     st.confirmCounter = 0;
     return;
   }
-  // ==========================================================
-  // 1. 首先处理 INA219 保护
-  // ==========================================================
-  if (st.relayOn) {
 
-    if (checkPowerProtection()) {
-      // 保护已经执行切断
-      return;
+  // 2. 硬件保护切断检测 (最高优先级)
+  if (st.relayOn && checkPowerProtection()) {
+    return;
+  }
+
+  // 3. 故障冷却或手动安全断开锁定时，严禁任何自动开启
+  if (st.faultLatched && getCooldownRemaining() > 0) {
+    st.confirmCounter = 0;
+    return;
+  }
+  if (manualOff || getManualOffRemaining() > 0) {
+    st.confirmCounter = 0;
+    return;
+  }
+  if (st.tripReason == TripReason::MANUAL) {
+    st.confirmCounter = 0;
+    return;
+  }
+
+  // ==========================================================
+  // 4. 计算业务期望状态 (期望开启 true，期望关闭 false)
+  // ==========================================================
+  bool desiredState = st.relayOn; // 默认维持当前状态
+
+  if (settings.tempCtrlEnabled) {
+    // --- 模式 A：启用了智能温控 (回差控制，防止临界抖动) ---
+    if (!isnan(dhtTemp)) {
+      if (dhtTemp >= settings.tempThreshold) {
+        desiredState = true;
+      } else if (dhtTemp <= settings.tempThresholdOff) {
+        desiredState = false;
+      }
+    }
+    // 如果同时开启了定时，则定时作为总使能条件 (定时外强制关闭)
+    if (settings.relayTimerEnabled && !isRelayTimerActive()) {
+      desiredState = false;
+    }
+
+  } else if (settings.relayTimerEnabled) {
+    // --- 模式 B：未启用温控，仅启用了定时开关 ---
+    desiredState = isRelayTimerActive();
+
+  } else {
+    // --- 模式 C：未启用温控与定时，走默认 INA219 电压吸合策略 ---
+    // 达到开启阈值时吸合；若低于开启阈值则保持现态（低于欠压由保护层切断）
+    if (st.busVoltage > settings.turnOnVoltage) {
+      desiredState = true;
     }
   }
 
   // ==========================================================
-  // 2. 真正故障锁定期间，不允许自动重新开启
+  // 5. 执行控制与多重防抖确认
   // ==========================================================
-  if (st.faultLatched) {
-
-    long remain = getCooldownRemaining();
-
-    if (remain > 0) {
-      st.confirmCounter = 0;
-      return;
-    }
-
-    // 冷却结束，只有电压恢复到开启阈值以上才允许恢复
+  if (desiredState) {
+    // 期望开启：必须满足电压安全前置条件 (未发生欠压且大于启动电压)
     if (st.busVoltage > settings.turnOnVoltage) {
-
-      if (++st.confirmCounter >= 3) {
-
-        st.faultLatched = false;
-        st.tripReason = TripReason::NONE;
-        st.tripEpoch = 0;
-        st.tripMillis = 0;
+      if (!st.relayOn) {
+        if (++st.confirmCounter >= 3) { // 连续 3 次采样确认开启
+          setRelay(true);
+          st.faultLatched = false;
+          st.tripReason = TripReason::NONE;
+          st.tripEpoch = 0;
+          st.tripMillis = 0;
+          st.confirmCounter = 0;
+          saveSystemState();
+          addLog("触发自动控制条件，继电器已吸合。");
+        }
+      } else {
         st.confirmCounter = 0;
-
-        setRelay(true);
-
-        saveSystemState();
-
-        addLog(
-          "INA219 保护冷却结束，当前电压 "
-          + String(st.busVoltage, 2)
-          + "V，自动恢复继电器。"
-        );
       }
-
     } else {
       st.confirmCounter = 0;
     }
-
-    return;
-  }
-
-  // ==========================================================
-  // 3. 继电器当前关闭：执行普通自动开启
-  // ==========================================================
-  if (!st.relayOn) {
-
-    // 手动锁定情况下不自动开启
-    if (st.tripReason == TripReason::MANUAL) {
-      st.confirmCounter = 0;
-      return;
+  } else {
+    // 期望关闭：立即响应
+    st.confirmCounter = 0;
+    if (st.relayOn) {
+      setRelay(false);
+      saveSystemState();
+      addLog("触发控制退出条件(温控/定时)，继电器已断开。");
     }
-
-    // 电压达到自动开启阈值
-    if (st.busVoltage > settings.turnOnVoltage) {
-
-      if (++st.confirmCounter >= 3) {
-
-        setRelay(true);
-
-        st.faultLatched = false;
-        st.tripReason = TripReason::NONE;
-        st.tripEpoch = 0;
-        st.tripMillis = 0;
-        st.confirmCounter = 0;
-
-        saveSystemState();
-
-        addLog(
-          "当前电压 "
-          + String(st.busVoltage, 2)
-          + "V，高于开启阈值，自动开启继电器。"
-        );
-      }
-
-    } else {
-      st.confirmCounter = 0;
-    }
-
-    return;
-  }
-
-  // ==========================================================
-  // 4. 继电器已经开启
-  // ==========================================================
-
-  // ----------------------------------------------------------
-  // 温控
-  // ----------------------------------------------------------
-  if (settings.tempCtrlEnabled && !isnan(dhtTemp)) {
-
-    if (dhtTemp > settings.tempThreshold) {
-
-      if (!relayState) {
-        setRelay(true);
-
-        addLog(
-          "智能温控：温度 "
-          + String(dhtTemp, 1)
-          + "°C，开启继电器。"
-        );
-      }
-
-    } else if (dhtTemp < settings.tempThresholdOff) {
-
-      if (relayState) {
-        setRelay(false);
-
-        addLog(
-          "智能温控：温度 "
-          + String(dhtTemp, 1)
-          + "°C，关闭继电器。"
-        );
-      }
-    }
-
-    return;
   }
 }
 

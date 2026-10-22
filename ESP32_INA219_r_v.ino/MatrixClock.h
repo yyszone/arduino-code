@@ -7,6 +7,10 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_NeoMatrix.h>
 #include <Adafruit_NeoPixel.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
+
 
 // 极简锐利 3x6 字体
 const byte font3x6[10][6] = {
@@ -40,6 +44,7 @@ input[type=color] { padding: 0; height: 45px; cursor: pointer; }
 button { background: linear-gradient(90deg, #ff007f, #7f00ff); color: #fff; font-weight: bold; margin-top: 25px; cursor: pointer; transition: 0.3s; }
 button:hover { opacity: 0.8; }
 .back-btn { background: #333; margin-top: 15px; text-align: center; display: block; text-decoration: none; color: #bbb; padding: 12px; border-radius: 8px; }
+.refresh-btn { background: #164e63; margin-top: 12px; text-align: center; display: block; text-decoration: none; color: #cffafe; padding: 12px; border-radius: 8px; border: 1px solid #0891b2; }
 .stat-row { display: flex; justify-content: space-between; align-items: center; background: #111; border-radius: 8px; padding: 10px 14px; margin-top: 10px; font-size: 13px; }
 .stat-label { color: #888; }
 .stat-value { color: #fff; font-weight: bold; font-size: 15px; }
@@ -162,6 +167,26 @@ button:hover { opacity: 0.8; }
 
     <div class="divider"></div>
 
+    <!-- 灯板降压模块输入电源定时循环 -->
+    <h3>⚡ 灯板降压模块硬件断电恢复（MOSFET）</h3>
+    <label>基础恢复周期（分钟，0=关闭自动恢复）:</label>
+    <input type='number' name='pc_min' min='0' max='1440' step='1' value='%PC_MIN%'>
+    <div class='sub-hint'>只切断灯板降压模块输入电源，不重启 ESP32，不影响 GPIO10 控制的逆变器。建议先设 10 分钟。</div>
+
+    <label>每次断电时间（秒）:</label>
+    <input type='number' name='pc_sec' min='1' max='10' step='1' value='%PC_SEC%'>
+    <div class='sub-hint'>建议 2 秒。断电时 ESP32 保持运行，数据 GPIO 暂时设为高阻。</div>
+
+    <label>高电压加速阈值（V，0=关闭加速）:</label>
+    <input type='number' name='pc_hv' min='0' max='80' step='0.1' value='%PC_HV%'>
+    <div class='sub-hint'>当 INA219 实测电压达到该值时，使用下方倍数缩短恢复周期。阈值必须按你实际测量的电池电压设置。</div>
+
+    <label>达到高电压阈值后的周期缩短倍数（1～10）:</label>
+    <input type='number' name='pc_mul' min='1' max='10' step='1' value='%PC_MUL%'>
+    <div class='sub-hint'>例如基础周期 10 分钟、倍数 3：电压低于阈值时每 10 分钟恢复；达到阈值后每约 3 分钟恢复（最低 1 分钟）。倍数 1 表示不加速。</div>
+
+    <div class="divider"></div>
+
     <label>🔋 电池类型 (用于智能曲线电量计算):</label>
     <select name='batt'>
       <option value='0' %BT_0%>12V 磷酸铁锂 (放电曲线精确匹配)</option>
@@ -171,6 +196,8 @@ button:hover { opacity: 0.8; }
 
     <button type='submit'>💾 永久保存设置</button>
   </form>
+  <a href='/clock/refresh' class='refresh-btn' onclick="return confirm('切断灯板降压模块输入电源 %PC_SEC% 秒再恢复？灯板会短暂熄灭。');">⚡ 立即断电 %PC_SEC% 秒并恢复</a>
+  <div class='sub-hint' style='text-align:center'>基础周期：%PC_MIN% 分钟；断电：%PC_SEC% 秒；高压阈值：%PC_HV% V；缩短倍数：%PC_MUL%。0 分钟关闭自动恢复，0V 关闭高压加速。</div>
   <a href='/' class='back-btn'>🔙 返回继电器主页</a>
 </div>
 
@@ -198,8 +225,17 @@ class SmartMatrixClock {
 private:
   Adafruit_NeoMatrix* matrix;
   WebServer*          webServer;
+  SemaphoreHandle_t matrixMutex = nullptr;
+
+  void lockState() {
+    if (matrixMutex) xSemaphoreTake(matrixMutex, portMAX_DELAY);
+  }
+  void unlockState() {
+    if (matrixMutex) xSemaphoreGive(matrixMutex);
+  }
 
   int   clockPin;
+  int   matrixPowerPin; // 外部高侧电子开关模块 EN/CTRL：HIGH=接通降压模块 VIN+，LOW=断开
   int   currentBrightness = 20;   // 0-100 (0=off)
   int   brightnessMode    = 0;    // 0=手动, 1=自动(跟随电量)
   bool  showSeconds       = true;
@@ -217,6 +253,24 @@ private:
   // 电池
   int   batteryType    = 0;       // 0=12V LiFePO4, 1=24V LiFePO4
   float batteryVoltage = 0.0f;
+
+  // 降压模块输入正极由外部高侧电子开关控制：GPIO HIGH=通电，LOW=断电。
+  int autoPowerCycleMinutes = 10;  // 基础周期，0=禁用，1-1440 分钟
+  int powerOffSeconds = 2;         // 每次断电 1-10 秒
+  float highVoltageThreshold = 13.0f; // 达到阈值后缩短周期；0=关闭高压加速
+  int highVoltageMultiplier = 3;       // 基础周期除以该倍数，最低 1 分钟
+
+  // 以下快照供独立电源恢复任务读取；该任务不依赖 WebServer/main loop。
+  volatile int scheduleCycleMinutes = 10;
+  volatile int scheduleOffSeconds = 2;
+  volatile float scheduleHighVoltageThreshold = 13.0f;
+  volatile int scheduleHighVoltageMultiplier = 3;
+  volatile float scheduleVoltage = 0.0f;
+  volatile uint32_t lastPowerCycleMs = 0;
+  volatile bool manualPowerCycleRequested = false;
+  volatile bool driverRefreshRequested = false;
+  volatile bool powerCycleInProgress = false;
+  TaskHandle_t powerTaskHandle = nullptr;
 
   bool  isShowingTime  = true;
   unsigned long lastSwitchTime = 0;
@@ -327,6 +381,9 @@ private:
     auto readLineU8 = [&](uint8_t& out) {
       if (f.available()) { String v = f.readStringUntil('\n'); v.trim(); if (v.length()) out = (uint8_t)v.toInt(); }
     };
+    auto readLineFloat = [&](float& out) {
+      if (f.available()) { String v = f.readStringUntil('\n'); v.trim(); if (v.length()) out = v.toFloat(); }
+    };
 
     readLine(currentBrightness); 
     readLine(currentTheme);      
@@ -344,6 +401,15 @@ private:
     readLine(nightEndHour);
     readLine(nightBrightnessScale);
     readLineBool(colonBlink);
+    // 新增自动断电恢复配置；旧配置文件没有这两行时保留默认值。
+    readLine(autoPowerCycleMinutes);
+    readLine(powerOffSeconds);
+    readLineFloat(highVoltageThreshold);  // 兼容旧配置：没有该行时保留默认 13.0V
+    readLine(highVoltageMultiplier);      // 兼容旧配置：没有该行时保留默认 3 倍
+    autoPowerCycleMinutes = constrain(autoPowerCycleMinutes, 0, 1440);
+    powerOffSeconds = constrain(powerOffSeconds, 1, 10);
+    highVoltageThreshold = constrain(highVoltageThreshold, 0.0f, 80.0f);
+    highVoltageMultiplier = constrain(highVoltageMultiplier, 1, 10);
 
     f.close();
     Serial.println("[Clock] 设置读取成功！");
@@ -366,6 +432,10 @@ private:
     f.println(nightEndHour);
     f.println(nightBrightnessScale);
     f.println(colonBlink ? "1" : "0");
+    f.println(autoPowerCycleMinutes);
+    f.println(powerOffSeconds);
+    f.println(highVoltageThreshold, 1);
+    f.println(highVoltageMultiplier);
     f.close();
     Serial.println("[Clock] 设置保存成功！");
   }
@@ -442,6 +512,7 @@ private:
 
   // ── 主刷新 ────────────────────────────────────────────────
   void updateDisplay() {
+    if (matrix == nullptr) return;
     yield();
     int effBr = getEffectiveBrightness();
     if (effBr != lastEffBr) {
@@ -554,33 +625,143 @@ private:
   }
 
 public:
-  SmartMatrixClock(int pin, WebServer& srv) {
-    clockPin  = pin;
+  SmartMatrixClock(int pin, int powerPin, WebServer& srv) {
+    clockPin = pin;
+    matrixPowerPin = powerPin;
     webServer = &srv;
-    matrix    = new Adafruit_NeoMatrix(32, 8, clockPin,
-      NEO_MATRIX_TOP     + NEO_MATRIX_LEFT  +
+    matrix = new Adafruit_NeoMatrix(32, 8, clockPin,
+      NEO_MATRIX_TOP     + NEO_MATRIX_LEFT +
       NEO_MATRIX_COLUMNS + NEO_MATRIX_ZIGZAG,
-      NEO_GRB            + NEO_KHZ800);
+      NEO_GRB + NEO_KHZ800);
+  }
+
+  // 重建 NeoMatrix 对象。调用前必须持有 matrixMutex。
+  // 失败时不再软件重启 ESP32；硬件电源恢复任务仍继续工作并可再次尝试。
+  bool recreateMatrixDriver() {
+    if (matrix != nullptr) {
+      delete matrix;
+      matrix = nullptr;
+    }
+    delay(5);
+    matrix = new Adafruit_NeoMatrix(32, 8, clockPin,
+      NEO_MATRIX_TOP + NEO_MATRIX_LEFT +
+      NEO_MATRIX_COLUMNS + NEO_MATRIX_ZIGZAG,
+      NEO_GRB + NEO_KHZ800);
+    if (matrix == nullptr) {
+      Serial.println("[Clock] 重建灯板驱动失败；不重启 ESP32，将在后续周期重试");
+      return false;
+    }
+    matrix->begin();
+    matrix->setTextWrap(false);
+    lastEffBr = -1;
+    return true;
+  }
+
+  // 定时/手动电源恢复任务。它单独运行，不在 WebServer 请求处理中 delay，
+  // 因此即使网页接口处理慢，也能按周期真实切断 DC-DC 的输入正极。
+  void powerCycleWorker() {
+    Serial.println("[MatrixPowerTask] 独立硬件电源恢复任务已启动");
+    for (;;) {
+      const uint32_t now = millis();
+      const int baseMinutes = scheduleCycleMinutes;
+      const int offSec = constrain((int)scheduleOffSeconds, 1, 10);
+      const float voltage = scheduleVoltage;
+      const float threshold = scheduleHighVoltageThreshold;
+      const int multiplier = constrain((int)scheduleHighVoltageMultiplier, 1, 10);
+      const bool manualRequest = manualPowerCycleRequested;
+
+      int effectiveMinutes = baseMinutes;
+      const bool highVoltage = (threshold > 0.0f && voltage >= threshold);
+      if (baseMinutes > 0 && highVoltage && multiplier > 1) {
+        effectiveMinutes = baseMinutes / multiplier;
+        if (effectiveMinutes < 1) effectiveMinutes = 1;
+      }
+
+      const bool autoDue = (effectiveMinutes > 0) &&
+          ((uint32_t)(now - lastPowerCycleMs) >= (uint32_t)effectiveMinutes * 60000UL);
+
+      if (!powerCycleInProgress && (manualRequest || autoDue)) {
+        manualPowerCycleRequested = false;
+        powerCycleInProgress = true;
+
+        Serial.printf("[MatrixPowerTask] 开始硬件断电恢复：电压=%.2fV，高压状态=%s，基础周期=%d分钟，当前周期=%d分钟，断电=%d秒\n",
+                      voltage, highVoltage ? "是" : "否", baseMinutes,
+                      effectiveMinutes, offSec);
+
+        // 先停止数据驱动，降低 DIN 在灯板掉电时的反向供电风险。
+        pinMode(clockPin, INPUT);
+        digitalWrite(clockPin, LOW);
+        digitalWrite(matrixPowerPin, LOW);  // 外部高侧开关 CTRL：LOW=断电
+        vTaskDelay(pdMS_TO_TICKS((uint32_t)offSec * 1000UL));
+
+        digitalWrite(matrixPowerPin, HIGH); // 恢复降压模块输入电源
+        vTaskDelay(pdMS_TO_TICKS(200));      // 等 DC-DC 输出稳定
+
+        // 驱动对象只能由显示任务销毁/重建；此处仅发出请求。
+        driverRefreshRequested = true;
+        lastPowerCycleMs = millis();
+        powerCycleInProgress = false;
+        Serial.printf("[MatrixPowerTask] 电源已重新接通；等待显示任务重建驱动，heap=%u\n",
+                      (unsigned)ESP.getFreeHeap());
+      }
+
+      vTaskDelay(pdMS_TO_TICKS(100));
+    }
+  }
+
+  static void powerCycleTaskEntry(void* arg) {
+    SmartMatrixClock* self = static_cast<SmartMatrixClock*>(arg);
+    if (self) self->powerCycleWorker();
+    vTaskDelete(nullptr);
+  }
+
+  bool requestPowerCycle() {
+    if (powerCycleInProgress || manualPowerCycleRequested) return false;
+    manualPowerCycleRequested = true;
+    return true;
   }
 
   void setBatteryVoltage(float v) {
+    lockState();
     batteryVoltage = v;
+    scheduleVoltage = v; // 独立电源任务按 INA219 实测电压选择恢复周期
+    unlockState();
   }
 
   void begin() {
+    if (!matrixMutex) matrixMutex = xSemaphoreCreateMutex();
+    if (!matrixMutex) Serial.println("[Clock] 警告：矩阵互斥锁创建失败");
     loadSettings();
+    scheduleCycleMinutes = autoPowerCycleMinutes;
+    scheduleOffSeconds = powerOffSeconds;
+    scheduleHighVoltageThreshold = highVoltageThreshold;
+    scheduleHighVoltageMultiplier = highVoltageMultiplier;
+    lastPowerCycleMs = millis();
+
+    // GPIO1 只接外部高侧电子开关的逻辑 EN/CTRL，禁止连接电池正极。
+    // 选购支持 3.3V 逻辑触发、HIGH=ON 的模块；控制端加下拉，复位时默认断电。
+    pinMode(clockPin, INPUT);
+    digitalWrite(clockPin, LOW);
+    pinMode(matrixPowerPin, OUTPUT);
+    digitalWrite(matrixPowerPin, HIGH);
+    delay(120);
 
     matrix->begin();
     matrix->setTextWrap(false);
     matrix->setBrightness(getEffectiveBrightness());
     matrix->fillScreen(0);
     matrix->show();
-    yield(); 
+    yield();
+    lastRefresh = millis();
+    Serial.printf("[MatrixPower] GPIO%d：基础周期=%d分钟，断电=%d秒，高压阈值=%.1fV，缩短倍数=%d\n",
+                  matrixPowerPin, autoPowerCycleMinutes, powerOffSeconds,
+                  highVoltageThreshold, highVoltageMultiplier);
 
-    configTime(8 * 3600, 0, "ntp.aliyun.com");
+    // 系统时间与联网校时由主 .ino 统一管理；此处不进行任何网络同步调用。
 
     // ── GET /clock ─────────────────────────────────────────
     webServer->on("/clock", HTTP_GET, [this]() {
+      lockState();
       String html = FPSTR(CLOCK_HTML_TEMPLATE);
 
       html.replace("%UPTIME%", formatUptime());
@@ -642,12 +823,28 @@ public:
       html.replace("%NM_SCALE%", String(nightBrightnessScale));
 
       html.replace("%PALETTE_DISPLAY%", currentTheme == 5 ? "flex" : "none");
+      html.replace("%PC_MIN%", String(autoPowerCycleMinutes));
+      html.replace("%PC_SEC%", String(powerOffSeconds));
+      html.replace("%PC_HV%", String(highVoltageThreshold, 1));
+      html.replace("%PC_MUL%", String(highVoltageMultiplier));
 
+      unlockState();
       webServer->send(200, "text/html", html);
+    });
+
+    // ── 手动灯板硬件电源循环：只切断 DC-DC 输入，不重启 ESP32 ──
+    webServer->on("/clock/refresh", HTTP_GET, [this]() {
+      if (requestPowerCycle()) {
+        webServer->sendHeader("Location", "/clock");
+        webServer->send(303);
+      } else {
+        webServer->send(409, "text/plain; charset=utf-8", "灯板电源恢复正在执行，请稍后再试。");
+      }
     });
 
     // ── POST /clock/save ────────────────────────────────────
     webServer->on("/clock/save", HTTP_POST, [this]() {
+      lockState();
       if (webServer->hasArg("bmode")) brightnessMode  = webServer->arg("bmode").toInt();
       if (webServer->hasArg("br"))    currentBrightness = constrain(webServer->arg("br").toInt(), 0, 100);
       if (webServer->hasArg("theme")) currentTheme    = webServer->arg("theme").toInt();
@@ -668,22 +865,82 @@ public:
         colorR = number >> 16; colorG = (number >> 8) & 0xFF; colorB = number & 0xFF;
       }
       
-      matrix->setBrightness(getEffectiveBrightness());
-      matrix->show(); 
-      
+      // 设置自动硬件断电周期；改动任一恢复参数后重新开始计时。
+      bool powerSettingsChanged = false;
+      if (webServer->hasArg("pc_min")) {
+        autoPowerCycleMinutes = constrain(webServer->arg("pc_min").toInt(), 0, 1440);
+        powerSettingsChanged = true;
+      }
+      if (webServer->hasArg("pc_sec")) {
+        powerOffSeconds = constrain(webServer->arg("pc_sec").toInt(), 1, 10);
+        powerSettingsChanged = true;
+      }
+      if (webServer->hasArg("pc_hv")) {
+        highVoltageThreshold = constrain(webServer->arg("pc_hv").toFloat(), 0.0f, 80.0f);
+        powerSettingsChanged = true;
+      }
+      if (webServer->hasArg("pc_mul")) {
+        highVoltageMultiplier = constrain(webServer->arg("pc_mul").toInt(), 1, 10);
+        powerSettingsChanged = true;
+      }
+      scheduleCycleMinutes = autoPowerCycleMinutes;
+      scheduleOffSeconds = powerOffSeconds;
+      scheduleHighVoltageThreshold = highVoltageThreshold;
+      scheduleHighVoltageMultiplier = highVoltageMultiplier;
+      if (powerSettingsChanged) lastPowerCycleMs = millis();
+
+      // 不在 HTTP 请求处理期间执行 NeoPixel show；让独立灯板任务在下一帧应用设置。
+      lastEffBr = -1;
+      lastRefresh = 0;
       saveSettings();
+      unlockState();
 
       webServer->sendHeader("Location", "/clock");
       webServer->send(303);
     });
+
+    // 独立于 main loop 和 MatrixTask 的硬件电源恢复定时器。
+    BaseType_t powerTaskResult = xTaskCreate(
+      &SmartMatrixClock::powerCycleTaskEntry,
+      "matrixPowerCycle", 3072, this, 3, &powerTaskHandle
+    );
+    if (powerTaskResult == pdPASS) {
+      Serial.println("[MatrixPowerTask] 独立定时任务创建成功");
+    } else {
+      Serial.println("[MatrixPowerTask] 创建失败；自动硬件断电恢复不可用，请检查剩余 RAM");
+    }
   }
 
   void loop() {
-    // 【核心优化】：将刷新周期优化为 250ms，秒数更新丝滑、冒号状态稳定无闪烁
-    if (millis() - lastRefresh >= 250) {
-      lastRefresh = millis();  
+    // 物理电源循环由独立 PowerCycleTask 执行。显示任务仅在电源恢复后重建驱动、重绘。
+    if (driverRefreshRequested) {
+      lockState();
+      if (driverRefreshRequested) {
+        driverRefreshRequested = false;
+        if (recreateMatrixDriver()) {
+          const int effBr = getEffectiveBrightness();
+          matrix->setBrightness(effBr);
+          lastEffBr = effBr;
+          matrix->fillScreen(0);
+          matrix->show();
+          delay(5);
+          updateDisplay();
+          lastRefresh = millis();
+          Serial.printf("[MatrixPower] 灯板驱动已重建并绘制当前时钟，heap=%u\n",
+                        (unsigned)ESP.getFreeHeap());
+        }
+      }
+      unlockState();
+    }
+
+    lockState();
+    const unsigned long now = millis();
+    // 保留原有 250ms 刷新周期，不增加平时的刷新频率。
+    if (matrix != nullptr && now - lastRefresh >= 250UL) {
+      lastRefresh = now;
       updateDisplay();
     }
+    unlockState();
   }
 };
 

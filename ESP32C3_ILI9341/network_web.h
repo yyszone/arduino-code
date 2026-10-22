@@ -501,75 +501,93 @@ void handleIrCommand() {
   server.send(302, "text/plain", "");
 }
 
-// ⭐️ 生成网页与 API 状态 HTML
+// ⭐️ 优化：生成包含定时与温控状态的网页状态提示 HTML
 String buildStatusHtml() {
-
   unsigned long nowMs = millis();
 
+  // 1. 开机预热提示
   if (nowMs < 60000UL) {
     long remWarm = (60000UL - nowMs) / 1000UL;
-
     return "<span style='color:#f0883e;font-weight:bold;'>"
-           "⏳ 系统开机预热中（剩余 " +
-           String(remWarm) +
-           " 秒）</span>";
+           "⏳ 系统开机预热中（剩余 " + String(remWarm) + " 秒）</span>";
   }
 
-  if (st.relayOn) {
-    return "<span style='color:#3fb950;font-weight:bold;'>"
-           "✔ 继电器吸合（正常运行）</span>";
-  }
-
-  // 手动安全断开冷却
+  // 2. 手动安全断开冷却提示
   long manualRemain = getManualOffRemaining();
-
   if (manualOff || manualRemain > 0) {
-
     return "<div style='color:#d29922;font-weight:bold;line-height:1.6;'>"
            "🛑 <b>手动安全断开</b><br>"
-           "⏳ <b>冷却倒计时："
-           "<span style='color:#ffea00;font-size:1.1em;'>"
-           + formatSeconds(manualRemain) +
-           "</span></b><br>"
-           "<small style='color:#8b949e;font-size:0.8em;'>"
-           "冷却结束后自动恢复控制"
-           "</small>"
-           "</div>";
+           "⏳ <b>冷却倒计时：<span style='color:#ffea00;font-size:1.1em;'>" + formatSeconds(manualRemain) + "</span></b><br>"
+           "<small style='color:#8b949e;font-size:0.8em;'>冷却结束后自动恢复控制</small></div>";
   }
 
+  // 3. 故障锁定（欠压/低功率）提示
   long rem = getCooldownRemaining();
-
   if (rem > 0) {
-
-    String rText =
-        (st.tripReason == TripReason::UNDERVOLTAGE)
-        ? "欠压保护切断"
-        : (st.tripReason == TripReason::OVERCURRENT)
-        ? "低功率保护切断"
-        : "保护触发";
-
+    String rText = (st.tripReason == TripReason::UNDERVOLTAGE) ? "欠压保护切断" : "低功率保护切断";
     return "<div style='color:#d29922;font-weight:bold;line-height:1.6;'>"
            "🛡️ <b>" + rText + "</b><br>"
-           "⏳ <b>冷却锁定倒计时："
-           "<span style='color:#ffea00;font-size:1.1em;'>"
-           + formatSeconds(rem) +
-           "</span></b><br>"
-           "<small style='color:#8b949e;font-size:0.8em;'>"
-           "在此期间防频繁通断保护中，无法自动吸合"
-           "</small>"
-           "</div>";
+           "⏳ <b>冷却锁定倒计时：<span style='color:#ffea00;font-size:1.1em;'>" + formatSeconds(rem) + "</span></b></div>";
   }
 
+  // ==========================================================
+  // 4. 定时开关与智能温控状态联动提示
+  // ==========================================================
+  bool timerActive = isRelayTimerActive();
+
+  if (settings.tempCtrlEnabled && settings.relayTimerEnabled) {
+    // 兼具温控与定时
+    if (!timerActive) {
+      return "<span style='color:#8b949e;font-weight:bold;'>"
+             "⏱️ 定时休眠中 (不在设定时间段内，继电器强制关闭)</span>";
+    }
+    if (isnan(dhtTemp)) {
+      return "<span style='color:#f0883e;font-weight:bold;'>"
+             "🌡️ 定时时段内 | 传感器异常，正在等待有效温湿度...</span>";
+    }
+    if (st.relayOn) {
+      return "<span style='color:#3fb950;font-weight:bold;'>"
+             "🌡️ 定时时段内 | 智能温控运行中 (当前温度: " + String(dhtTemp, 1) + "°C >= 开启阈值)</span>";
+    } else {
+      return "<span style='color:#58a6ff;font-weight:bold;'>"
+             "🌡️ 定时时段内 | 智能温控待命中 (当前温度: " + String(dhtTemp, 1) + "°C，未达开启阈值)</span>";
+    }
+  } 
+  else if (settings.tempCtrlEnabled) {
+    // 仅启用智能温控
+    if (isnan(dhtTemp)) {
+      return "<span style='color:#f0883e;font-weight:bold;'>"
+             "🌡️ 智能温控启用 | 传感器异常，等待数据...</span>";
+    }
+    if (st.relayOn) {
+      return "<span style='color:#3fb950;font-weight:bold;'>"
+             "🌡️ 智能温控加热/降温中 (当前: " + String(dhtTemp, 1) + "°C, 阈值: " + String(settings.tempThreshold, 1) + "°C)</span>";
+    } else {
+      return "<span style='color:#58a6ff;font-weight:bold;'>"
+             "🌡️ 智能温控待命中 (当前: " + String(dhtTemp, 1) + "°C, 关闭阈值: " + String(settings.tempThresholdOff, 1) + "°C)</span>";
+    }
+  } 
+  else if (settings.relayTimerEnabled) {
+    // 仅启用定时开关
+    if (timerActive) {
+      return "<span style='color:#3fb950;font-weight:bold;'>"
+             "⏱️ 定时时段内 (继电器已按计划自动开启)</span>";
+    } else {
+      return "<span style='color:#8b949e;font-weight:bold;'>"
+             "⏱️ 定时休眠中 (不在设定时间段内，保持关闭)</span>";
+    }
+  }
+
+  // 5. 默认电压监控状态
   if (st.busVoltage > settings.turnOnVoltage) {
     return "<span style='color:#58a6ff;font-weight:bold;'>"
            "⏳ 电压高于开启阈值，正在确认采样...</span>";
   }
 
   return "<span style='color:#8b949e;font-weight:bold;'>"
-         "🔍 待机监测中（待电压高于 " +
-         String(settings.turnOnVoltage, 1) +
-         "V 自动吸合）</span>";
+         "🔍 待机监测中 (电压低于 " + String(settings.turnOnVoltage, 1) + "V)</span>";
 }
+
 
 void handleApiStatus() {
   String statusHtml = buildStatusHtml();

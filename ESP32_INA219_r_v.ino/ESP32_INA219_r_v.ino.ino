@@ -14,17 +14,22 @@ I2C 传感器	INA219 SCL	GPIO 5	避开 GPIO 9 以防上电异常
 #include "ipv6.h"              // IPv6 工具模块
 #include <Wire.h>
 #include <Adafruit_INA219.h>
-#include <NTPClient.h>
-#include <WiFiUdp.h>
+#include <Preferences.h>
+#include <sys/time.h>
 #include <EEPROM.h>
 #include <time.h>
 #include <ESP_Mail_Client.h>
 #include <WiFiClientSecure.h>
 #include <LittleFS.h>
 #include <Update.h>            // 【修改】引入 ESP32 固件更新支持
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
+#include <esp_attr.h>      // RTC_NOINIT_ATTR 看门狗重启标记
 #include "MatrixClock.h" 
 #include "notify.h"
 #include "logs.h" 
+#include "main_html.h"
 
 // ============== 用户 WiFi 配置 ==============
 const char* ssid       = "yang1234";
@@ -56,13 +61,22 @@ const int   DAYLIGHT_OFFSET       = 0;
 const int RELAY_PIN   = 10; // 继电器控制 (GPIO 10)
 const int I2C_SDA_PIN = 4;  // I2C SDA (GPIO 4)
 const int I2C_SCL_PIN = 5;  // I2C SCL (GPIO 5)
-const int MATRIX_PIN  = 3;  // 点阵时钟 DIN (GPIO 3)
+const int MATRIX_PIN  = 3;  // 点阵 WS2812 DIN (GPIO 3)
+const int MATRIX_POWER_PIN = 1; // GPIO1 控制外部高侧电子开关 EN/CTRL（HIGH=通电，LOW=断开）；不接12/24/48V
 
 // ============== 时间与定时任务配置 ==============
-const char* WEB_UI_NTP_SERVER = "ntp.aliyun.com";
+// 主时钟统一使用 ESP32 系统时钟：正常运行时靠 millis/RTC 走时，联网时由 SNTP 后台校正。
 const long  WEB_UI_GMT_OFFSET_SEC = 8 * 3600;
-WiFiUDP ntpUDP;
-NTPClient timeClient(ntpUDP, WEB_UI_NTP_SERVER, WEB_UI_GMT_OFFSET_SEC);
+const char* CLOCK_SNAPSHOT_PATH = "/heartbeat.txt";
+const char* RELAY_STATE_PATH = "/relay.txt";
+
+// 继电器状态同时写入 NVS 和 LittleFS。NVS 用于重启早期恢复，文件用于兼容旧固件。
+Preferences relayPreferences;
+bool relayPreferencesReady = false;
+bool firstBootDetected = false;
+static const uint32_t RELAY_RTC_MAGIC = 0x52E1A7E1;
+RTC_NOINIT_ATTR uint32_t relayRtcStateMagic;
+RTC_NOINIT_ATTR uint32_t relayRtcStateValue;
 
 // ============== EEPROM 存储地址定义 ==============
 const int EEPROM_SIZE = 64; 
@@ -78,14 +92,24 @@ const char* EMAIL_CFG_PATH = "/email_cfg.txt";
 
 // ============== 全局对象与变量 ==============
 WebServer server(WEB_SERVER_PORT);      // 【修改】
-SmartMatrixClock myClock(MATRIX_PIN, server); // 【修改】初始化时钟引脚指向 GPIO 3
+SmartMatrixClock myClock(MATRIX_PIN, MATRIX_POWER_PIN, server); // 灯板 DIN=GPIO3，外部高侧电子开关逻辑控制=GPIO1
+
+// ===== 灯板刷新任务状态 =====
+// 灯板降压模块的定时硬断电恢复由 MatrixClock.h 中独立 PowerCycleTask 执行。
+// 不再提供 /clock/reboot 软件重启按钮；手动/自动恢复只切断灯板 DC-DC 输入电源。
+bool matrixClockTaskRunning = false;
 
 Adafruit_INA219 ina219;
 SMTPSession smtp;
 
 bool relayState = false, ina219_ok = false;
-bool wifiConnected = false; 
+bool wifiConnected = false;
 float busVoltage = 0;
+
+// 首次开机时先启动本地服务；仅在确认 15 秒内没有 Wi-Fi 后，才按规则默认开启继电器。
+bool initialOfflineDefaultPending = false;
+uint32_t initialOfflineDefaultDeadline = 0;
+unsigned long lastWifiAttemptMs = 0;
 float lowVoltageThreshold = 10.5, highVoltageThreshold = 12.8, warningVoltageThreshold = 11.5;
 bool isLockedOut = false;
 bool isVoltageWarning = false;
@@ -101,13 +125,25 @@ unsigned long lastLockoutNoticeTime = 0;
 
 // --- 图表数据配置 ---
 const int DATA_POINTS = 1440;
+const int CHART_SAMPLE_STEP = 5;                 // 图表按 5 分钟取 1 点，降低首页加载和 CPU 开销
+const int CHART_POINTS = DATA_POINTS / CHART_SAMPLE_STEP; // 288 点，仍覆盖完整 24 小时
 const unsigned long DATA_INTERVAL_MS = 60000;
 int historyIndex = 0;
 
-// --- 低电压重启 ---
-unsigned long lowVoltageRebootTimer = 0;
-const float REBOOT_VOLTAGE_THRESHOLD = 10.0;
-const unsigned long REBOOT_TIMER_DURATION_MS = 3600000;
+// 曲线请求先复制历史样本，再在 RAM 中降采样生成 JSON。
+static float chartSnapshot[DATA_POINTS];
+
+// WS2812 刷新独立运行；即使首页、曲线、SMTP 或通知请求耗时，也能按 250ms 周期刷新。
+void matrixClockTask(void* parameter) {
+  (void)parameter;
+  TickType_t lastWake = xTaskGetTickCount();
+  const TickType_t period = pdMS_TO_TICKS(20);
+  for (;;) {
+    myClock.setBatteryVoltage(busVoltage);
+    myClock.loop();
+    vTaskDelayUntil(&lastWake, period);
+  }
+}
 
 // --- CPU使用率估算 (优化版：杜绝空转，精准计算工作时间比例) ---
 unsigned long lastCpuMeasureTime = 0;
@@ -116,228 +152,73 @@ unsigned long totalWorkTime = 0; // 累计实际工作耗时 (微秒)
 const unsigned long CPU_MEASURE_INTERVAL_MS = 1000;
 // ============== 辅助函数 ==============
 uint32_t getChipId() {
-  return (uint32_t)(ESP.getEfuseMac() & 0xFFFFFFFF); // 【修改】ESP32 获取唯一 ID
+  return (uint32_t)(ESP.getEfuseMac() & 0xFFFFFFFF);
+}
+
+// 设置中国时区，不需要网络。POSIX 的 CST-8 表示 UTC+8。
+void setLocalTimezone() {
+  setenv("TZ", "CST-8", 1);
+  tzset();
+}
+
+// 只在本机系统时间有效时返回时间；系统时间在同步后会独立走时，不依赖网页或网络轮询。
+String getDeviceFormattedTime() {
+  time_t nowTs = time(nullptr);
+  struct tm tmInfo;
+  if (nowTs >= 1700000000UL) {
+    localtime_r(&nowTs, &tmInfo);
+  } else {
+    // 首次冷启动且完全离线、又没有历史快照时无法知道真实墙上时间；至少显示会走动的临时钟。
+    uint32_t daySeconds = (8UL * 3600UL + millis() / 1000UL) % 86400UL;
+    tmInfo.tm_hour = daySeconds / 3600UL;
+    tmInfo.tm_min = (daySeconds % 3600UL) / 60UL;
+    tmInfo.tm_sec = daySeconds % 60UL;
+  }
+  char buf[9];
+  snprintf(buf, sizeof(buf), "%02d:%02d:%02d", tmInfo.tm_hour, tmInfo.tm_min, tmInfo.tm_sec);
+  return String(buf);
+}
+
+// 保存最近的有效时间。断网时系统仍继续走时；如果软件重启后系统时钟无效，可恢复这个快照。
+void saveClockSnapshot() {
+  time_t nowTs = time(nullptr);
+  if (nowTs < 1700000000UL) return;
+  File f = LittleFS.open(CLOCK_SNAPSHOT_PATH, "w");
+  if (f) { f.print((uint32_t)nowTs); f.close(); }
+}
+
+void restoreClockSnapshotIfNeeded() {
+  if (time(nullptr) >= 1700000000UL) return;
+  File f = LittleFS.open(CLOCK_SNAPSHOT_PATH, "r");
+  if (!f) return;
+  uint32_t savedEpoch = (uint32_t)f.parseInt();
+  f.close();
+  if (savedEpoch < 1700000000UL) return;
+  struct timeval tv;
+  tv.tv_sec = (time_t)savedEpoch;
+  tv.tv_usec = 0;
+  settimeofday(&tv, nullptr);
+  Serial.printf("[Clock] 从本地快照恢复时间戳：%lu\n", (unsigned long)savedEpoch);
+}
+
+// SNTP 在系统后台工作，不在 loop() 里同步等待。联网时调用；断网时系统时钟继续走。
+void configureNetworkTimeSync() {
+  setLocalTimezone();
+  configTime(8 * 3600, 0, "ntp.aliyun.com", "pool.ntp.org", "time.nist.gov");
+}
+
+// 读取 NVS 持久状态。返回 true 表示有可靠的历史继电器状态。
+bool readRelayStateFromNvs(bool &stateOut) {
+  if (!relayPreferencesReady) return false;
+  if (!relayPreferences.getBool("has_state", false)) return false;
+  stateOut = relayPreferences.getBool("state", false);
+  return true;
 }
 
 // =====================================================
 // ============== 网页 (HTML+CSS+JS) ==============
 // =====================================================
-const char MAIN_HTML_PART1[] PROGMEM = R"HTML(
-<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ESP32-C3 智能继电器</title><script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script><style>:root{--bg-color:#111827;--card-color:#1f2937;--text-color:#d1d5db;--accent-color:#38bdf8;--green-color:#22c55e;--red-color:#ef4444;--warning-color:#f59e0b;--muted-text:#9ca3af}body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif,"Apple Color Emoji","Segoe UI Emoji";background-color:var(--bg-color);color:var(--text-color);margin:0;padding:15px;display:flex;justify-content:center}h1,h2,h4{margin-top:0;color:#fff;text-align:center}h2{border-top:1px solid #374151;padding-top:15px;margin-top:20px}.container{width:100%;max-width:500px}.card{background-color:var(--card-color);border-radius:12px;padding:20px;margin-bottom:15px;box-shadow:0 4px 6px -1px rgba(0,0,0,.1),0 2px 4px -1px rgba(0,0,0,.06)}.chart-card{padding:20px 0 10px 0;}.chart-card h2{padding:0 20px 15px;margin:0;border:none;}.data-box{text-align:center;padding:10px}.data-box .val{font-size:2.5em;font-weight:700;color:var(--accent-color);line-height:1.2;transition:color .3s ease}.data-box .unit{color:var(--muted-text)}.btn{width:100%;padding:15px;font-size:1.2em;font-weight:bold;border:none;border-radius:8px;cursor:pointer;transition:background-color .2s ease}.btn.on{background-color:var(--green-color);color:#fff}.btn.off{background-color:var(--red-color);color:#fff}.status-light{width:12px;height:12px;border-radius:50%;display:inline-block;margin-right:8px;background-color:#6b7280}.status-light.on{background-color:var(--green-color)}.input-group{display:flex;align-items:center;gap:10px;margin-bottom:10px}.input-group label{flex-basis:120px;flex-shrink:0;font-size:0.9em}input[type=number],input[type=text],input[type=password]{width:100%;padding:8px;background-color:#374151;border:1px solid #4b5563;border-radius:6px;color:var(--text-color);font-size:1em}.btn-save{padding:10px 15px;background-color:var(--accent-color);color:#fff;border:none;border-radius:6px;cursor:pointer}#sysinfo{font-size:.8em;color:var(--muted-text);word-break:break-all}#lockoutStatus{color:var(--red-color);text-align:center;margin-bottom:10px;font-weight:bold;}.toggle-section{cursor:pointer;color:var(--accent-color);text-align:center;font-size:0.9em;margin-top:10px;}</style></head><body>
-<div class="container"><h1>ESP32-C3 智能继电器</h1><p style="text-align:center;color:var(--muted-text);font-size:0.8em;margin-bottom:2px;">来自脚本 ESP32_INA219_r_v.ino.ino</p><p style="text-align:center;color:var(--muted-text);margin-top:2px;">当前时间: <span id="currentTime">--:--:--</span></p><div class="card"><div class="data-box"><div>电池电压</div><div class="val" id="v">--</div><div class="unit">V</div></div></div><div class="card"><h2>手动控制</h2><div id="lockoutStatus" style="display:none;"></div><p><span id="relayStatusLight" class="status-light"></span>继电器状态: <strong id="relayStatusText">读取中...</strong></p><button id="relayBtn" class="btn">读取中...</button></div><div class="card"><h2>参数设置</h2><div class="input-group"><label for="highV">高压开启 (V)</label><input type="number" id="highV" step="0.1"></div><div class="input-group"><label for="warnV">电压警告 (V)</label><input type="number" id="warnV" step="0.1"></div><div class="input-group"><label for="lowV">低压关闭 (V)</label><input type="number" id="lowV" step="0.1"></div>
-<p style="font-size:0.85em;color:var(--muted-text);text-align:right;">
-  邮件通知将发送至: 
-  <span id="dispRecvEmail" 
-    style="color:var(--accent-color);cursor:pointer;text-decoration:underline dotted;" 
-    title="点击发送测试邮件"
-    onclick="sendTestEmail()">未设置</span>
-</p>
-<p id="testEmailStatus" style="font-size:0.8em;text-align:right;margin:0;min-height:1.2em;"></p>
-<div style="text-align:right;margin-top:10px;"><button class="btn-save" onclick="saveSettings()">保存电压设置</button></div></div>
-)HTML";
-
-const char MAIN_HTML_PART2[] PROGMEM = R"HTML(
-<div class="card"><h2>邮件通知设置</h2><div class="input-group"><label>SMTP服务器</label><input type="text" id="smtpHost" placeholder="如: smtp.qq.com"></div><div class="input-group"><label>SMTP端口</label><input type="number" id="smtpPort" placeholder="465"></div><div class="input-group"><label>发件邮箱</label><input type="text" id="authEmail" placeholder="xxxx@qq.com"></div><div class="input-group"><label>授权码/密码</label><input type="password" id="authPass"></div><div class="input-group"><label>收件邮箱</label><input type="text" id="recvEmail" placeholder="接收通知的邮箱"></div><div style="text-align:right;margin-top:10px;"><button class="btn-save" onclick="saveEmailConfig()">保存邮件配置</button></div></div>
-
-<div class="card">
-  <h2>API 通知设置</h2>
-
-  <div class="input-group">
-    <label>通知 API</label>
-    <input
-      type="text"
-      id="notifyApi"
-      placeholder="https://notify.yysresume.work/api/send">
-  </div>
-
-  <p style="font-size:0.8em;color:var(--muted-text);">
-    用于电压警告 API 推送通知
-  </p>
-
-  <div style="text-align:right;margin-top:10px;">
-    <button class="btn-save" onclick="saveNotifyConfig()">
-      保存 API 配置
-    </button>
-  </div>
-
-  <p id="notifyStatus"
-     style="font-size:0.8em;text-align:right;margin:8px 0 0;">
-  </p>
-</div>
-
-<div class="card"><h2>系统信息与更新</h2>
-<a href="/clock" style="display:block; text-align:center; background:linear-gradient(90deg, #ff007f, #7f00ff); color:#fff; padding:12px; border-radius:8px; text-decoration:none; margin-bottom:15px; font-weight:bold; box-shadow: 0 4px 10px rgba(255,0,127,0.3);">✨ 进入矩阵时钟控制台</a><div id="sysinfo">加载中...</div><h4>固件更新 (OTA)</h4><div id="otaUi"><form id="otaForm" method="POST" action="/update" enctype="multipart/form-data"><input type="file" name="update" accept=".bin,.bin.gz" required><button type="submit" class="btn-save" style="margin-top:10px;">上传并更新</button></form></div><div id="otaStatus"></div></div><div class="card chart-card"><h2>24小时电压曲线</h2><div id="voltageChart" style="width: 100%; height: 250px;"></div></div>
-<a href="/logs" style="display:block;text-align:center;background:#1f2937;
-color:#34d399;padding:10px;border-radius:8px;text-decoration:none;
-margin-bottom:10px;font-size:13px;">📋 查看系统日志</a>
-</div>
-
-
-<script>
-var echartInstance;
-var latestDeviceTimeStr = "--:--:--";
-const DATA_INTERVAL_MIN = 1;
-function $(s){return document.getElementById(s)}
-function fetchJson(url){return fetch(url).then(r=>{if(!r.ok)throw new Error('Network error');return r.json()})}
-function updateStatus(data){
-  const relayOn=data.relay;
-  $('relayStatusText').textContent=relayOn?'已开启':'已关闭';
-  $('relayStatusText').style.color=relayOn?'var(--green-color)':'var(--red-color)';
-  $('relayStatusLight').className=relayOn?'status-light on':'status-light';
-  $('relayBtn').textContent=relayOn?'关闭继电器':'开启继电器';
-  $('relayBtn').className=relayOn?'btn off':'btn on';
-  if(data.lockout){$('lockoutStatus').style.display='block';$('lockoutStatus').textContent='电压警告中！剩余 '+data.lockout_rem+' 分钟可自动恢复。'}else{$('lockoutStatus').style.display='none';}
-}
-
-function fetchData(){fetchJson('/getData').then(data=>{
-  $('v').textContent=data.voltage.toFixed(2);
-  $('v').style.color=data.voltage_warning?'var(--warning-color)':'var(--accent-color)';
-  $('currentTime').textContent=data.time;
-  latestDeviceTimeStr = data.time;
-  updateStatus(data);
-})}
-function fetchInitialState(){fetchJson('/getStatus').then(data=>{
-  updateStatus(data);
-  $('lowV').value=data.low_v;
-  $('warnV').value=data.warn_v;
-  $('highV').value=data.high_v;
-  $('sysinfo').innerHTML=`IPv4: ${data.ip}<br>IPv6: ${data.ipv6}<br>芯片ID: ${data.chip_id}<br>CPU繁忙度: ${data.cpu_usage}%<br>内存(RAM): ${data.free_heap} / ${data.total_heap} KB<br>存储(Flash): ${data.fs_free} / ${data.fs_total} KB`;
-  $('smtpHost').value = data.mail_host;
-  $('smtpPort').value = data.mail_port;
-  $('authEmail').value = data.mail_user;
-  $('authPass').value = data.mail_pass;
-  $('recvEmail').value = data.mail_to;
-  $('notifyApi').value = data.notify_api || '';
-  if(data.mail_to && data.mail_to.length > 3) $('dispRecvEmail').textContent = data.mail_to;
-})}
-function saveSettings(){
-  const lowV=$('lowV').value; const warnV=$('warnV').value; const highV=$('highV').value;
-  fetch(`/setSettings?low=${lowV}&warn=${warnV}&high=${highV}`).then(r=>{if(r.ok){alert('电压设置已保存!')}else{alert('保存失败!')}}).catch(e=>alert('请求出错: '+e));
-}
-
-function sendTestEmail() {
-  const addr = $('dispRecvEmail').textContent;
-  if (!addr || addr === '未设置') {
-    $('testEmailStatus').style.color = 'var(--warning-color)';
-    $('testEmailStatus').textContent = '请先保存邮件配置';
-    return;
-  }
-  $('testEmailStatus').style.color = 'var(--muted-text)';
-  $('testEmailStatus').textContent = '发送中...';
-
-  fetch('/testEmail').then(r => {
-    if (!r.ok) return r.text().then(t => { throw new Error(t); });
-    let attempts = 0;
-    const poll = setInterval(() => {
-      attempts++;
-      fetch('/testEmailResult').then(r => r.text()).then(result => {
-        if (result === 'pending') return; 
-        clearInterval(poll);
-        if (result === 'ok') {
-          $('testEmailStatus').style.color = 'var(--green-color)';
-          $('testEmailStatus').textContent = '✓ 发送成功';
-        } else {
-          $('testEmailStatus').style.color = 'var(--red-color)';
-          $('testEmailStatus').textContent = '✗ ' + result.replace('fail:', '');
-        }
-      });
-      if (attempts > 30) { 
-        clearInterval(poll);
-        $('testEmailStatus').style.color = 'var(--warning-color)';
-        $('testEmailStatus').textContent = '⚠ 超时，请查收邮件确认';
-      }
-    }, 2000); 
-  }).catch(e => {
-    $('testEmailStatus').style.color = 'var(--red-color)';
-    $('testEmailStatus').textContent = '✗ 请求出错: ' + e;
-  });
-}
-
-function saveEmailConfig(){
-  const host=$('smtpHost').value;
-  const port=$('smtpPort').value;
-  const user=$('authEmail').value;
-  const pass=$('authPass').value;
-  const to=$('recvEmail').value;
-  const url = `/setEmail?host=${encodeURIComponent(host)}&port=${port}&user=${encodeURIComponent(user)}&pass=${encodeURIComponent(pass)}&to=${encodeURIComponent(to)}`;
-  fetch(url).then(r=>{if(r.ok){alert('邮件配置已保存! 以后将发送通知至: '+to);$('dispRecvEmail').textContent = to;} else { alert('保存失败!'); }}).catch(e=>alert('请求出错: '+e));
-}
-$('relayBtn').addEventListener('click',()=>{const newState=$('relayBtn').classList.contains('on');fetch('/setRelay?state='+(newState?'1':'0')).then(()=>setTimeout(fetchData,200))});
-$('otaForm').addEventListener('submit', function(e){$('otaUi').style.display='none';$('otaStatus').innerHTML='<h4>正在上传并更新...</h4><p>请勿关闭此页面或断开设备电源。设备将在大约一分钟后自动重启。</p>';});
-
-async function initChart(){
-  const chartDom = $('voltageChart');
-  echartInstance = echarts.init(chartDom);
-  echartInstance.showLoading({ text: '正在加载历史数据...' });
-  try {
-    const chartData = await fetchJson('/getChartData');
-    const option={
-      tooltip:{
-        trigger:'axis',
-        formatter: function(params){
-          const point = params[0];
-          if (point.value === null || point.value === '-') return null;
-          const dataIndex = point.dataIndex;
-          const voltage = parseFloat(point.value).toFixed(2);
-          const minutesAgo = (chartData.data.length - 1 - dataIndex) * DATA_INTERVAL_MIN;
-          
-          let now = new Date();
-          if (latestDeviceTimeStr !== "--:--:--") {
-            const timeParts = latestDeviceTimeStr.split(':');
-            now.setHours(timeParts[0], timeParts[1], timeParts[2]);
-          }
-          now.setMinutes(now.getMinutes() - minutesAgo);
-          const historicalDate = `${now.getFullYear()}-${(now.getMonth()+1).toString().padStart(2,'0')}-${now.getDate().toString().padStart(2,'0')}`;
-          const historicalTime = `${now.getHours().toString().padStart(2,'0')}:${now.getMinutes().toString().padStart(2,'0')}`;
-          
-          return `${historicalDate} ${historicalTime}<br/>电压: <strong>${voltage} V</strong>`;
-        }
-      },
-      grid:{left:'8%',right:'4%',bottom:'10%',containLabel:false},
-      xAxis:{type:'category',boundaryGap:false,data:chartData.labels,axisLine:{lineStyle:{color:'var(--muted-text)'}},axisTick:{show:false}},
-      yAxis:{type:'value',name:'电压 (V)',nameTextStyle:{color:'var(--muted-text)',padding:[0,0,0,35]},min:'dataMin',max:'dataMax',axisLine:{show:true,lineStyle:{color:'var(--muted-text)'}},splitLine:{lineStyle:{color:'rgba(255,255,255,0.1)'}}},
-      series:[{name:'电压',type:'line',smooth:true,connectNulls:false,data:chartData.data,symbol:'none',areaStyle:{color:new echarts.graphic.LinearGradient(0,0,0,1,[{offset:0,color:'rgba(56,189,248,0.5)'},{offset:1,color:'rgba(56,189,248,0.1)'}])},lineStyle:{color:'var(--accent-color)'}}]
-    };
-    echartInstance.hideLoading();
-    echartInstance.setOption(option);
-    window.addEventListener('resize',()=>echartInstance.resize());
-  } catch (error) { echartInstance.hideLoading(); console.error(error); }
-}
-async function updateChart(){ if(!echartInstance)return; try { const chartData=await fetchJson('/getChartData'); echartInstance.setOption({xAxis:{data:chartData.labels},series:[{data:chartData.data}]}); } catch(e){} }
-
-document.addEventListener('DOMContentLoaded', (event) => { fetchInitialState(); fetchData(); initChart(); });
-setInterval(fetchData,5000); setInterval(updateChart,120000);
-
-function saveNotifyConfig() {
-  const url = $('notifyApi').value.trim();
-
-  if (!url.startsWith('http://') && !url.startsWith('https://')) {
-    $('notifyStatus').style.color = 'var(--red-color)';
-    $('notifyStatus').textContent = 'API 地址格式错误';
-    return;
-  }
-
-  fetch('/setNotifyApi?url=' + encodeURIComponent(url))
-    .then(r => {
-      if (!r.ok) {
-        return r.text().then(t => {
-          throw new Error(t);
-        });
-      }
-
-      $('notifyStatus').style.color = 'var(--green-color)';
-      $('notifyStatus').textContent = '✓ API 配置已保存';
-    })
-    .catch(e => {
-      $('notifyStatus').style.color = 'var(--red-color)';
-      $('notifyStatus').textContent = '✗ 保存失败: ' + e;
-    });
-}
-
-</script>
-</body></html>
-)HTML";
-
+// 首页 HTML/JavaScript 模板已移至 main_html.h，避免 Arduino .ino 预处理误解析。
 
 const char OTA_SUCCESS_HTML[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><title>更新成功</title><style>body{background-color:#111827;color:#d1d5db;font-family:system-ui;text-align:center;padding-top:50px;}div{background-color:#1f2937;padding:30px;border-radius:12px;display:inline-block;}h1{color:#22c55e;}</style></head><body><div><h1>更新成功!</h1><p>设备正在重启，请在约1分钟后重新连接。</p></div></body></html>)HTML";
 const char OTA_FAIL_HTML[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><title>更新失败</title><style>body{background-color:#111827;color:#d1d5db;font-family:system-ui;text-align:center;padding-top:50px;}div{background-color:#1f2937;padding:30px;border-radius:12px;display:inline-block;}h1{color:#ef4444;}</style></head><body><div><h1>更新失败!</h1><p>请检查上传的固件文件(.bin)是否正确，然后返回重试。</p></div></body></html>)HTML";
@@ -401,7 +282,7 @@ void sendEmailNotification(String subject, String message) {
   email.subject = subject;
   email.addRecipient(F("User"), recipient_email.c_str());
   
-  String htmlMsg = "<h2>" + subject + "</h2><p>" + message + "</p><p>设备名称: " + String(deviceName) + "</p><p>当前时间: " + timeClient.getFormattedTime() + "</p>";
+  String htmlMsg = "<h2>" + subject + "</h2><p>" + message + "</p><p>设备名称: " + String(deviceName) + "</p><p>当前时间: " + getDeviceFormattedTime() + "</p>";
   email.html.content = htmlMsg;
   email.html.transfer_encoding = Content_Transfer_Encoding::enc_base64;
 
@@ -481,6 +362,7 @@ void recordVoltageHistory() {
     voltage = ina219.getBusVoltage_V();
     if (voltage < 0.1) voltage = 0.0;
   }
+
   File vlogFile = LittleFS.open(VLOG_FILE_PATH, "r+");
   if (!vlogFile) return;
   vlogFile.seek(sizeof(int) + (historyIndex * sizeof(float)), SeekSet);
@@ -492,12 +374,22 @@ void recordVoltageHistory() {
 }
 
 void setRelay(bool state) {
+  // 先更新 RTC 快速备份和 GPIO，再写 NVS/LittleFS；软重启时可在 setup 最早阶段恢复。
   relayState = state;
+  relayRtcStateValue = state ? 1U : 0U;
+  relayRtcStateMagic = RELAY_RTC_MAGIC;
   digitalWrite(RELAY_PIN, relayState ? HIGH : LOW);
-  sysLogf(LOG_INFO, "继电器 -> %s  电压=%.2fV  堆=%uB",   
-    state ? "ON" : "OFF", busVoltage, ESP.getFreeHeap());
-  File f = LittleFS.open("/relay.txt", "w");
+
+  if (relayPreferencesReady) {
+    relayPreferences.putBool("state", state);
+    relayPreferences.putBool("has_state", true);
+    relayPreferences.putBool("booted", true);
+  }
+
+  File f = LittleFS.open(RELAY_STATE_PATH, "w");
   if (f) { f.print(state ? "1" : "0"); f.close(); }
+  sysLogf(LOG_INFO, "继电器 -> %s  电压=%.2fV  堆=%uB",
+    state ? "ON" : "OFF", busVoltage, ESP.getFreeHeap());
 }
 
 void checkVoltageProtection() {
@@ -548,14 +440,6 @@ void checkVoltageProtection() {
     setRelay(false);
   }
 
-  if (busVoltage > 0.1 && busVoltage < REBOOT_VOLTAGE_THRESHOLD) {
-    if (lowVoltageRebootTimer == 0) lowVoltageRebootTimer = millis();
-    else if (millis() - lowVoltageRebootTimer > REBOOT_TIMER_DURATION_MS) {
-      delay(100); ESP.restart();
-    }
-  } else {
-    lowVoltageRebootTimer = 0;
-  }
   lastBusVoltage = busVoltage;
 }
 
@@ -608,13 +492,12 @@ void handleRoot() {
 
 void handleGetData() {
   if (ina219_ok) busVoltage = ina219.getBusVoltage_V();
-  // timeClient.update();
   long remaining_min = isLockedOut ? (LOCKOUT_DURATION_MS - (millis() - lockoutStartTime)) / 60000 : 0;
   
   String json = "{";
   json += "\"voltage\":" + String(busVoltage, 2) + ",";
   json += "\"relay\":" + String(relayState ? "true" : "false") + ",";
-  json += "\"time\":\"" + timeClient.getFormattedTime() + "\",";
+  json += "\"time\":\"" + getDeviceFormattedTime() + "\",";
   json += "\"lockout\":" + String(isLockedOut ? "true" : "false") + ",";
   json += "\"lockout_rem\":" + String(remaining_min) + ",";
   json += "\"voltage_warning\":" + String(isVoltageWarning ? "true" : "false");
@@ -682,60 +565,174 @@ void handleSetEmail() {
 }
 
 void handleGetChartData() {
-  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
-  server.send(200, "application/json", "");
+  // 先顺序读取到 RAM，再生成较小的 JSON；避免在 HTTP 请求中逐点 seek 文件。
   File vlogFile = LittleFS.open(VLOG_FILE_PATH, "r");
-  if (!vlogFile) { server.sendContent("{}"); return; }
-  
-  int savedIndex; vlogFile.read((byte*)&savedIndex, sizeof(int));
-  server.sendContent("{\"labels\":[");
-  for (int i = 0; i < DATA_POINTS; i++) {
-    server.sendContent(i == DATA_POINTS - 1 ? "\"Now\"" : ((DATA_POINTS-1-i)%180==0 ? ("\"-"+String((DATA_POINTS-1-i)/60)+"h\"") : "\"\""));
-    if (i < DATA_POINTS - 1) server.sendContent(",");
+  if (!vlogFile || vlogFile.size() < (size_t)(sizeof(int) + DATA_POINTS * sizeof(float))) {
+    if (vlogFile) vlogFile.close();
+    server.send(503, "application/json", "{\"labels\":[],\"data\":[]}");
+    return;
   }
-  server.sendContent("],\"data\":[");
-  float voltage;
-  for (int i = 0; i < DATA_POINTS; i++) {
-    int curr = (savedIndex + i) % DATA_POINTS;
-    vlogFile.seek(sizeof(int) + (curr * sizeof(float)), SeekSet);
-    vlogFile.read((byte*)&voltage, sizeof(float));
-    server.sendContent((isnan(voltage) || voltage < 0.1) ? "null" : String(voltage, 2));
-    if (i < DATA_POINTS - 1) server.sendContent(",");
+
+  int savedIndex = 0;
+  if (vlogFile.read((uint8_t*)&savedIndex, sizeof(savedIndex)) != sizeof(savedIndex)) {
+    vlogFile.close();
+    server.send(503, "application/json", "{\"labels\":[],\"data\":[]}");
+    return;
+  }
+  if (savedIndex < 0 || savedIndex >= DATA_POINTS) savedIndex = 0;
+
+  int outIndex = 0;
+  const int firstSegment = DATA_POINTS - savedIndex;
+  vlogFile.seek(sizeof(int) + (size_t)savedIndex * sizeof(float), SeekSet);
+  for (int i = 0; i < firstSegment; ++i) {
+    if (vlogFile.read((uint8_t*)&chartSnapshot[outIndex], sizeof(float)) != sizeof(float)) {
+      chartSnapshot[outIndex] = NAN;
+    }
+    ++outIndex;
+  }
+  if (savedIndex > 0) {
+    vlogFile.seek(sizeof(int), SeekSet);
+    for (int i = 0; i < savedIndex; ++i) {
+      if (vlogFile.read((uint8_t*)&chartSnapshot[outIndex], sizeof(float)) != sizeof(float)) {
+        chartSnapshot[outIndex] = NAN;
+      }
+      ++outIndex;
+    }
   }
   vlogFile.close();
-  server.sendContent("]}");
-  server.sendContent("");
+
+  // 1440 个点降采样到 288 个点（每 5 分钟一个），足够显示 24 小时趋势。
+  // 减小响应体，减少 String 拼接和 Wi-Fi 发送期间的 CPU 占用。
+  String json;
+  json.reserve(5200);
+  json += "{\"labels\":[";
+  for (int i = 0; i < CHART_POINTS; ++i) {
+    if (i) json += ',';
+    const int remaining = CHART_POINTS - 1 - i;
+    if (i == CHART_POINTS - 1) {
+      json += "\"Now\"";
+    } else if (i == 0) {
+      json += "\"-24h\"";
+    } else if (remaining % 36 == 0) { // 每 3 小时一个标签：36 点 × 5 分钟
+      char label[16];
+      snprintf(label, sizeof(label), "\"-%dh\"", remaining / 12);
+      json += label;
+    } else {
+      json += "\"\"";
+    }
+  }
+
+  json += "],\"data\":[";
+  for (int i = 0; i < CHART_POINTS; ++i) {
+    if (i) json += ',';
+    const int sampleIndex = (i + 1) * CHART_SAMPLE_STEP - 1;
+    const float voltage = chartSnapshot[sampleIndex];
+    if (isnan(voltage) || voltage < 0.1f) {
+      json += "null";
+    } else {
+      char value[16];
+      snprintf(value, sizeof(value), "%.2f", voltage);
+      json += value;
+    }
+  }
+  json += "]}";
+  server.send(200, "application/json", json);
 }
 
 // ============== SETUP ==============
 void setup() {
-  
+  bool savedRelay = false;
+  bool savedRelayAvailable = false;
+
+  // 最优先恢复 RTC 缓存的输出状态，减少软件重启后继电器重新拉高的延迟。
+  const bool rtcRelayStateValid =
+      (relayRtcStateMagic == RELAY_RTC_MAGIC && relayRtcStateValue <= 1U);
+  pinMode(RELAY_PIN, OUTPUT);
+  relayState = rtcRelayStateValid ? (relayRtcStateValue == 1U) : false;
+  digitalWrite(RELAY_PIN, relayState ? HIGH : LOW);
+  if (rtcRelayStateValid) {
+    savedRelay = relayState;
+    savedRelayAvailable = true;
+  }
+
   Serial.begin(115200);
 
-  // 1. 【修改】文件系统，若首次运行未格式化则自动格式化挂载
-  if (LittleFS.begin(true)) { 
+  relayPreferencesReady = relayPreferences.begin("relaycfg", false);
+  bool wasBootedBefore = false;
+  if (relayPreferencesReady) {
+    wasBootedBefore = relayPreferences.getBool("booted", false);
+    firstBootDetected = !wasBootedBefore;
+    if (!wasBootedBefore) relayPreferences.putBool("booted", true);
+
+    bool nvsRelay = false;
+    if (readRelayStateFromNvs(nvsRelay)) {
+      savedRelay = nvsRelay;
+      savedRelayAvailable = true;
+      // NVS 为跨断电的持久记录；若与 RTC 不同，以 NVS 为准。
+      if (!rtcRelayStateValid || relayState != nvsRelay) {
+        relayState = nvsRelay;
+        digitalWrite(RELAY_PIN, relayState ? HIGH : LOW);
+      }
+    }
+  }
+
+  if (savedRelayAvailable) {
+    firstBootDetected = false;
+    relayRtcStateValue = savedRelay ? 1U : 0U;
+    relayRtcStateMagic = RELAY_RTC_MAGIC;
+    Serial.printf("[Boot] 启动早期恢复继电器状态：%s\n", savedRelay ? "ON" : "OFF");
+  }
+
+  // 1. 文件系统：历史图表、配置与旧版本继电器状态文件。
+  bool littleFsReady = LittleFS.begin(true);
+  if (littleFsReady) {
     logBootReason();
     File vlogFile = LittleFS.open(VLOG_FILE_PATH, "r+");
     if (!vlogFile) {
       vlogFile = LittleFS.open(VLOG_FILE_PATH, "w+");
-      int initialIndex = 0; vlogFile.write((byte*)&initialIndex, sizeof(int));
-      float nan_val = NAN;
-      for (int i = 0; i < DATA_POINTS; i++) vlogFile.write((byte*)&nan_val, sizeof(float));
-      vlogFile.close();
+      if (vlogFile) {
+        int initialIndex = 0; vlogFile.write((byte*)&initialIndex, sizeof(int));
+        float nan_val = NAN;
+        for (int i = 0; i < DATA_POINTS; i++) vlogFile.write((byte*)&nan_val, sizeof(float));
+        vlogFile.close();
+      }
     } else {
       vlogFile.read((byte*)&historyIndex, sizeof(int));
       vlogFile.close();
     }
+
+    // 兼容升级前只把继电器状态存于 /relay.txt 的设备。
+    if (!savedRelayAvailable && LittleFS.exists(RELAY_STATE_PATH)) {
+      File relayFile = LittleFS.open(RELAY_STATE_PATH, "r");
+      if (relayFile) {
+        int c = relayFile.read(); relayFile.close();
+        if (c == '0' || c == '1') {
+          savedRelay = (c == '1');
+          savedRelayAvailable = true;
+          firstBootDetected = false;
+          relayState = savedRelay;
+          digitalWrite(RELAY_PIN, relayState ? HIGH : LOW);
+          relayRtcStateValue = relayState ? 1U : 0U;
+          relayRtcStateMagic = RELAY_RTC_MAGIC;
+          if (relayPreferencesReady) {
+            relayPreferences.putBool("state", savedRelay);
+            relayPreferences.putBool("has_state", true);
+            relayPreferences.putBool("booted", true);
+          }
+        }
+      }
+    }
+
     loadSettings();
-      Notify::loadConfig();
-
+    Notify::loadConfig();
+    setLocalTimezone();
+    restoreClockSnapshotIfNeeded();
+  } else {
+    Serial.println("[Boot] LittleFS 挂载失败，无法读取历史时间/旧版状态文件");
+    setLocalTimezone();
   }
-  
-  // 2. 引脚配置
-  pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, LOW); // 默认安全关闭
 
-  // 3. I2C 初始化（使用 ESP32-C3 安全引脚）
+  // 2. I2C 初始化（使用 ESP32-C3 安全引脚）
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
   if (ina219.begin()) { 
     ina219_ok = true; 
@@ -745,110 +742,38 @@ void setup() {
   // 4. 读当前电压
   if (ina219_ok) busVoltage = ina219.getBusVoltage_V();
 
-  // 5. 读上次继电器状态
-  bool savedRelay = false;
-  if (LittleFS.exists("/relay.txt")) {
-    File f = LittleFS.open("/relay.txt", "r");
-    if (f) { savedRelay = (f.read() == '1'); f.close(); }
-  }
-
-  // 6. WiFi连接
+  // 5. 非阻塞启动 Wi-Fi：不再连续等待 3×10 秒。网页服务和灯板会先启动，网络在 loop 中重连。
   WiFi.mode(WIFI_STA);
-  WiFi.setHostname(deviceName); // 【修改】ESP32 设置主机名
-  
-  wifiConnected = false;
-  const int    WIFI_MAX_RETRIES    = 3;
-  const unsigned long WIFI_TIMEOUT_MS = 10000UL; 
-  for (int attempt = 1; attempt <= WIFI_MAX_RETRIES; attempt++) {
-    Serial.printf("\n[WiFi] 第 %d/%d 次尝试连接...", attempt, WIFI_MAX_RETRIES);
-    WiFi.begin(ssid, password);
-    unsigned long t0 = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < WIFI_TIMEOUT_MS) {
-      delay(500);
-      Serial.print(".");
-    }
-    if (WiFi.status() == WL_CONNECTED) {
-      wifiConnected = true;
-      break;
-    }
-    Serial.printf(" 超时，断开重试");
-    WiFi.disconnect(true);
-    delay(1000);
+  WiFi.setHostname(deviceName);
+  WiFi.setSleep(false);
+  WiFi.setAutoReconnect(true);
+  wifiConnected = (WiFi.status() == WL_CONNECTED);
+  lastWifiAttemptMs = millis();
+  WiFi.begin(ssid, password);  // 只发起连接，不在 setup 里等待结果
+
+  // 继电器状态先于联网恢复。真正首次启动且没有历史状态时，暂时保持 OFF，给 Wi-Fi 15 秒判断窗口。
+  if (savedRelayAvailable) {
+    Serial.printf("[Boot] 启动时恢复上次继电器状态：%s\n", savedRelay ? "ON" : "OFF");
+    setRelay(savedRelay);
+  } else if (firstBootDetected) {
+    Serial.println("[Boot] 首次启动：先保持继电器 OFF，15 秒内若仍无 Wi-Fi 才默认 ON");
+    setRelay(false);
+    initialOfflineDefaultPending = true;
+    initialOfflineDefaultDeadline = millis() + 15000UL;
+  } else {
+    Serial.println("[Boot] 未发现有效历史状态且不是首次启动，默认 OFF");
+    setRelay(false);
   }
 
-  if (!wifiConnected) {
-    sysLog(LOG_WARN, "WiFi连接失败(3次)，进入停电保护：强制开启继电器");
-    Serial.println("\n[Boot] WiFi失败 → 停电保护，强制 setRelay(ON)");
-    setRelay(true);
-    timeClient.begin(); 
-    goto SETUP_NETWORK_DONE;
-  }
-
-  WiFi.setSleep(false); // 【修改】ESP32 关闭 WiFi 自动睡眠防掉线
-  WiFi.enableIPv6();  
-  ipv6Mgr.onWiFiConnected();   // 等待 RA 下发，缓存 IPv6 地址
-  sysLogf(LOG_BOOT, "WiFi已连接 IP=%s IPv6=%s", WiFi.localIP().toString().c_str(), ipv6Mgr.cached().c_str());
-
-  // 7. NTP同步
-  timeClient.begin();
-  timeClient.forceUpdate();
-  configTime(8 * 3600, 0, "ntp.aliyun.com"); 
-
-  Serial.print("[Boot] 等待NTP同步");
-  {
-    unsigned long ntpWait = millis();
-    while (time(nullptr) < 1700000000UL && millis() - ntpWait < 10000) {
-      delay(200); Serial.print(".");
-    }
-    Serial.printf(" time=%lu\n", (unsigned long)time(nullptr));
-  }
-
-  // 8.notify通知
-  server.on(
-    "/setNotifyApi",
-    HTTP_GET,
-    handleSetNotifyApi
-  );
-
-  // 9. 决策与状态恢复
-  {
-    unsigned long offlineSec = 0;
-    bool offlineTimeKnown = false;
-    if (LittleFS.exists("/heartbeat.txt")) {
-      File f = LittleFS.open("/heartbeat.txt", "r");
-      if (f) {
-        unsigned long savedTs = f.parseInt();
-        f.close();
-        time_t nowTs = time(nullptr);
-        if (nowTs > savedTs && savedTs > 1000000UL) {
-          offlineSec = (unsigned long)(nowTs - savedTs);
-          offlineTimeKnown = true;
-        }
-      }
-    }
-
-    bool bootRelayOn;
-    if (!offlineTimeKnown || offlineSec <= 10) {
-      bootRelayOn = savedRelay;
-      Serial.printf("[Boot] 崩溃重启(离线%lus) → 恢复上次: %s\n", offlineSec, savedRelay?"ON":"OFF");
-    } else if (busVoltage > warningVoltageThreshold) {
-      bootRelayOn = true;
-      Serial.printf("[Boot] 正常重启(离线%lus), %.2fV > %.2fV → 强制开机\n", offlineSec, busVoltage, warningVoltageThreshold);
-    } else {
-      bootRelayOn = false;
-      Serial.printf("[Boot] 正常重启(离线%lus), %.2fV ≤ %.2fV → 强制关机\n", offlineSec, busVoltage, warningVoltageThreshold);
-    }
-    setRelay(bootRelayOn);
-
-
-  }
-
-SETUP_NETWORK_DONE:
+  // 在线/离线都注册 API 路由，不再因为启动时没网而跳过路由配置。
+  server.on("/setNotifyApi", HTTP_GET, handleSetNotifyApi);
 
   smtp.debug(1);
   smtp.callback(smtpCallback);
 
-  if (MDNS.begin(deviceName)) MDNS.addService("http", "tcp", WEB_SERVER_PORT);
+  // 其他路由与 myClock 路由统一在下方注册，最后启动 server。
+
+  // mDNS 在 Wi-Fi 真正连接后由 loop 中的连接状态处理分支启动。
 
   server.on("/", HTTP_GET, handleRoot);
   server.on("/getData", HTTP_GET, handleGetData);
@@ -886,35 +811,50 @@ SETUP_NETWORK_DONE:
   });
 
   setupLogEndpoint(server);
+  myClock.begin();               // 先注册时钟路由并初始化灯板
   server.begin();
-  myClock.begin(); 
+
+  // ESP32-C3 是单核；独立的优先级 2 灯板任务可与优先级 1 的 HTTP/控制 loop 交替运行。
+  BaseType_t matrixTaskResult = xTaskCreate(
+    matrixClockTask, "matrixClock", 4096, nullptr, 2, nullptr
+  );
+  matrixClockTaskRunning = (matrixTaskResult == pdPASS);
+  Serial.println(matrixClockTaskRunning ? "[MatrixTask] 灯板独立任务已启动" : "[MatrixTask] 创建失败，将由主 loop 刷新灯板");
+
+  Serial.println("[Recovery] 自动/手动屏幕恢复只操作外部高侧电子开关，不软件重启 ESP32。");
 }
 
 void loop() {
   unsigned long loopStart = micros(); // 记录本轮循环开始时间 (微秒)
 
+  // WebServer 仍在主 loop 顺序处理；高优先级灯板任务独立运行，不会被 HTTP 卡住。
   server.handleClient();
-  // 每 2 秒刷新一次本地时间计数（非阻塞，不走网络）
-  static unsigned long lastTimeRefresh = 0;
-  if (millis() - lastTimeRefresh >= 2000) {
-      lastTimeRefresh = millis();
-      timeClient.update(); // NTPClient 内部有 60s 冷却，实际不会每次都请求网络
+
+  // 首次启动且没有历史继电器状态时，等待 Wi-Fi 判断窗口结束；仅确认离线才默认开启。
+  if (initialOfflineDefaultPending) {
+    if (WiFi.status() == WL_CONNECTED) {
+      initialOfflineDefaultPending = false;
+      Serial.println("[Boot] Wi-Fi 在判断窗口内连接成功，首次启动继电器保持 OFF");
+      setRelay(false);
+    } else if ((int32_t)(millis() - initialOfflineDefaultDeadline) >= 0) {
+      initialOfflineDefaultPending = false;
+      if (firstBootDetected) {
+        Serial.println("[Boot] 首次启动 15 秒后仍无 Wi-Fi，按要求默认开启继电器");
+        setRelay(true);
+      }
+    }
   }
 
-  // 每小时强制 NTP 网络同步一次
-  static unsigned long lastNtpSync = 0;
-  static bool ntpSyncPending = false;
-  if (millis() - lastNtpSync >= 3600000UL) {
-      lastNtpSync = millis();
-      ntpSyncPending = true;
-  }
-  if (ntpSyncPending && WiFi.status() == WL_CONNECTED) {
-      ntpSyncPending = false;
-      timeClient.forceUpdate(); // WiFi 稳定时才执行，避免断线时阻塞
+  // 系统时钟靠硬件计时持续走时，不需要每几秒访问 NTP。每小时只在联网时重新配置后台 SNTP。
+  static unsigned long lastNtpConfig = 0;
+  if (lastNtpConfig == 0) lastNtpConfig = millis();
+  if (WiFi.status() == WL_CONNECTED && millis() - lastNtpConfig >= 3600000UL) {
+    lastNtpConfig = millis();
+    configureNetworkTimeSync(); // 后台同步，不在 loop 中等待网络响应
   }
   if (pendingTestEmail) {
     pendingTestEmail = false;
-    myClock.loop();           // 先让屏幕刷新一次再去发邮件
+    // 灯板在独立高优先级任务中刷新，不依赖邮件发送完成。
     sendEmailNotification("[测试] " + String(deviceName), "这是一封测试邮件，邮件通知功能正常。");
     testEmailResult = (smtp.statusCode() > 0 && smtp.statusCode() < 400) 
                       ? "ok" 
@@ -954,8 +894,11 @@ void loop() {
       }
   }
 
-  myClock.setBatteryVoltage(busVoltage);  
-  myClock.loop(); 
+  // 灯板更新由 matrixClockTask 独立执行，不放在可能被网络/文件操作阻塞的 loop 中。
+  if (!matrixClockTaskRunning) {
+    myClock.setBatteryVoltage(busVoltage);
+    myClock.loop();
+  }
 
   // WiFi 自动重连
   static unsigned long lastWifiCheck = 0;
@@ -969,20 +912,19 @@ void loop() {
         ntpSynced = false;
         sysLog(LOG_WARN, "WiFi断线，等待重连...");
       }
-      Serial.println("[WiFi] 未连接，尝试重连...");
-      WiFi.disconnect(true);
-      delay(200);
-      WiFi.begin(ssid, password);
+      if (millis() - lastWifiAttemptMs >= 15000UL) {
+        Serial.println("[WiFi] 未连接，非阻塞发起重连...");
+        lastWifiAttemptMs = millis();
+        WiFi.begin(ssid, password);
+      }
     } else if (!ntpSynced) {
       ntpSynced = true;
       WiFi.setSleep(false); 
       WiFi.enableIPv6();        // ← 移到这里，连上之后再启用
       ipv6Mgr.onWiFiConnected();
       sysLogf(LOG_INFO, "WiFi已连接(重连) IP=%s", WiFi.localIP().toString().c_str());
-      timeClient.begin();
-      timeClient.forceUpdate();
-      configTime(8 * 3600, 0, "ntp.aliyun.com");
-      Serial.println("[WiFi] 重连成功，NTP补同步完成");
+      configureNetworkTimeSync();
+      Serial.println("[WiFi] 重连成功，后台 NTP 校时已启动");
       if (MDNS.begin(deviceName)) MDNS.addService("http", "tcp", WEB_SERVER_PORT);
     }
     prevWifiOk = curWifiOk;
@@ -1003,11 +945,7 @@ void loop() {
   static unsigned long lastHeartbeat = 0;
   if (millis() - lastHeartbeat > 60000) {
     lastHeartbeat = millis();
-    time_t nowTs = time(nullptr);
-    if (nowTs > 1000000UL) {
-      File f = LittleFS.open("/heartbeat.txt", "w");
-      if (f) { f.print((unsigned long)nowTs); f.close(); }
-    }
+    saveClockSnapshot();
   }
 
   // 累计本轮实际工作做功时长 (微秒)
@@ -1027,7 +965,6 @@ void loop() {
     lastCpuMeasureTime = millis();
   }
 
-  // 【最核心修复】主动让出 CPU 1 毫秒，给底层 WiFi 栈和 TCP 握手留出喘息时间。
-  // 彻底解决单核高速空转导致的网络响应极度迟缓、芯片发热、以及 CPU 虚高的问题。
-  delay(5); 
+  // 主动让出 CPU，给 Wi-Fi/TCP 栈调度时间。
+  delay(5);
 }
