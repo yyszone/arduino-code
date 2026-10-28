@@ -1,23 +1,18 @@
 /**
  * ============================================================
- *  智能感应灯 v7.2 — ESP32-C3 + HC-SR501 + WS2812B (60珠)
+ *  LED 灯带控制器 v7.5 — ESP32-C3 + WS2812B (60珠)
  *
- *  v7.2 新增:
- *   [★] Light Sleep 省电模式
- *       灯灭 + WiFi断开后自动进入 Light Sleep
- *       PIR 高电平 GPIO 唤醒，唤醒延迟 < 2ms
- *       60s 定时器兜底唤醒（防止 GPIO 边沿丢失）
- *       网页可实时开关省电模式（NVS持久化）
- *       新增睡眠状态指示 + 唤醒次数统计
- *
- *  v7.1 功能全部保留:
- *   [✓] 日志写入 LittleFS 按日期分文件 / 7天轮转 / 64KB截断
- *   [✓] 所有设置 NVS 掉电永久保存
- *   [✓] 效果模式下拉 + RANDOM随机切换(30s)
- *   [✓] 三层省电 + 累计亮灯时长
- *   [✓] 日志时间戳北京时间 / NTP自动补同步
- *   [✓] IP末段暗号动画（网页按钮手动触发）
- *   [✓] 9种灯效 / OTA修复 / 双重灭灯防残留
+ *  v7.5 调整:
+ *   [✓] 移除 HC-SR501 红外人体传感器，通电后自动亮灯
+ *   [✓] 移除 Light Sleep，WiFi 保持在线，方便随时网页控制
+ *   [✓] NOTE_URL 每个北京时间自然日最多尝试写入一次
+ *       写入日期先保存至 NVS，断电/重启后仍然有效
+ *   [✓] 移除闪电/警灯/星光等强闪烁灯效，统一改为柔和渐变
+ *   [✓] 新增全局帧缓冲与约 1.2 秒灯效交叉渐变，切换更平滑
+ *   [✓] 新增慢速渐亮渐暗模式，亮度从低到高平滑变化
+ *   [✓] 保留累计亮灯时长，累计时长每5分钟保存，降低断电丢失
+ *   [✓] 网页不再提供点亮/关闭按钮，上电自动运行当前灯效
+ *   [✓] Wi-Fi连接期间灯效仍持续运行，不必等待联网才亮灯
  * ============================================================
  */
 
@@ -32,30 +27,21 @@
 #include <time.h>
 #include <math.h>
 #include <stdarg.h>
-
-// [★ v7.2] Light Sleep 所需头文件
-#include "esp_sleep.h"
-#include "driver/gpio.h"
-#include "esp_pm.h"
+#include <vector>
 
 // ==================== 用户配置区 ====================
 const char* WIFI_SSID     = "yang1234";
 const char* WIFI_PASSWORD = "y123456789";
 
-#define PIR_PIN         4
 #define NEOPIXEL_PIN    5
 #define LED_COUNT       60
 
-#define WIFI_OFF_DELAY  60000UL   // 灯灭后多久断WiFi (ms)
 #define RAND_INTERVAL   30000UL   // 随机模式切换间隔 (ms)
 #define LOG_KEEP_DAYS   7         // 保留天数
 #define LOG_MAX_BYTES   65536     // 每个日志文件上限 64KB
+#define ONSEC_SAVE_INTERVAL 300000UL // 累计亮灯时长每5分钟写入NVS
 
-// [★ v7.2] Light Sleep 配置
-#define SLEEP_TIMER_US  (60ULL * 1000000ULL)  // 最长睡60s自动唤醒一次做维护
-#define PIR_DEBOUNCE_MS 80                    // PIR唤醒后防抖等待
-
-// ---- 云端笔记 API (开机写入一次) ----
+// ---- 云端笔记 API (每个北京时间自然日最多尝试一次) ----
 #define NOTE_URL        "https://note.yysresume.work/api/note-op"
 #define NOTE_ID         "97577ea2-5ce8-43e5-83eb-8b848abdb242"
 #define NOTE_AUTH       "a_secret_fixed_token"
@@ -71,34 +57,38 @@ uint8_t  cfg_g          = 150;
 uint8_t  cfg_b          = 0;
 uint8_t  cfg_brightness = 150;
 int      cfg_mode       = 0;
-uint32_t cfg_timeout    = 15000UL;
 uint32_t stat_onSec     = 0;
-bool     cfg_sleep_en   = true;   // [★ v7.2] Light Sleep 总开关
 
 // ---- 运行时状态 ----
-bool          pirTriggered   = false;
-bool          isLightOn      = false;
+bool          isLightOn      = true;  // 通电自动亮灯，不再需要网页按钮
 bool          wifiOnline     = false;
 bool          ntpSynced      = false;
-bool          bootLogSent    = false;
-unsigned long lastMotionTime = 0;
-unsigned long lightOffTime   = 0;
+bool          routesConfigured = false;
 unsigned long lightOnStart   = 0;
+unsigned long lastOnSecSave  = 0;
 
-// [★ v7.2] Light Sleep 运行时状态
-bool          inSleepReady   = false;   // 已满足入睡条件
-uint32_t      stat_wakeCount = 0;       // 累计唤醒次数
-unsigned long lastSleepEnter = 0;       // 最近一次进入睡眠的时间戳
 
 // ---- 随机模式 ----
 int           randCurrentMode = 1;
 unsigned long lastRandSwitch  = 0;
 
-// ---- 火焰热场 ----
-static uint8_t fireHeat[LED_COUNT];
+// ---- 灯效帧缓冲：所有效果先绘制到缓冲区，再统一柔和输出 ----
+static uint32_t effectFrame[LED_COUNT];          // 当前灯效的原始帧
+static uint32_t lastShownFrame[LED_COUNT];       // 上一帧实际输出颜色
+static uint32_t transitionFromFrame[LED_COUNT];  // 灯效切换渐变的起始帧
+float effectLevel = 1.0f;                        // 单个灯效自己的亮度系数
+int activeEffectMode = -1;
+bool modeTransitionActive = false;
+unsigned long modeTransitionStarted = 0;
+#define MODE_CROSSFADE_MS 1200UL                 // 模式切换交叉渐变时长
 
 // ---- 日志文件状态 ----
 static char logCurDate[9] = {0};
+
+// NVS 中记录最近一次云端笔记请求日期，格式 YYYYMMDD
+String lastNoteAttemptDate = "";
+unsigned long lastWifiRetry = 0;
+#define WIFI_RETRY_INTERVAL 30000UL
 
 
 // ============================================================
@@ -111,10 +101,8 @@ void loadPrefs() {
   cfg_b          = prefs.getUChar("b",    0);
   cfg_brightness = prefs.getUChar("bri",  150);
   cfg_mode       = prefs.getInt  ("mode", 0);
-  cfg_timeout    = prefs.getULong("tout", 15000UL);
   stat_onSec     = prefs.getULong("ons",  0);
-  cfg_sleep_en   = prefs.getBool ("slp",  true);    // [★ v7.2]
-  stat_wakeCount = prefs.getULong("wkc",  0);       // [★ v7.2]
+  lastNoteAttemptDate = prefs.getString("noteDate", "");
   prefs.end();
 }
 
@@ -125,8 +113,6 @@ void savePrefs() {
   prefs.putUChar("b",   cfg_b);
   prefs.putUChar("bri", cfg_brightness);
   prefs.putInt  ("mode",cfg_mode);
-  prefs.putULong("tout",cfg_timeout);
-  prefs.putBool ("slp", cfg_sleep_en);   // [★ v7.2]
   prefs.end();
 }
 
@@ -136,12 +122,24 @@ void saveOnSec() {
   prefs.end();
 }
 
-// [★ v7.2] 单独持久化唤醒次数（避免频繁写全量）
-void saveWakeCount() {
-  prefs.begin("led", false);
-  prefs.putULong("wkc", stat_wakeCount);
-  prefs.end();
+// 灯带始终随设备通电运行。每5分钟把已累计秒数保存到NVS，
+// 采用增量基准，状态页显示值不会因保存操作而倒退。
+void persistOnSecondsIfDue() {
+  if (!isLightOn || lightOnStart == 0) return;
+
+  const unsigned long now = millis();
+  if (lastOnSecSave == 0) lastOnSecSave = now;
+  if (now - lastOnSecSave < ONSEC_SAVE_INTERVAL) return;
+
+  const uint32_t elapsed = (now - lightOnStart) / 1000UL;
+  if (elapsed > 0) {
+    stat_onSec += elapsed;
+    lightOnStart += (unsigned long)elapsed * 1000UL;
+    saveOnSec();
+  }
+  lastOnSecSave = now;
 }
+
 
 
 // ============================================================
@@ -312,8 +310,16 @@ void LOG(const char* fmt, ...) {
 //  工具
 // ============================================================
 void stripOff() {
+  // 使用 255 作为灯带驱动的固定亮度，实际亮度由帧缓冲统一计算，避免反复 setBrightness 造成色彩损失。
+  strip.setBrightness(255);
   strip.clear(); strip.show(); delay(2);
   strip.clear(); strip.show();
+  memset(effectFrame, 0, sizeof(effectFrame));
+  memset(lastShownFrame, 0, sizeof(lastShownFrame));
+  memset(transitionFromFrame, 0, sizeof(transitionFromFrame));
+  effectLevel = 1.0f;
+  activeEffectMode = -1;
+  modeTransitionActive = false;
 }
 
 uint32_t colorWheel(uint8_t pos) {
@@ -325,95 +331,6 @@ uint32_t colorWheel(uint8_t pos) {
 
 
 // ============================================================
-//  [★ v7.2] Light Sleep 核心函数
-// ============================================================
-
-/**
- * 配置 PIR GPIO 为唤醒源（HIGH电平触发）
- * 注意：gpio_wakeup_enable 只支持 GPIO 输入模式
- */
-void setupSleepWakeup() {
-  // 确保 PIR 引脚为输入
-  gpio_set_direction((gpio_num_t)PIR_PIN, GPIO_MODE_INPUT);
-  // HIGH 电平触发唤醒（HC-SR501 检测到人时输出 HIGH）
-  gpio_wakeup_enable((gpio_num_t)PIR_PIN, GPIO_INTR_HIGH_LEVEL);
-  esp_sleep_enable_gpio_wakeup();
-}
-
-/**
- * 进入 Light Sleep
- *  - 调用前必须已调用 setupSleepWakeup()
- *  - 同时启用定时器兜底（maxUs）防止 GPIO 电平丢失
- *  - 返回后 CPU/外设立即恢复，RAM 完整保留
- *  - 返回值: true=GPIO唤醒(PIR), false=定时器唤醒
- */
-bool doLightSleep(uint64_t maxUs = SLEEP_TIMER_US) {
-  // 确保灯带完全关闭（防止 NeoPixel 保持电流）
-  stripOff();
-
-  // 串口 flush，避免睡眠截断输出
-  Serial.flush();
-
-  // 启用定时器兜底
-  esp_sleep_enable_timer_wakeup(maxUs);
-
-  // ---- 进入 Light Sleep ----
-  lastSleepEnter = millis();
-  esp_light_sleep_start();
-  // ---- 从此处恢复，CPU 继续运行 ----
-
-  // 关闭定时器（避免影响下次睡眠）
-  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
-
-  esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
-  bool gpioWake = (cause == ESP_SLEEP_WAKEUP_GPIO);
-
-  stat_wakeCount++;
-
-  if (gpioWake) {
-    // 防抖：等待 PIR 信号稳定
-    delay(PIR_DEBOUNCE_MS);
-    bool confirmed = (digitalRead(PIR_PIN) == HIGH);
-    LOG("Light Sleep 唤醒[GPIO] PIR=%s  累计唤醒=%lu次",
-        confirmed ? "HIGH✓" : "LOW(抖动)", (unsigned long)stat_wakeCount);
-    return confirmed;
-  } else {
-    // 定时器唤醒——静默维护，不打日志（节省闪存写入）
-    return false;
-  }
-}
-
-/**
- * loop() 中调用：判断是否应该入睡，并执行睡眠循环
- * 条件：灯灭 + WiFi已断 + lightOffTime倒计时已清零 + 省电开关开
- */
-void sleepIfIdle() {
-  if (!cfg_sleep_en)    return;
-  if (isLightOn)        return;
-  if (wifiOnline)       return;
-  if (lightOffTime > 0) return;   // 仍在 WiFi 断开倒计时中
-
-  // 每次进入睡眠前记录一次（仅第一次）
-  if (!inSleepReady) {
-    inSleepReady = true;
-    LOG("进入 Light Sleep 待机，等待 PIR 唤醒...");
-    saveWakeCount();
-    setupSleepWakeup();
-  }
-
-  // 执行一次睡眠（阻塞至唤醒）
-  bool pirWoke = doLightSleep();
-
-  if (pirWoke) {
-    // PIR 确认有人 → 退出睡眠状态，由主 loop 接管点灯逻辑
-    inSleepReady = false;
-    // 不在此处点灯，让 loop 正常流程处理
-  }
-  // 定时器唤醒 → inSleepReady 保持 true，下一帧继续睡
-}
-
-
-// ============================================================
 //  IP末段暗号动画（保留功能，改为手动触发）
 // ============================================================
 void showIPLastOctet() {
@@ -421,106 +338,280 @@ void showIPLastOctet() {
   uint8_t last = ip[3];
   LOG("IP暗号: %s  末段=%d", ip.toString().c_str(), last);
 
-  strip.setBrightness(220); strip.clear();
-  for (int f=0;f<3;f++){
-    strip.fill(strip.Color(55,55,55)); strip.show(); delay(90);
-    strip.clear(); strip.show(); delay(110);
+  // 不再三次快速闪烁，改为低亮度柔和淡入。
+  strip.setBrightness(255);
+  for (int b=0; b<=90; b+=3) {
+    const uint8_t v = (uint8_t)b;
+    strip.fill(strip.Color(v, v, v));
+    strip.show();
+    delay(18);
   }
-  delay(250);
+  strip.clear(); strip.show();
+  delay(150);
 
   if (last <= LED_COUNT) {
     for (int i=0;i<(int)last;i++){
       int idx=LED_COUNT-1-i;
-      if(i>0){float f=0.55f+0.45f*((float)i/last);strip.setPixelColor(idx+1,strip.Color(0,(uint8_t)(200*f),(uint8_t)(255*f)));}
-      strip.setPixelColor(idx,strip.Color(255,255,255)); strip.show(); delay(35);
+      if(i>0){float f=0.55f+0.45f*((float)i/last);strip.setPixelColor(idx+1,strip.Color(0,(uint8_t)(105*f),(uint8_t)(145*f)));}
+      strip.setPixelColor(idx,strip.Color(105,105,105)); strip.show(); delay(35);
     }
     delay(100);
-    if(last>0){strip.setPixelColor(LED_COUNT-last,strip.Color(0,200,255));strip.show();}
+    if(last>0){strip.setPixelColor(LED_COUNT-last,strip.Color(0,95,130));strip.show();}
     LOG("  末尾%d颗亮=IP末段%d",last,last);
   } else {
     uint8_t tens=last/10,ones=last%10;
     for(int i=0;i<(int)tens;i++){
-      if(i>0){float f=0.5f+0.5f*((float)i/tens);strip.setPixelColor(i-1,strip.Color((uint8_t)(255*f),(uint8_t)(100*f),0));}
-      strip.setPixelColor(i,strip.Color(255,255,255)); strip.show(); delay(45);
+      if(i>0){float f=0.5f+0.5f*((float)i/tens);strip.setPixelColor(i-1,strip.Color((uint8_t)(130*f),(uint8_t)(50*f),0));}
+      strip.setPixelColor(i,strip.Color(105,105,105)); strip.show(); delay(45);
     }
-    for(int i=0;i<(int)tens;i++){float f=0.5f+0.5f*((float)i/tens);strip.setPixelColor(i,strip.Color((uint8_t)(255*f),(uint8_t)(100*f),0));}
+    for(int i=0;i<(int)tens;i++){float f=0.5f+0.5f*((float)i/tens);strip.setPixelColor(i,strip.Color((uint8_t)(130*f),(uint8_t)(50*f),0));}
     strip.show(); delay(400);
     for(int i=0;i<(int)ones;i++){
       int idx=LED_COUNT-1-i;
-      if(i>0)strip.setPixelColor(idx+1,strip.Color(0,200,255));
-      strip.setPixelColor(idx,strip.Color(255,255,255)); strip.show(); delay(80);
+      if(i>0)strip.setPixelColor(idx+1,strip.Color(0,95,130));
+      strip.setPixelColor(idx,strip.Color(105,105,105)); strip.show(); delay(80);
     }
-    if(ones>0){strip.setPixelColor(LED_COUNT-ones,strip.Color(0,200,255));strip.show();}
+    if(ones>0){strip.setPixelColor(LED_COUNT-ones,strip.Color(0,95,130));strip.show();}
     LOG("  头%d橙+尾%d青=%d",tens,ones,last);
   }
   delay(3000);
-  for(int b=220;b>=0;b-=6){strip.setBrightness(b);strip.show();delay(16);}
+  // 保存当前图案，并按原始像素值逐帧淡出，避免 setBrightness 反复缩放造成色彩损失。
+  uint32_t ipSnapshot[LED_COUNT];
+  for (int i = 0; i < LED_COUNT; ++i) ipSnapshot[i] = strip.getPixelColor(i);
+  for (int level = 220; level >= 0; level -= 5) {
+    const float f = (float)level / 220.0f;
+    for (int i = 0; i < LED_COUNT; ++i) {
+      const uint32_t c = ipSnapshot[i];
+      strip.setPixelColor(i,
+        (uint8_t)(((c >> 16) & 0xFF) * f),
+        (uint8_t)(((c >> 8)  & 0xFF) * f),
+        (uint8_t)(( c        & 0xFF) * f));
+    }
+    strip.show();
+    delay(16);
+  }
   strip.clear(); strip.show();
-  strip.setBrightness(cfg_brightness);
+  strip.setBrightness(255);
+  memset(effectFrame, 0, sizeof(effectFrame));
+  memset(lastShownFrame, 0, sizeof(lastShownFrame));
+  memset(transitionFromFrame, 0, sizeof(transitionFromFrame));
+  activeEffectMode = -1;
+  modeTransitionActive = false;
   LOG("IP暗号显示完毕");
 }
 
 
 // ============================================================
-//  灯效 (全部非阻塞)
+//  灯效：全部采用帧缓冲，取消闪电/警灯/星光等强闪烁效果
 // ============================================================
-void fxSolid(){strip.setBrightness(cfg_brightness);strip.fill(strip.Color(cfg_r,cfg_g,cfg_b));strip.show();}
-void fxRainbow(){static unsigned long t=0;static uint16_t j=0;if(millis()-t<18)return;t=millis();for(int i=0;i<LED_COUNT;i++)strip.setPixelColor(i,colorWheel(((i*256/LED_COUNT)+j)&255));strip.show();j=(j+1)%256;}
-void fxBreathe(){static unsigned long t=0;if(millis()-t<15)return;t=millis();float s=(exp(sin(millis()/2000.0*PI))-0.36787944f)*108.0f;strip.setBrightness(constrain((uint8_t)s,8,255));strip.fill(strip.Color(cfg_r,cfg_g,cfg_b));strip.show();}
-void fxMeteor(){
-  static unsigned long t=0;static int pos=0;if(millis()-t<22)return;t=millis();
-  for(int i=0;i<LED_COUNT;i++){uint32_t c=strip.getPixelColor(i);strip.setPixelColor(i,strip.Color(((c>>16)&0xFF)*180/255,((c>>8)&0xFF)*180/255,(c&0xFF)*180/255));}
-  for(int j=0;j<8;j++){int idx=pos-j;if(idx>=0&&idx<LED_COUNT){float f=1.0f-(float)j/8.0f;strip.setPixelColor(idx,strip.Color((uint8_t)(255*f),(uint8_t)(220*f),(uint8_t)(140*f)));}}
-  strip.show();if(++pos>=LED_COUNT+10)pos=0;
-}
-void fxFire(){
-  static unsigned long t=0;if(millis()-t<28)return;t=millis();
-  for(int i=0;i<LED_COUNT;i++)fireHeat[i]=(uint8_t)max(0,(int)fireHeat[i]-(int)random(0,(55*10/LED_COUNT)+2));
-  for(int k=LED_COUNT-1;k>=2;k--)fireHeat[k]=(fireHeat[k-1]+fireHeat[k-2]*2)/3;
-  if(random(255)<120)fireHeat[random(5)]=(uint8_t)min(255,(int)fireHeat[random(5)]+(int)random(160,255));
-  for(int i=0;i<LED_COUNT;i++){uint8_t h=fireHeat[i],r2,g2,b2;
-    if(h<85){r2=h*3;g2=0;b2=0;}else if(h<170){r2=255;g2=(h-85)*3;b2=0;}else{r2=255;g2=255;b2=(h-170)*3;}
-    strip.setPixelColor(i,strip.Color(r2,g2,b2));}strip.show();
-}
-void fxTwinkle(){
-  static unsigned long t=0;if(millis()-t<35)return;t=millis();
-  for(int i=0;i<LED_COUNT;i++){uint32_t c=strip.getPixelColor(i);strip.setPixelColor(i,strip.Color(((c>>16)&0xFF)*210/255,((c>>8)&0xFF)*210/255,(c&0xFF)*210/255));}
-  for(int k=0;k<random(2,5);k++)strip.setPixelColor(random(LED_COUNT),colorWheel(random(256)));strip.show();
-}
-void fxPolice(){
-  static unsigned long t=0;static int ph=0;if(millis()-t<75)return;t=millis();strip.clear();
-  switch(ph%4){case 0:for(int i=0;i<LED_COUNT/2;i++)strip.setPixelColor(i,strip.Color(255,0,0));break;
-    case 2:for(int i=LED_COUNT/2;i<LED_COUNT;i++)strip.setPixelColor(i,strip.Color(0,60,255));break;default:break;}
-  strip.show();ph++;
-}
-void fxChase(){
-  static unsigned long t=0;static int pos=0;if(millis()-t<38)return;t=millis();strip.clear();
-  strip.setPixelColor(pos,strip.Color(cfg_r,cfg_g,cfg_b));
-  for(int j=1;j<=8;j++){int idx=(pos-j+LED_COUNT)%LED_COUNT;float f=1.0f-(float)j/9.0f;strip.setPixelColor(idx,strip.Color((uint8_t)(cfg_r*f),(uint8_t)(cfg_g*f),(uint8_t)(cfg_b*f)));}
-  strip.show();pos=(pos+1)%LED_COUNT;
-}
-void fxLightning(){
-  static unsigned long nxt=0,fend=0;static bool act=false;unsigned long now=millis();
-  if(act){if(now<fend){strip.fill(strip.Color(180+random(75),180+random(75),255));strip.show();delay(random(8,35));strip.clear();strip.show();delay(random(4,18));}
-    else{act=false;strip.clear();strip.show();nxt=now+random(800,4000);}}
-  else if(now>=nxt){act=true;fend=now+random(120,450);}
+uint32_t scaleColor(uint32_t c, float factor) {
+  factor = constrain(factor, 0.0f, 1.0f);
+  uint8_t r = (uint8_t)(((c >> 16) & 0xFF) * factor);
+  uint8_t g = (uint8_t)(((c >> 8)  & 0xFF) * factor);
+  uint8_t b = (uint8_t)(( c        & 0xFF) * factor);
+  return strip.Color(r, g, b);
 }
 
-void runEffects(){
-  int eff=cfg_mode;
-  if(cfg_mode==9){
-    unsigned long now=millis();
-    if(now-lastRandSwitch>=RAND_INTERVAL){int nx;do{nx=random(1,9);}while(nx==randCurrentMode);randCurrentMode=nx;lastRandSwitch=now;LOG("随机切换→效果%d",randCurrentMode);}
-    eff=randCurrentMode;
+void frameFill(uint32_t c) {
+  for (int i = 0; i < LED_COUNT; ++i) effectFrame[i] = c;
+}
+
+void frameAdd(int idx, uint8_t r, uint8_t g, uint8_t b) {
+  if (idx < 0 || idx >= LED_COUNT) return;
+  uint32_t old = effectFrame[idx];
+  uint16_t nr = ((old >> 16) & 0xFF) + r;
+  uint16_t ng = ((old >> 8)  & 0xFF) + g;
+  uint16_t nb = ( old        & 0xFF) + b;
+  effectFrame[idx] = strip.Color((uint8_t)min((uint16_t)255, nr),
+                                 (uint8_t)min((uint16_t)255, ng),
+                                 (uint8_t)min((uint16_t)255, nb));
+}
+
+void renderEffectFrame() {
+  const unsigned long now = millis();
+  float blend = 1.0f;
+  bool useBlend = modeTransitionActive;
+
+  if (useBlend) {
+    float p = (float)(now - modeTransitionStarted) / (float)MODE_CROSSFADE_MS;
+    if (p >= 1.0f) {
+      modeTransitionActive = false;
+      useBlend = false;
+      blend = 1.0f;
+    } else {
+      // Smoothstep：起步和结束都更柔和，不会突然跳变。
+      p = constrain(p, 0.0f, 1.0f);
+      blend = p * p * (3.0f - 2.0f * p);
+    }
   }
-  strip.setBrightness(cfg_brightness);
-  switch(eff){case 1:fxRainbow();break;case 2:fxBreathe();break;case 3:fxMeteor();break;case 4:fxFire();break;
-    case 5:fxTwinkle();break;case 6:fxPolice();break;case 7:fxChase();break;case 8:fxLightning();break;default:fxSolid();break;}
+
+  const float scale = ((float)cfg_brightness / 255.0f) * constrain(effectLevel, 0.0f, 1.0f);
+  for (int i = 0; i < LED_COUNT; ++i) {
+    const uint32_t c = effectFrame[i];
+    int r = (int)(((c >> 16) & 0xFF) * scale);
+    int g = (int)(((c >> 8)  & 0xFF) * scale);
+    int b = (int)(( c        & 0xFF) * scale);
+
+    if (useBlend) {
+      const uint32_t from = transitionFromFrame[i];
+      r = (int)(((from >> 16) & 0xFF) + (r - (int)((from >> 16) & 0xFF)) * blend);
+      g = (int)(((from >> 8)  & 0xFF) + (g - (int)((from >> 8)  & 0xFF)) * blend);
+      b = (int)(( from        & 0xFF) + (b - (int)( from        & 0xFF)) * blend);
+    }
+
+    r = constrain(r, 0, 255); g = constrain(g, 0, 255); b = constrain(b, 0, 255);
+    strip.setPixelColor(i, (uint8_t)r, (uint8_t)g, (uint8_t)b);
+    lastShownFrame[i] = strip.Color((uint8_t)r, (uint8_t)g, (uint8_t)b);
+  }
+  strip.show();
+}
+
+void fxSolid() {
+  effectLevel = 1.0f;
+  frameFill(strip.Color(cfg_r, cfg_g, cfg_b));
+}
+
+// 1：缓慢流动的彩虹，不再快速跳色。
+void fxRainbow() {
+  static unsigned long last = 0;
+  static uint16_t phase = 0;
+  const unsigned long now = millis();
+  if (now - last >= 45) {
+    last = now;
+    phase = (phase + 1) & 0xFF;
+  }
+  effectLevel = 0.88f;
+  for (int i = 0; i < LED_COUNT; ++i) {
+    effectFrame[i] = colorWheel(((i * 256 / LED_COUNT) + phase) & 0xFF);
+  }
+}
+
+// 2：柔和呼吸，低亮度约为设定亮度的 22%，再平滑升至设定亮度。
+void fxBreathe() {
+  const float phase = (float)(millis() % 6000UL) / 6000.0f * 2.0f * PI;
+  effectLevel = 0.22f + 0.78f * (0.5f - 0.5f * cosf(phase));
+  frameFill(strip.Color(cfg_r, cfg_g, cfg_b));
+}
+
+// 3：柔和流星。长尾逐步衰减，亮度受控，不做全灯闪白。
+void fxMeteor() {
+  static unsigned long last = 0;
+  static int pos = 0;
+  const unsigned long now = millis();
+  if (now - last >= 55) {
+    last = now;
+    for (int i = 0; i < LED_COUNT; ++i) effectFrame[i] = scaleColor(effectFrame[i], 0.78f);
+    const int tail = 18;
+    for (int j = 0; j < tail; ++j) {
+      const int idx = pos - j;
+      if (idx >= 0 && idx < LED_COUNT) {
+        float f = 1.0f - (float)j / (float)tail;
+        f = f * f;
+        frameAdd(idx, (uint8_t)(155 * f), (uint8_t)(105 * f), (uint8_t)(48 * f));
+      }
+    }
+    if (++pos >= LED_COUNT + tail) pos = 0;
+  }
+  effectLevel = 0.82f;
+}
+
+// 4：平缓的暖色波动，取代随机跳变的火焰闪烁。
+void fxFire() {
+  const float t = (float)millis() / 2300.0f;
+  for (int i = 0; i < LED_COUNT; ++i) {
+    const float wave = 0.5f + 0.5f * sinf(t + i * 0.19f + 0.20f * sinf(t * 0.43f + i * 0.07f));
+    const float v = 0.22f + 0.48f * wave;  // 限制变化范围，避免突然窜亮
+    effectFrame[i] = strip.Color((uint8_t)(220 * v), (uint8_t)(78 * v), (uint8_t)(14 * v));
+  }
+  effectLevel = 0.95f;
+}
+
+// 5：整条灯带缓慢变色，不再随机闪烁星点。
+void fxColorFade() {
+  const uint8_t hue = (uint8_t)((millis() / 95UL) & 0xFF);
+  effectLevel = 0.85f;
+  frameFill(colorWheel(hue));
+}
+
+// 6：柔和暖光呼吸，固定暖白色并缓慢明暗变化，取代警灯闪烁。
+void fxWarmGlow() {
+  const float phase = (float)(millis() % 9000UL) / 9000.0f * 2.0f * PI;
+  effectLevel = 0.30f + 0.48f * (0.5f - 0.5f * cosf(phase));
+  frameFill(strip.Color(255, 145, 65));
+}
+
+// 7：长尾追光。灯珠逐渐衰减，不清屏、不硬切。
+void fxChase() {
+  static unsigned long last = 0;
+  static int pos = 0;
+  const unsigned long now = millis();
+  if (now - last >= 65) {
+    last = now;
+    for (int i = 0; i < LED_COUNT; ++i) effectFrame[i] = scaleColor(effectFrame[i], 0.82f);
+    const int tail = 18;
+    for (int j = 0; j < tail; ++j) {
+      int idx = pos - j;
+      while (idx < 0) idx += LED_COUNT;
+      float f = 1.0f - (float)j / (float)tail;
+      f = f * f;
+      frameAdd(idx, (uint8_t)(cfg_r * f), (uint8_t)(cfg_g * f), (uint8_t)(cfg_b * f));
+    }
+    pos = (pos + 1) % LED_COUNT;
+  }
+  effectLevel = 0.90f;
+}
+
+// 8：慢速渐亮渐暗（推荐）。一个完整周期 12 秒，曲线平滑，无闪烁。
+void fxSlowFade() {
+  const float phase = (float)(millis() % 12000UL) / 12000.0f * 2.0f * PI;
+  effectLevel = 0.12f + 0.88f * (0.5f - 0.5f * cosf(phase));
+  frameFill(strip.Color(cfg_r, cfg_g, cfg_b));
+}
+
+void runEffects() {
+  const unsigned long now = millis();
+  int eff = cfg_mode;
+
+  if (cfg_mode == 9) {
+    if (lastRandSwitch == 0) lastRandSwitch = now;
+    if (now - lastRandSwitch >= RAND_INTERVAL) {
+      int nx;
+      do { nx = random(1, 9); } while (nx == randCurrentMode);
+      randCurrentMode = nx;
+      lastRandSwitch = now;
+      LOG("随机平滑切换 → 效果%d", randCurrentMode);
+    }
+    eff = randCurrentMode;
+  }
+
+  if (eff < 0 || eff > 8) eff = 0;
+
+  // 任意手动切换或随机切换，先缓存上一帧，再用 1.2 秒交叉渐变进入新模式。
+  if (activeEffectMode != eff) {
+    memcpy(transitionFromFrame, lastShownFrame, sizeof(transitionFromFrame));
+    activeEffectMode = eff;
+    modeTransitionStarted = now;
+    modeTransitionActive = true;
+  }
+
+  effectLevel = 1.0f;
+  switch (eff) {
+    case 1: fxRainbow();   break;
+    case 2: fxBreathe();   break;
+    case 3: fxMeteor();    break;
+    case 4: fxFire();      break;
+    case 5: fxColorFade(); break;
+    case 6: fxWarmGlow();  break;
+    case 7: fxChase();     break;
+    case 8: fxSlowFade();  break;
+    default: fxSolid();    break;
+  }
+  renderEffectFrame();
 }
 
 
 // ============================================================
-//  HTML 控制面板  (v7.2 新增省电模式卡片)
+//  HTML 控制面板（网页手动开关灯带）
 // ============================================================
 const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
@@ -528,10 +619,10 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>感应灯控制台</title>
+<title>LED 灯带控制台</title>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Noto+Sans+SC:wght@300;500&display=swap');
-:root{--bg:#0b0d11;--card:#13161e;--border:#1f2430;--accent:#39e0ac;--warn:#ff5f5f;--text:#bec8da;--dim:#485068;--sleep:#7c3aed;}
+:root{--bg:#0b0d11;--card:#13161e;--border:#1f2430;--accent:#39e0ac;--warn:#ff5f5f;--text:#bec8da;--dim:#485068;}
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:var(--bg);color:var(--text);font-family:'Noto Sans SC',sans-serif;min-height:100vh;padding:22px 14px}
 h1{font-family:'Share Tech Mono',monospace;font-size:15px;letter-spacing:5px;text-align:center;color:var(--accent);margin-bottom:22px;text-transform:uppercase}
@@ -544,7 +635,6 @@ h1{font-family:'Share Tech Mono',monospace;font-size:15px;letter-spacing:5px;tex
 .sval{font-family:'Share Tech Mono',monospace;font-size:18px;font-weight:bold;color:var(--accent);transition:color .3s}
 .row3 .sval,.row4 .sval{font-size:12px}
 .sval.off{color:var(--warn)}
-.sval.slp{color:var(--sleep)}
 .card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:18px;margin-bottom:13px}
 .sec{font-size:10px;letter-spacing:4px;text-transform:uppercase;color:var(--dim);margin-bottom:14px}
 label{display:block;font-size:11px;color:var(--dim);letter-spacing:1px;margin:13px 0 5px;text-transform:uppercase}
@@ -560,25 +650,6 @@ input[type=file]{width:100%;padding:9px;background:#0b0d11;border:1px solid var(
 .btn-ip{width:100%;padding:11px;background:linear-gradient(135deg,#4f46e5,#7c3aed);color:#fff;border:none;border-radius:8px;font-weight:700;font-size:12px;letter-spacing:2px;cursor:pointer;margin-top:12px;font-family:'Share Tech Mono',monospace;text-transform:uppercase;transition:opacity .2s}
 .btn-ip:active{transform:scale(.98);opacity:.85}
 #om{text-align:center;margin-top:9px;font-size:12px;color:var(--dim);font-family:'Share Tech Mono',monospace;min-height:18px}
-
-/* ---- [★ v7.2] 省电模式开关 ---- */
-.sleep-row{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
-.sleep-label{font-size:12px;color:var(--text);font-family:'Noto Sans SC',sans-serif}
-.sleep-sub{font-size:10px;color:var(--dim);margin-top:2px}
-.toggle{position:relative;width:48px;height:26px;flex-shrink:0}
-.toggle input{opacity:0;width:0;height:0}
-.slider{position:absolute;inset:0;background:#1a1e28;border-radius:13px;cursor:pointer;transition:background .3s;border:1px solid var(--border)}
-.slider:before{content:'';position:absolute;width:20px;height:20px;left:2px;top:2px;background:#485068;border-radius:50%;transition:transform .3s,background .3s}
-.toggle input:checked + .slider{background:#3b1f7a;border-color:var(--sleep)}
-.toggle input:checked + .slider:before{transform:translateX(22px);background:var(--sleep);box-shadow:0 0 8px #7c3aed88}
-.sleep-stats{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px}
-.sleep-stat{background:#090b0e;border:1px solid var(--border);border-radius:8px;padding:10px;text-align:center}
-.sleep-stat .lbl{font-size:9px;letter-spacing:2px;color:var(--dim);text-transform:uppercase}
-.sleep-stat .val{font-family:'Share Tech Mono',monospace;font-size:14px;color:var(--sleep);margin-top:4px}
-.sleep-badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:10px;font-family:'Share Tech Mono',monospace;letter-spacing:1px;margin-left:8px}
-.sleep-badge.on{background:#1e1040;color:var(--sleep);border:1px solid #3b1f7a}
-.sleep-badge.off{background:#1a0a0a;color:#666;border:1px solid #2a1010}
-.sleep-note{font-size:10px;color:var(--dim);margin-top:10px;line-height:1.6;padding:8px;background:#090b0e;border-radius:6px;border-left:2px solid var(--sleep)}
 
 /* IP */
 .ileg{display:flex;justify-content:space-between;font-size:10px;color:var(--dim);letter-spacing:1px;margin-bottom:6px;font-family:'Share Tech Mono',monospace}
@@ -603,11 +674,11 @@ input[type=file]{width:100%;padding:9px;background:#0b0d11;border:1px solid var(
 </style>
 </head>
 <body>
-<h1>// LED_CTRL · v7.2</h1>
+<h1>// LED_CTRL · v7.5 AUTO ON</h1>
 
 <div class="row2">
-  <div class="sbox"><div class="slbl">PIR</div><div id="pv" class="sval off">○ 无人</div></div>
-  <div class="sbox"><div class="slbl">灯带</div><div id="lv" class="sval off">▼ 关闭</div></div>
+  <div class="sbox"><div class="slbl">灯带状态</div><div id="lv" class="sval">⚡ 自动运行</div></div>
+  <div class="sbox"><div class="slbl">启动方式</div><div class="sval">通电自动亮</div></div>
 </div>
 <div class="row4">
   <div class="sbox"><div class="slbl">运行时长</div><div id="uv" class="sval">--:--:--</div></div>
@@ -621,58 +692,23 @@ input[type=file]{width:100%;padding:9px;background:#0b0d11;border:1px solid var(
   <div class="sec">灯光控制</div>
   <label>效果模式</label>
   <select id="mode" onchange="send('mode',this.value)">
-    <option value="0">SOLID     · 常亮纯色</option>
-    <option value="1">RAINBOW   · 动态彩虹</option>
-    <option value="2">BREATHE   · 呼吸灯</option>
-    <option value="3">METEOR    · 流星雨 ✦</option>
-    <option value="4">FIRE      · 火焰 🔥</option>
-    <option value="5">TWINKLE   · 星光 ✧</option>
-    <option value="6">POLICE    · 警灯 🚨</option>
-    <option value="7">CHASE     · 追光 →</option>
-    <option value="8">LIGHTNING · 闪电 ⚡</option>
-    <option value="9" style="color:#a78bfa;font-weight:bold">✦ RANDOM  · 随机切换(30s)</option>
+    <option value="0">SOLID      · 常亮纯色</option>
+    <option value="1">RAINBOW    · 慢速彩虹流动</option>
+    <option value="2">BREATHE    · 柔和呼吸灯</option>
+    <option value="3">SOFT METEOR · 长尾柔和流星</option>
+    <option value="4">WARM WAVE  · 暖色缓慢波动</option>
+    <option value="5">COLOR FADE · 全灯慢速变色</option>
+    <option value="6">WARM GLOW  · 暖光渐亮渐暗</option>
+    <option value="7">SOFT CHASE · 柔和长尾追光</option>
+    <option value="8">SLOW FADE  · 慢速渐亮渐暗（推荐）</option>
+    <option value="9" style="color:#a78bfa;font-weight:bold">✦ RANDOM · 柔和随机切换(30s)</option>
   </select>
-  <label>颜色 <span style="font-size:10px;color:var(--dim)">(纯色/追光/呼吸有效)</span></label>
+  <label>颜色 <span style="font-size:10px;color:var(--dim)">(常亮/追光/渐亮渐暗有效)</span></label>
   <input type="color" id="clr" onchange="setColor(this.value)">
   <label>亮度 <span class="vb" id="bv">150</span></label>
   <input type="range" id="bri" min="10" max="255"
     oninput="document.getElementById('bv').innerText=this.value"
     onchange="send('brightness',this.value)">
-  <label>无人超时 <span class="vb"><span id="tv">15</span> s</span></label>
-  <input type="range" id="tout" min="1" max="300"
-    oninput="document.getElementById('tv').innerText=this.value"
-    onchange="send('timeout',this.value)">
-</div>
-
-<!-- [★ v7.2] 省电模式 -->
-<div class="card">
-  <div class="sec">省电模式
-    <span class="sleep-badge" id="slpBadge">-- --</span>
-  </div>
-  <div class="sleep-row">
-    <div>
-      <div class="sleep-label">Light Sleep 自动待机</div>
-      <div class="sleep-sub">灯灭 + WiFi断开后自动进入，PIR触发立即唤醒</div>
-    </div>
-    <label class="toggle">
-      <input type="checkbox" id="slpToggle" onchange="setSleep(this.checked)">
-      <span class="slider"></span>
-    </label>
-  </div>
-  <div class="sleep-stats">
-    <div class="sleep-stat">
-      <div class="lbl">累计唤醒</div>
-      <div class="val" id="wkc">--</div>
-    </div>
-    <div class="sleep-stat">
-      <div class="lbl">当前状态</div>
-      <div class="val" id="slpState">--</div>
-    </div>
-  </div>
-  <div class="sleep-note">
-    💡 Light Sleep 期间 CPU 暂停，RAM 保留，功耗降至 &lt;1mA（不含 PIR 模块自身 ~65µA）<br>
-    唤醒延迟 &lt;2ms，对日常使用无感知。关闭此开关将保持 WiFi 监听（~15mA）。
-  </div>
 </div>
 
 <!-- IP 暗号 -->
@@ -683,7 +719,7 @@ input[type=file]{width:100%;padding:9px;background:#0b0d11;border:1px solid var(
   <div class="iinfo" id="ii">等待连接...</div>
   <div class="irule" id="ir"></div>
   <button class="btn-ip" id="ipBtn" onclick="triggerIPAnim()">SHOW IP ANIMATION</button>
-  <div class="ip-note">▲ 点击后灯带将播放IP暗号动画（约5秒）</div>
+  <div class="ip-note">▲ 点击后灯带将以柔和亮度播放IP暗号动画（约5秒）</div>
 </div>
 
 <!-- 日志 (7天历史) -->
@@ -710,11 +746,6 @@ input[type=file]{width:100%;padding:9px;background:#0b0d11;border:1px solid var(
 <script>
 function send(k,v){fetch('/set?'+k+'='+v);}
 function setColor(c){send('color',c.substring(1));}
-function setSleep(en){
-  send('sleep', en?'1':'0');
-  document.getElementById('slpBadge').className='sleep-badge '+(en?'on':'off');
-  document.getElementById('slpBadge').innerText=en?'● ENABLED':'○ DISABLED';
-}
 function fmt(s){return[Math.floor(s/3600),Math.floor((s%3600)/60),s%60].map(n=>String(n).padStart(2,'0')).join(':');}
 function fmtDate(d){
   if(d==='boot')return '启动日志';
@@ -797,37 +828,26 @@ function initLogList(){
 let loaded=false;
 function ps(){
   fetch('/status').then(r=>r.json()).then(d=>{
-    const pv=document.getElementById('pv'),lv=document.getElementById('lv');
-    pv.innerText=d.pir?'● 有人':'○ 无人';pv.className='sval'+(d.pir?'':' off');
-    lv.innerText=d.light?'▲ 点亮':'▼ 关闭';lv.className='sval'+(d.light?'':' off');
+    const lv=document.getElementById('lv');
+    lv.innerText=d.light?'⚡ 自动运行':'等待启动';
+    lv.className='sval'+(d.light?'':' off');
     document.getElementById('uv').innerText=fmt(d.uptime);
     document.getElementById('ov').innerText=fmt(d.onSec);
-    const rv=document.getElementById('rv');rv.innerText=d.rssi+'dBm';
+    const rv=document.getElementById('rv');
+    rv.innerText=d.rssi+'dBm';
     rv.style.color=d.rssi>-65?'#39e0ac':d.rssi>-80?'#fbbf24':'#ff5f5f';
 
-    // [★ v7.2] 状态栏
     const sv=document.getElementById('sv');
-    if(d.sleeping){sv.innerText='💤 SLEEP';sv.className='sval slp';}
-    else if(d.light){sv.innerText='💡 ON';sv.className='sval';}
-    else{sv.innerText='待机';sv.className='sval off';}
-
-    // [★ v7.2] 省电模式卡片
-    document.getElementById('wkc').innerText=d.wakeCount||'0';
-    document.getElementById('slpState').innerText=d.sleeping?'💤 睡眠中':(d.sleepEn?'就绪':'已关闭');
+    if(d.light){sv.innerText='⚡ AUTO ON';sv.className='sval';}
+    else if(d.wifi){sv.innerText='在线待机';sv.className='sval';}
+    else{sv.innerText='WiFi断开';sv.className='sval off';}
 
     if(!loaded){
-      document.getElementById('bri').value=d.brightness;document.getElementById('bv').innerText=d.brightness;
-      document.getElementById('tout').value=Math.round(d.timeout/1000);document.getElementById('tv').innerText=Math.round(d.timeout/1000);
+      document.getElementById('bri').value=d.brightness;
+      document.getElementById('bv').innerText=d.brightness;
       document.getElementById('mode').value=d.mode;
       const h=n=>n.toString(16).padStart(2,'0');
       document.getElementById('clr').value='#'+h(d.r)+h(d.g)+h(d.b);
-
-      // 省电开关初始化
-      document.getElementById('slpToggle').checked=d.sleepEn;
-      const badge=document.getElementById('slpBadge');
-      badge.className='sleep-badge '+(d.sleepEn?'on':'off');
-      badge.innerText=d.sleepEn?'● ENABLED':'○ DISABLED';
-
       fetch('/ip').then(r=>r.text()).then(ip=>{const p=ip.split('.');if(p.length===4)buildIP(parseInt(p[3]));}).catch(()=>{});
       initLogList();
       loaded=true;
@@ -868,28 +888,48 @@ function doOTA(){
 
 
 // ============================================================
-//  云端笔记开机日志
+//  云端笔记日志：每个北京时间自然日最多请求一次
 // ============================================================
-void sendBootLog() {
-  if (bootLogSent) return;
-  if (!ntpSynced)  return;
-  if (WiFi.status() != WL_CONNECTED) return;
+bool saveNoteAttemptDate(const char* date) {
+  if (!prefs.begin("led", false)) return false;
+  prefs.putString("noteDate", date);
+  String saved = prefs.getString("noteDate", "");
+  prefs.end();
+  if (saved != date) return false;
+  lastNoteAttemptDate = saved;
+  return true;
+}
+
+void sendDailyNote() {
+  if (!ntpSynced || WiFi.status() != WL_CONNECTED) return;
 
   struct tm ti;
   if (!getLocalTime(&ti, 500) || ti.tm_year <= 120) return;
 
+  char today[9];
+  snprintf(today, sizeof(today), "%04d%02d%02d",
+           ti.tm_year + 1900, ti.tm_mon + 1, ti.tm_mday);
+
+  // 已经为今天预留过请求额度，断电重启后也不会重复请求。
+  if (lastNoteAttemptDate == today) return;
+
+  // 必须先把今天的日期写入 NVS，再发 HTTP 请求；严格保证最多一次尝试。
+  // 这样即使服务器已经收到请求后设备突然断电，也不会在重启后重复发送。
+  if (!saveNoteAttemptDate(today)) {
+    LOG("云端笔记日期锁保存失败，取消今日请求，避免重复写入");
+    return;
+  }
+
   char timeStr[20];
   snprintf(timeStr, sizeof(timeStr), "%04d-%02d-%02d %02d:%02d:%02d",
-           ti.tm_year+1900, ti.tm_mon+1, ti.tm_mday,
+           ti.tm_year + 1900, ti.tm_mon + 1, ti.tm_mday,
            ti.tm_hour, ti.tm_min, ti.tm_sec);
 
-  const char* modeNames[] = {"SOLID","RAINBOW","BREATHE","METEOR",
-                              "FIRE","TWINKLE","POLICE","CHASE","LIGHTNING","RANDOM"};
-  const char* modeName = (cfg_mode>=0 && cfg_mode<=9) ? modeNames[cfg_mode] : "?";
+  const char* modeNames[] = {"SOLID","RAINBOW","BREATHE","SOFT_METEOR",
+                              "WARM_WAVE","COLOR_FADE","WARM_GLOW","SOFT_CHASE","SLOW_FADE","RANDOM"};
+  const char* modeName = (cfg_mode >= 0 && cfg_mode <= 9) ? modeNames[cfg_mode] : "?";
 
   char logRow[256];
-  // 在 sendBootLog 函数中，修改 snprintf 部分：
-
   snprintf(logRow, sizeof(logRow),
     "| %s | 开机 | IP: %s | RSSI: %ddBm | 效果: %s | 累计亮灯: %lus |",
     timeStr,
@@ -903,7 +943,7 @@ void sendBootLog() {
   gmtime_r(&utcNow, &utcTm);
   char updatedAt[25];
   snprintf(updatedAt, sizeof(updatedAt), "%04d-%02d-%02dT%02d:%02d:%02dZ",
-           utcTm.tm_year+1900, utcTm.tm_mon+1, utcTm.tm_mday,
+           utcTm.tm_year + 1900, utcTm.tm_mon + 1, utcTm.tm_mday,
            utcTm.tm_hour, utcTm.tm_min, utcTm.tm_sec);
 
   char payload[450];
@@ -911,6 +951,7 @@ void sendBootLog() {
     "{\"noteId\":\"%s\",\"appendText\":\"%s\",\"updatedAt\":\"%s\"}",
     NOTE_ID, logRow, updatedAt);
 
+  LOG("开始今日云端笔记请求，日期=%s", today);
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient http;
@@ -921,10 +962,9 @@ void sendBootLog() {
 
   int code = http.POST(payload);
   if (code == 200) {
-    bootLogSent = true;
-    LOG("云端笔记写入成功 (HTTP %d)", code);
+    LOG("云端笔记写入成功 (HTTP %d)，今日不再请求", code);
   } else {
-    LOG("云端笔记写入失败 (HTTP %d)", code);
+    LOG("云端笔记请求失败 (HTTP %d)，为避免重复，今日不再重试", code);
   }
   http.end();
 }
@@ -934,37 +974,51 @@ void sendBootLog() {
 //  WiFi 工具
 // ============================================================
 bool connectWifi() {
-  if (WiFi.status() == WL_CONNECTED) return true;
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(true);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.print("连接WiFi");
-  for (int i=0; i<40 && WiFi.status()!=WL_CONNECTED; i++) { delay(250); Serial.print("."); }
-  Serial.println();
+  if (WiFi.status() != WL_CONNECTED) {
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false); // 不进入 WiFi modem sleep，保持网页控制响应
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    Serial.print("连接WiFi");
+
+    // 联网等待时继续更新灯效，保证上电后不必等 Wi-Fi 连好才亮灯。
+    const unsigned long connectStarted = millis();
+    unsigned long lastDot = connectStarted;
+    while (WiFi.status() != WL_CONNECTED && millis() - connectStarted < 10000UL) {
+      runEffects();
+      const unsigned long now = millis();
+      if (now - lastDot >= 250UL) {
+        Serial.print(".");
+        lastDot = now;
+      }
+      delay(8);
+    }
+    Serial.println();
+  }
+
   if (WiFi.status() == WL_CONNECTED) {
     configTzTime("CST-8", "pool.ntp.org", "ntp.aliyun.com", "time.asia.apple.com");
-    struct tm ti; ntpSynced = false;
-    for (int i=0; i<20; i++) {
-      if (getLocalTime(&ti,500) && ti.tm_year>120) { ntpSynced=true; break; }
-      delay(500);
+    struct tm ti;
+    ntpSynced = false;
+
+    // 最多短暂等待约4秒同步时间，期间灯效仍然持续运行。
+    const unsigned long ntpStarted = millis();
+    while (!ntpSynced && millis() - ntpStarted < 4000UL) {
+      if (getLocalTime(&ti, 50) && ti.tm_year > 120) {
+        ntpSynced = true;
+        break;
+      }
+      runEffects();
+      delay(8);
     }
     LOG("WiFi已连接 IP:%s RSSI:%ddBm NTP:%s",
         WiFi.localIP().toString().c_str(), WiFi.RSSI(),
-        ntpSynced?"已同步北京时间":"同步失败");
+        ntpSynced ? "已同步北京时间" : "同步失败，稍后补同步");
     return true;
   }
-  LOG("WiFi连接失败，离线运行");
-  return false;
-}
 
-void disconnectWifi() {
-  if (!wifiOnline) return;
-  server.stop();
-  WiFi.disconnect(true);
-  WiFi.mode(WIFI_OFF);
-  wifiOnline = false;
-  inSleepReady = false;   // [★ v7.2] 重置睡眠标志，下次进入时重新配置唤醒源
-  LOG("WiFi已断开（省电）");
+  ntpSynced = false;
+  LOG("WiFi连接失败，灯带继续运行，稍后自动重试");
+  return false;
 }
 
 
@@ -1001,23 +1055,18 @@ void setupRoutes() {
 
   server.on("/status", HTTP_GET, [](){
     uint32_t curOn = stat_onSec;
-    if (isLightOn && lightOnStart>0) curOn += (millis()-lightOnStart)/1000;
-    char buf[380];
+    if (isLightOn && lightOnStart > 0) curOn += (millis() - lightOnStart) / 1000;
+    char buf[300];
     snprintf(buf, sizeof(buf),
-      "{\"pir\":%s,\"light\":%s,\"r\":%d,\"g\":%d,\"b\":%d,"
-      "\"brightness\":%d,\"timeout\":%lu,\"mode\":%d,"
-      "\"uptime\":%lu,\"onSec\":%lu,\"rssi\":%d,"
-      "\"sleepEn\":%s,\"sleeping\":%s,\"wakeCount\":%lu}",
-      pirTriggered?"true":"false",
-      isLightOn?"true":"false",
+      "{\"light\":%s,\"r\":%d,\"g\":%d,\"b\":%d,"
+      "\"brightness\":%d,\"mode\":%d,"
+      "\"uptime\":%lu,\"onSec\":%lu,\"rssi\":%d,\"wifi\":%s}",
+      isLightOn ? "true" : "false",
       cfg_r, cfg_g, cfg_b,
-      cfg_brightness, cfg_timeout, cfg_mode,
-      millis()/1000, (unsigned long)curOn,
+      cfg_brightness, cfg_mode,
+      millis() / 1000, (unsigned long)curOn,
       (int)WiFi.RSSI(),
-      // [★ v7.2]
-      cfg_sleep_en?"true":"false",
-      inSleepReady?"true":"false",
-      (unsigned long)stat_wakeCount);
+      WiFi.status() == WL_CONNECTED ? "true" : "false");
     server.send(200, "application/json", buf);
   });
 
@@ -1031,21 +1080,12 @@ void setupRoutes() {
         if(cfg_mode!=9)cfg_mode=0;
       }
     }
-    if(server.hasArg("brightness")){cfg_brightness=constrain(server.arg("brightness").toInt(),10,255);strip.setBrightness(cfg_brightness);}
+    if(server.hasArg("brightness")){cfg_brightness=constrain(server.arg("brightness").toInt(),10,255);}
     if(server.hasArg("mode")){
       int m=server.arg("mode").toInt();
-      if(m==9&&cfg_mode!=9){lastRandSwitch=millis()-RAND_INTERVAL;randCurrentMode=random(1,9);LOG("切换至随机模式(当前效果%d)",randCurrentMode);}
+      m = constrain(m, 0, 9);
+      if(m==9&&cfg_mode!=9){lastRandSwitch=millis();randCurrentMode=random(1,9);LOG("切换至柔和随机模式(当前效果%d)",randCurrentMode);}
       cfg_mode=m;
-    }
-    if(server.hasArg("timeout"))cfg_timeout=(uint32_t)server.arg("timeout").toInt()*1000UL;
-    // [★ v7.2] 省电模式开关
-    if(server.hasArg("sleep")){
-      bool en = server.arg("sleep") == "1";
-      if(en != cfg_sleep_en){
-        cfg_sleep_en = en;
-        if(!en) inSleepReady = false;   // 关闭时清除待机状态
-        LOG("Light Sleep %s", en?"已启用":"已关闭");
-      }
     }
     savePrefs();
     server.send(200,"text/plain","OK");
@@ -1069,6 +1109,7 @@ void setupRoutes() {
   );
 
   server.begin();
+  routesConfigured = true;
   LOG("HTTP服务器已启动");
 }
 
@@ -1079,7 +1120,7 @@ void setupRoutes() {
 void setup() {
   Serial.begin(115200);
   delay(200);
-  Serial.println("\n=== 智能感应灯 v7.2 ===");
+  Serial.println("\n=== LED 灯带控制器 v7.5 自动亮灯版 ===");
 
   loadPrefs();
 
@@ -1087,26 +1128,30 @@ void setup() {
     Serial.println("⚠ LittleFS 初始化失败！");
   } else {
     Serial.printf("✅ LittleFS 就绪  已用:%uKB / 总计:%uKB\n",
-                  (unsigned)LittleFS.usedBytes()/1024,
-                  (unsigned)LittleFS.totalBytes()/1024);
+                  (unsigned)LittleFS.usedBytes() / 1024,
+                  (unsigned)LittleFS.totalBytes() / 1024);
   }
 
-  pinMode(PIR_PIN, INPUT);
-  memset(fireHeat, 0, sizeof(fireHeat));
-
+  memset(effectFrame, 0, sizeof(effectFrame));
+  memset(lastShownFrame, 0, sizeof(lastShownFrame));
+  memset(transitionFromFrame, 0, sizeof(transitionFromFrame));
   strip.begin();
-  strip.setBrightness(cfg_brightness);
+  strip.setBrightness(255);
   stripOff();
 
-  LOG("系统启动  累计亮灯=%lu秒  累计唤醒=%lu次  Light Sleep=%s",
+  // 上电即开始运行当前保存的灯效；网页不再提供点亮/关闭按钮。
+  isLightOn = true;
+  lightOnStart = millis();
+  lastOnSecSave = lightOnStart;
+  LOG("系统启动：灯带自动点亮  累计亮灯=%lu秒  最近云端笔记日期=%s",
       (unsigned long)stat_onSec,
-      (unsigned long)stat_wakeCount,
-      cfg_sleep_en ? "开" : "关");
+      lastNoteAttemptDate.length() ? lastNoteAttemptDate.c_str() : "无");
 
   wifiOnline = connectWifi();
+  lastWifiRetry = millis();
   if (wifiOnline) {
     setupRoutes();
-    sendBootLog();
+    sendDailyNote();
   }
 }
 
@@ -1117,67 +1162,46 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
+  // WiFi 断线后自动重连；不再依赖红外传感器唤醒网络。
+  if (wifiOnline && WiFi.status() != WL_CONNECTED) {
+    wifiOnline = false;
+    ntpSynced = false;
+    server.stop();
+    LOG("WiFi连接中断，将自动重连");
+  }
+
+  if (!wifiOnline && (lastWifiRetry == 0 || now - lastWifiRetry >= WIFI_RETRY_INTERVAL)) {
+    lastWifiRetry = now;
+    wifiOnline = connectWifi();
+    if (wifiOnline) {
+      if (!routesConfigured) {
+        setupRoutes();
+      } else {
+        server.begin();
+        LOG("HTTP服务器已重新启动");
+      }
+      sendDailyNote();
+    }
+  }
+
   if (wifiOnline) server.handleClient();
 
-  // NTP补同步
+  // NTP 补同步：时间恢复后检查当天的云端笔记额度。
   if (wifiOnline && !ntpSynced) {
     static unsigned long lastRetry = 0;
     if (now - lastRetry > 30000UL) {
       lastRetry = now;
       struct tm ti;
-      if (getLocalTime(&ti,1000) && ti.tm_year>120) {
+      if (getLocalTime(&ti, 1000) && ti.tm_year > 120) {
         ntpSynced = true;
         LOG("NTP补同步成功 → 北京时间");
-        sendBootLog();
+        sendDailyNote();
       }
     }
   }
 
-  // PIR 检测
-  bool newPir = (digitalRead(PIR_PIN) == HIGH);
-  if (newPir && !pirTriggered && !wifiOnline) {
-    LOG("检测到人，重连WiFi...");
-    wifiOnline = connectWifi();
-    if (wifiOnline) setupRoutes();
-  }
-  pirTriggered = newPir;
-
-  // 点灯逻辑
-  if (pirTriggered) {
-    lastMotionTime = now;
-    if (!isLightOn) {
-      isLightOn=true; lightOnStart=now;
-      inSleepReady=false;   // [★ v7.2] 唤醒后退出睡眠就绪状态
-      strip.setBrightness(cfg_brightness);
-      LOG("灯带点亮 效果=%d", cfg_mode);
-    }
-  }
-
-  // 超时灭灯
-  if (isLightOn && (now-lastMotionTime > cfg_timeout)) {
-    if (lightOnStart>0) stat_onSec += (now-lightOnStart)/1000;
-    lightOnStart=0; isLightOn=false; lightOffTime=now;
-    stripOff();
-    LOG("超时熄灯  累计亮灯=%lu秒", (unsigned long)stat_onSec);
-    saveOnSec();
-  }
-
-  // 运行灯效
+  // 灯带通电自动运行，无人体检测、手动点亮按钮或自动休眠。
   if (isLightOn) runEffects();
-
-  // WiFi 断开计时
-  if (!isLightOn && wifiOnline && lightOffTime>0 &&
-      (now-lightOffTime > WIFI_OFF_DELAY)) {
-    disconnectWifi();
-    lightOffTime=0;
-  }
-
-  // [★ v7.2] Light Sleep 入口
-  // 条件：灯灭 + WiFi已断 + 不在WiFi断开倒计时 + 开关开启
-  sleepIfIdle();
-
-  // 动态 delay（睡眠模式不走此处，已在 sleepIfIdle 阻塞）
-  if (!inSleepReady) {
-    delay((isLightOn || pirTriggered) ? 8 : 200);
-  }
+  persistOnSecondsIfDue();
+  delay(isLightOn ? 8 : 50);
 }

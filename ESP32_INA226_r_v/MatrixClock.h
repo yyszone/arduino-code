@@ -58,6 +58,12 @@ button:hover { opacity: 0.8; }
 .time-range-box { display: flex; gap: 10px; align-items: center; margin-top: 5px; }
 .time-range-box input { width: 50%; }
 .tag-night { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px; }
+.power-status { background: linear-gradient(135deg,#10231b,#111827); border: 1px solid #166534; border-radius: 10px; padding: 12px; margin: 10px 0 14px; }
+.power-status .ps-title { color:#86efac; font-size:14px; font-weight:bold; margin-bottom:8px; }
+.power-status .ps-row { display:flex; justify-content:space-between; gap:10px; padding:5px 0; font-size:12px; border-bottom:1px solid #26352c; }
+.power-status .ps-row:last-child { border-bottom:0; }
+.power-status .ps-label { color:#9ca3af; }
+.power-status .ps-value { color:#fff; text-align:right; font-weight:bold; }
 </style></head><body>
 <div class='card'>
   <h2>✨ 独立时钟控制台</h2>
@@ -169,6 +175,14 @@ button:hover { opacity: 0.8; }
 
     <!-- 灯板降压模块输入电源定时循环 -->
     <h3>⚡ 灯板降压模块硬件断电恢复（MOSFET）</h3>
+    <div class="power-status">
+      <div class="ps-title">⚡ 上次断电恢复 / ⏳ 下次恢复倒计时</div>
+      <div class="ps-row"><span class="ps-label">⚡ 上次断电恢复</span><span class="ps-value" id="pcLast">正在读取…</span></div>
+      <div class="ps-row"><span class="ps-label">⏳ 下次恢复倒计时</span><span class="ps-value" id="pcCountdown">正在读取…</span></div>
+      <div class="ps-row"><span class="ps-label">🔋 当前电压 / 周期</span><span class="ps-value" id="pcVoltage">正在读取…</span></div>
+      <div class="ps-row"><span class="ps-label">🧰 自动任务状态</span><span class="ps-value" id="pcTask">正在读取…</span></div>
+      <div class="sub-hint">此状态每秒自动更新。低于高压阈值时仍按基础周期恢复；高于阈值时才会缩短周期。</div>
+    </div>
     <label>基础恢复周期（分钟，0=关闭自动恢复）:</label>
     <input type='number' name='pc_min' min='0' max='1440' step='1' value='%PC_MIN%'>
     <div class='sub-hint'>只切断灯板降压模块输入电源，不重启 ESP32，不影响 GPIO10 控制的逆变器。建议先设 10 分钟。</div>
@@ -214,6 +228,26 @@ function toggleNightConfig(val) {
 function updatePalette(val) {
   document.getElementById('palettePrev').style.display = (val === '5') ? 'flex' : 'none';
 }
+function formatCountdown(sec) {
+  sec = Math.max(0, Number(sec) || 0);
+  var h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  return (h > 0 ? String(h).padStart(2,'0') + ':' : '') + String(m).padStart(2,'0') + ':' + String(s).padStart(2,'0');
+}
+async function refreshPowerStatus() {
+  try {
+    const r = await fetch('/clock/power-status', {cache:'no-store'});
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json();
+    document.getElementById('pcLast').textContent = d.last;
+    document.getElementById('pcCountdown').textContent = d.enabled ? (d.due ? '即将执行…' : formatCountdown(d.remaining)) : '自动恢复已关闭';
+    document.getElementById('pcVoltage').textContent = d.voltage.toFixed(2) + ' V / ' + (d.enabled ? d.effective + ' 分钟' : '未启用');
+    document.getElementById('pcTask').textContent = d.task + (d.busy ? '（执行中）' : '') + ' · 累计 ' + d.count + ' 次';
+  } catch (e) {
+    document.getElementById('pcLast').textContent = '状态读取失败';
+    document.getElementById('pcCountdown').textContent = '请刷新页面重试';
+  }
+}
+refreshPowerStatus(); setInterval(refreshPowerStatus, 1000);
 </script>
 </body></html>
 )=====";
@@ -266,7 +300,11 @@ private:
   volatile float scheduleHighVoltageThreshold = 13.0f;
   volatile int scheduleHighVoltageMultiplier = 3;
   volatile float scheduleVoltage = 0.0f;
-  volatile uint32_t lastPowerCycleMs = 0;
+  volatile uint32_t lastPowerCycleMs = 0; // 当前周期计时起点（启动/保存设置/完成恢复时更新）
+  volatile time_t lastPowerCycleEpoch = 0; // 最近一次实际断电恢复的时间戳
+  volatile uint32_t lastPowerCycleEventMs = 0; // 未校时情况下用于显示最近一次恢复是否执行过
+  volatile uint32_t powerCycleCount = 0;
+  volatile bool powerTaskStarted = false;
   volatile bool manualPowerCycleRequested = false;
   volatile bool driverRefreshRequested = false;
   volatile bool powerCycleInProgress = false;
@@ -660,7 +698,9 @@ public:
   // 定时/手动电源恢复任务。它单独运行，不在 WebServer 请求处理中 delay，
   // 因此即使网页接口处理慢，也能按周期真实切断 DC-DC 的输入正极。
   void powerCycleWorker() {
+    powerTaskStarted = true;
     Serial.println("[MatrixPowerTask] 独立硬件电源恢复任务已启动");
+    uint32_t lastStatusLogMs = 0;
     for (;;) {
       const uint32_t now = millis();
       const int baseMinutes = scheduleCycleMinutes;
@@ -672,13 +712,26 @@ public:
 
       int effectiveMinutes = baseMinutes;
       const bool highVoltage = (threshold > 0.0f && voltage >= threshold);
+      // 低于高压阈值并不会禁止自动恢复，只是使用基础周期；达到阈值才缩短周期。
       if (baseMinutes > 0 && highVoltage && multiplier > 1) {
         effectiveMinutes = baseMinutes / multiplier;
         if (effectiveMinutes < 1) effectiveMinutes = 1;
       }
 
-      const bool autoDue = (effectiveMinutes > 0) &&
-          ((uint32_t)(now - lastPowerCycleMs) >= (uint32_t)effectiveMinutes * 60000UL);
+      const uint32_t elapsedMs = (uint32_t)(now - lastPowerCycleMs);
+      const uint32_t cycleMs = (effectiveMinutes > 0) ? (uint32_t)effectiveMinutes * 60000UL : 0;
+      const bool autoDue = (cycleMs > 0) && (elapsedMs >= cycleMs);
+
+      // 每分钟记录一次调度状态，便于判断低于 13V 时为何没有执行。
+      if ((uint32_t)(now - lastStatusLogMs) >= 60000UL || lastStatusLogMs == 0) {
+        lastStatusLogMs = now;
+        const uint32_t remainMs = (cycleMs > elapsedMs) ? (cycleMs - elapsedMs) : 0;
+        Serial.printf("[MatrixPowerTask] 调度检查：电压=%.2fV，阈值=%.2fV，高压=%s，基础周期=%d分钟，实际周期=%d分钟，已计时=%lu秒，剩余=%lu秒，自动=%s，到期=%s，任务=%s\n",
+                      voltage, threshold, highVoltage ? "是" : "否", baseMinutes,
+                      effectiveMinutes, (unsigned long)(elapsedMs / 1000UL),
+                      (unsigned long)(remainMs / 1000UL), baseMinutes > 0 ? "开启" : "关闭",
+                      autoDue ? "是" : "否", powerTaskStarted ? "运行" : "未就绪");
+      }
 
       if (!powerCycleInProgress && (manualRequest || autoDue)) {
         manualPowerCycleRequested = false;
@@ -700,9 +753,14 @@ public:
         // 驱动对象只能由显示任务销毁/重建；此处仅发出请求。
         driverRefreshRequested = true;
         lastPowerCycleMs = millis();
+        const time_t completedAt = time(nullptr);
+        if (completedAt > 1000000) lastPowerCycleEpoch = completedAt;
+        lastPowerCycleEventMs = millis();
+        powerCycleCount++;
         powerCycleInProgress = false;
-        Serial.printf("[MatrixPowerTask] 电源已重新接通；等待显示任务重建驱动，heap=%u\n",
-                      (unsigned)ESP.getFreeHeap());
+        Serial.printf("[MatrixPowerTask] 断电恢复完成：电压=%.2fV，来源=%s，累计=%lu次，下一周期=%d分钟，heap=%u\n",
+                      voltage, manualRequest ? "手动" : "自动", (unsigned long)powerCycleCount,
+                      effectiveMinutes, (unsigned)ESP.getFreeHeap());
       }
 
       vTaskDelay(pdMS_TO_TICKS(100));
@@ -830,6 +888,47 @@ public:
 
       unlockState();
       webServer->send(200, "text/html", html);
+    });
+
+    // ── /clock 状态接口：供网页显示上次恢复时间与实时倒计时 ──
+    webServer->on("/clock/power-status", HTTP_GET, [this]() {
+      const uint32_t now = millis();
+      const int base = (int)scheduleCycleMinutes;
+      const float voltage = scheduleVoltage;
+      const float threshold = scheduleHighVoltageThreshold;
+      const int multiplier = constrain((int)scheduleHighVoltageMultiplier, 1, 10);
+      int effective = base;
+      const bool high = threshold > 0.0f && voltage >= threshold;
+      if (base > 0 && high && multiplier > 1) {
+        effective = base / multiplier;
+        if (effective < 1) effective = 1;
+      }
+      const uint32_t elapsed = (uint32_t)(now - lastPowerCycleMs);
+      const uint32_t cycleMs = effective > 0 ? (uint32_t)effective * 60000UL : 0;
+      const bool due = cycleMs > 0 && elapsed >= cycleMs;
+      const uint32_t remaining = cycleMs > elapsed ? (cycleMs - elapsed) / 1000UL : 0;
+      String lastText = "本次启动后尚未执行";
+      const time_t lastEpoch = lastPowerCycleEpoch;
+      const uint32_t lastEventMs = lastPowerCycleEventMs;
+      if (lastEpoch > 1000000) {
+        struct tm tmLast;
+        localtime_r(&lastEpoch, &tmLast);
+        char timeBuf[24];
+        strftime(timeBuf, sizeof(timeBuf), "%m-%d %H:%M:%S", &tmLast);
+        lastText = String(timeBuf);
+      } else if (lastEventMs > 0) {
+        lastText = "本次运行已执行（约 " + String((uint32_t)(now - lastEventMs) / 1000UL) + " 秒前）";
+      }
+      String json = "{\"last\":\"" + lastText + "\",\"enabled\":" + String(base > 0 ? "true" : "false") +
+                    ",\"due\":" + String(due ? "true" : "false") +
+                    ",\"remaining\":" + String((unsigned long)remaining) +
+                    ",\"voltage\":" + String(voltage, 2) +
+                    ",\"effective\":" + String(effective) +
+                    ",\"task\":\"" + String(powerTaskStarted ? "运行中" : "未启动") + "\"" +
+                    ",\"busy\":" + String(powerCycleInProgress ? "true" : "false") +
+                    ",\"count\":" + String((unsigned long)powerCycleCount) + "}";
+      webServer->sendHeader("Cache-Control", "no-store");
+      webServer->send(200, "application/json; charset=utf-8", json);
     });
 
     // ── 手动灯板硬件电源循环：只切断 DC-DC 输入，不重启 ESP32 ──
