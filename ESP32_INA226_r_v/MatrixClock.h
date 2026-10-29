@@ -663,6 +663,8 @@ private:
   }
 
 public:
+  void lock() { lockState(); }
+  void unlock() { unlockState(); }
   SmartMatrixClock(int pin, int powerPin, WebServer& srv) {
     clockPin = pin;
     matrixPowerPin = powerPin;
