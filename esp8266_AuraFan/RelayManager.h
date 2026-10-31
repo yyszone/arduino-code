@@ -316,14 +316,101 @@ public:
     }
 
     void setupRoutes() {
-        // ✅ 核心：保持与 Python 脚本请求的 URL 完全一致
-        server->on("/LED-Control", HTTP_GET, [this]() {
-            this->handleLedControl();
+        // =========================================================================
+        // 🌟 1. 适配 NewSwitch2400Optimized 的三大专属接口
+        // =========================================================================
+
+        // ① 清空所有任务 (/deleteAllTasks?relay=1)
+        server->on("/deleteAllTasks", [this]() {
+            this->onTimesCount = 0;
+            this->offTimesCount = 0;
+            this->saveSchedules();
+            this->server->send(200, "text/plain", "All tasks deleted successfully");
         });
-        
-        // 同时支持访问 /relay 作为别名
-        server->on("/relay", HTTP_GET, [this]() {
-            server->send(200, "text/html; charset=UTF-8", this->generatePage());
+
+        // ② 手动设置开关状态 (/setSocketTask?cmd=manual&relay=1&state=1/0)
+        server->on("/setSocketTask", [this]() {
+            String cmd = this->server->arg("cmd");
+            if (cmd == "manual" && this->server->hasArg("state")) {
+                int stateVal = this->server->arg("state").toInt();
+                this->setHardware(stateVal == 1);
+            }
+            this->server->send(200, "text/plain", "OK");
+        });
+
+        // ③ 返回插座 JSON 状态，满足 Go 代码读取 relay2 和 relay3 校验要求
+        server->on("/getSocketData", [this]() {
+            String stateStr = this->currentState ? "true" : "false";
+            String json = "{\"relay1\":" + stateStr + ",\"relay2\":" + stateStr + ",\"relay3\":" + stateStr + "}";
+            this->server->send(200, "application/json", json);
+        });
+
+        // =========================================================================
+        // 🌟 ④ 【就是漏了这里！】首页“一键切换”按钮专属接口
+        // =========================================================================
+        server->on("/relay/api/toggle", [this]() {
+            if (this->server->hasArg("state")) {
+                String s = this->server->arg("state");
+                this->setHardware(s == "1" || s == "true" || s == "on");
+            } else {
+                // 点击一键切换时，没有传参，直接状态取反（开变关，关变开）
+                this->setHardware(!this->currentState);
+            }
+            this->server->send(200, "text/plain", "OK");
+        });
+
+        // =========================================================================
+        // 🌟 2. 适配经典版 Switch2400 接口 (支持 GET 和 POST，兼容 relay 参数)
+        // =========================================================================
+        server->on("/LED-Control", [this]() {
+            String ledPwm = this->server->arg("ledPwm");
+            int ledPwmVal = ledPwm.toInt();
+            String timeParam = this->server->arg("time");
+
+            switch (ledPwmVal) {
+                case 0:
+                    if (this->offTimesCount < MAX_SCHEDULES && timeParam.length() > 0) {
+                        this->offTimes[this->offTimesCount++] = timeParam;
+                        this->saveSchedules();
+                    }
+                    break;
+                case 1:
+                    if (this->onTimesCount < MAX_SCHEDULES && timeParam.length() > 0) {
+                        this->onTimes[this->onTimesCount++] = timeParam;
+                        this->saveSchedules();
+                    }
+                    break;
+                case 2: break;
+                case 3: this->setHardware(true); break;
+                case 4: this->setHardware(false); break;
+                case 5: {
+                    int idx = -1;
+                    for (int i = 0; i < this->offTimesCount; i++) {
+                        if (this->offTimes[i] == timeParam) { idx = i; break; }
+                    }
+                    if (idx != -1) {
+                        for (int i = idx; i < this->offTimesCount - 1; i++) this->offTimes[i] = this->offTimes[i + 1];
+                        this->offTimes[--this->offTimesCount] = "";
+                        this->saveSchedules();
+                    }
+
+                    idx = -1;
+                    for (int i = 0; i < this->onTimesCount; i++) {
+                        if (this->onTimes[i] == timeParam) { idx = i; break; }
+                    }
+                    if (idx != -1) {
+                        for (int i = idx; i < this->onTimesCount - 1; i++) this->onTimes[i] = this->onTimes[i + 1];
+                        this->onTimes[--this->onTimesCount] = "";
+                        this->saveSchedules();
+                    }
+                    break;
+                }
+            }
+            this->server->send(200, "text/html; charset=UTF-8", this->generatePage());
+        });
+
+        server->on("/relay", [this]() {
+            this->server->send(200, "text/html; charset=UTF-8", this->generatePage());
         });
     }
 
