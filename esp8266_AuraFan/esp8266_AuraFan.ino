@@ -1,19 +1,17 @@
-// =======================================================================
-// = ESP8266 智能风扇 & LED & ILI9341 显示屏一体化控制器 v2.6 (单引脚简化版) =
-// =======================================================================
-//
-// 更新日志 (v2.6):
-// 1. [硬件简化] 根据用户要求，将两条60灯珠的灯带合并为一条120灯珠的
-//    长灯带，统一由 D8 引脚控制。移除了所有关于 D6 引脚的逻辑。
-// 2. [代码优化] 大幅简化了 setupLeds() 和 updateLeds() 函数，使其
-//    逻辑更清晰、效率更高。
-// 3. [功能保留] 完整保留了 v2.5 的所有功能，包括动态首页、屏幕同步等。
-//
-// 项目名称: AuraFan Display Integrator
-// =======================================================================
+// =========================================================================================
+// =          ESP8266 智能风扇 & LED & 继电器 & ILI9341 屏幕一体化控制器 v3.4              =
+// =========================================================================================
+// 项目来源: https://github.com/yyszone/arduino-code/tree/main/esp8266_AuraFan
+// 
+// 【更新日志 v3.4】:
+// 1. [杜绝欠压感] R 通道锁定 255 全满亮，彻底告别文字发暗带来的“电压不稳错觉”。
+// 2. [赛博流光色阶] 在【烈焰赤红】与【耀眼琥珀金】之间高饱和度平滑流转 (Crimson <-> Gold)。
+// 3. [2.2秒从容周期] 速度放缓，正弦平滑色相变化，优雅耐看且极其抓眼球。
+// 4. [原位微刷] 零背景开销，每 50ms 原位更新字体颜色笔画，流畅丝滑。
+// =========================================================================================
 
+#define FASTLED_INTERNAL
 
-// --- 核心库 ---
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
 #include <ESP8266mDNS.h>
@@ -22,52 +20,53 @@
 #include <SPI.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ILI9341.h>
-
-// --- C++ 标准库 ---
 #include <map>
 #include <vector>
 
-// ==================================================================
-// ==================== 用户配置 (在这里修改) =======================
-// ==================================================================
+#include "RelayManager.h"
+#include "IndexPage.h"
 
-// --- WiFi 设置 ---
+// --- 用户配置 ---
 const char* ssid = "yang1234";
 const char* password = "y123456789";
-
-// --- 设备名称 ---
 const char* deviceName = "esp8266-controller";
 
-// --- 风扇引脚 (AuraFan) ---
+// --- 引脚定义 ---
 const int PWM_PIN = 5;  // D1
 const int TACH_PIN = 4; // D2
 
-// --- ✅【重要修改】LED 灯带配置 (简化为单条) ---
 #define NUM_STRIPS 1
-#define LED_PIN    D8  // 所有灯带现在都由 D8 控制
-#define TOTAL_LEDS 120 // 两条 60 灯珠的灯带串联后的总数
+#define LED_PIN    D8  
+#define TOTAL_LEDS 120 
 
-// --- ILI9341 显示屏引脚 (已解决冲突) ---
 #define TFT_CS   D0
 #define TFT_DC   D3
 #define TFT_RST  D4
-// 硬件 SPI 引脚 (SCK=D5, MOSI=D7) 由硬件决定
 
-// ================== 配置结束, 以下代码无需修改 ==================
-
-// --- 派生配置 ---
 const int PWM_FREQUENCY = 25000;
 const int PWM_RESOLUTION = 1023;
 const bool PWM_INVERTED = false;
 CRGB leds[TOTAL_LEDS > 0 ? TOTAL_LEDS : 1];
 
-// ====================== 全局对象和变量 ======================
 ESP8266WebServer server(80);
 ESP8266HTTPUpdateServer httpUpdater;
 Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);
+RelayManager relayManager;
+
+String bootResetReason = "";
+bool lastDrawnRelayState = false;
+
+// 🌟【高亮色相流转状态机】
+bool hasOfflineAlert = false;
+String offlineIpsText = "";     
+int16_t offlineIpsX = 0;        
+int16_t offlineIpsY = 0;        
+int offlineIpsFontSize = 2;
+unsigned long lastBreathUpdate = 0;
 
 // --- AuraFan 全局变量 ---
 volatile int pulseCount = 0;
+volatile unsigned long lastTachMicros = 0;
 unsigned long lastRpmTime = 0;
 int fanSliderValue = 0;
 enum LedMode { OFF, STATIC, RAINBOW, FADE };
@@ -77,29 +76,53 @@ uint8_t gHue = 0;
 long lastLedUpdate = 0;
 int numLedsToLight = TOTAL_LEDS;
 
-// --- ILI9341 显示屏全局变量 ---
 struct LineData { String text; uint16_t color; uint8_t size; String colorHtml; };
 std::map<int, LineData> lines;
 struct ImageData { std::vector<uint16_t> pixels; int16_t width; int16_t height; int16_t y_offset; };
 ImageData image;
 bool useGBR = true;
 
-// ====================== 函数声明 ======================
-void updateLeds();
-void updateDisplay();
-uint16_t parseColor(String colorString);
-void handleRoot();
+void ICACHE_RAM_ATTR tachISR() {
+    unsigned long curMicros = micros();
+    if (curMicros - lastTachMicros > 1200) { 
+        pulseCount++;
+        lastTachMicros = curMicros;
+    }
+}
 
-// ====================== 核心功能函数 ======================
-void ICACHE_RAM_ATTR tachISR() { pulseCount++; }
-int computeRPM() { if (millis() == lastRpmTime) return 0; noInterrupts(); int pulses = pulseCount; pulseCount = 0; interrupts(); unsigned long elapsedTime = millis() - lastRpmTime; lastRpmTime = millis(); return (int)((pulses / 2.0) * 60000.0 / elapsedTime); }
+int computeRPM() {
+    if (millis() == lastRpmTime) return 0;
+    noInterrupts();
+    int pulses = pulseCount;
+    pulseCount = 0;
+    interrupts();
+    unsigned long elapsedTime = millis() - lastRpmTime;
+    lastRpmTime = millis();
+    return (int)((pulses / 2.0) * 60000.0 / elapsedTime);
+}
 
-// ✅ [修改] 简化了 updateLeds 函数，直接操作单条灯带
+String getUptime() {
+    unsigned long sec = millis() / 1000;
+    unsigned long days = sec / 86400;
+    sec %= 86400;
+    unsigned int hours = sec / 3600;
+    sec %= 3600;
+    unsigned int mins = sec / 60;
+    sec %= 60;
+
+    char buf[48];
+    if (days > 0) {
+        snprintf(buf, sizeof(buf), "%lud %02u:%02u:%02u", days, hours, mins, (unsigned int)sec);
+    } else {
+        snprintf(buf, sizeof(buf), "%02u:%02u:%02u", hours, mins, (unsigned int)sec);
+    }
+    return String(buf);
+}
+
 void updateLeds() {
     if (TOTAL_LEDS == 0 || millis() - lastLedUpdate < 20) return;
     lastLedUpdate = millis();
 
-    // 先将所有灯珠清空
     fill_solid(leds, TOTAL_LEDS, CRGB::Black);
 
     if (currentLedMode != OFF) {
@@ -108,7 +131,6 @@ void updateLeds() {
         }
         gHue++;
 
-        // 根据模式对需要点亮的灯珠应用效果
         switch (currentLedMode) {
             case STATIC:
                 fill_solid(leds, numLedsToLight, staticColor);
@@ -126,7 +148,6 @@ void updateLeds() {
         }
     }
 
-    // PWM暂停法，确保灯光和风扇无冲突
     int dutyCycle = map(fanSliderValue, 0, 255, 0, PWM_RESOLUTION);
     if (PWM_INVERTED) dutyCycle = PWM_RESOLUTION - dutyCycle;
     
@@ -135,86 +156,350 @@ void updateLeds() {
     analogWrite(PWM_PIN, dutyCycle);
 }
 
-// ====================== Web 路由处理 ======================
-void handleRoot() {
-    String html = R"HTML(
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>一体化控制器</title>
-<style>:root{--bg-start:#e0eafc;--bg-end:#cfdef3;--card-bg:rgba(255,255,255,0.65);--text:#3a3a3a;--accent:#8e44ad;--accent-dark:#592a6e;--muted:#5f6c7b;--shadow:rgba(0,0,0,0.1)}*{box-sizing:border-box}body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,'Helvetica Neue',Arial;background:linear-gradient(135deg,var(--bg-start),var(--bg-end));color:var(--text);display:flex;justify-content:center;padding:1.5rem;min-height:100vh}.container{width:100%;max-width:560px}.card{background:var(--card-bg);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);border-radius:1.25rem;padding:1.5rem;margin-bottom:1.25rem;box-shadow:0 8px 32px 0 var(--shadow);border:1px solid rgba(255,255,255,0.2)}h1,h2{margin:0 0 1rem;color:#2c3e50}h1{text-align:center;font-size:1.6rem;font-weight:600}h2{font-size:1.2rem;display:flex;align-items:center;gap:0.5rem}.label{margin:1rem 0 .5rem;font-weight:600}.value{font-feature-settings:'tnum' 1;font-weight:normal;color:var(--muted)}.slider{width:100%;-webkit-appearance:none;height:10px;background:#dcdfe4;border-radius:5px;outline:none;transition:opacity .2s}.slider::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:24px;height:24px;background:var(--accent);border-radius:50%;cursor:pointer;border:3px solid #fff;box-shadow:0 2px 5px var(--shadow)}.btn-group{display:flex;flex-wrap:wrap;gap:.75rem;margin-top:.8rem}.btn{background:var(--accent);border:none;color:#fff;padding:.8rem 1.2rem;border-radius:.75rem;font-weight:600;cursor:pointer;box-shadow:0 4px 12px rgba(142,68,173,.3);transition:all .2s ease-in-out}.btn:hover{background:var(--accent-dark);transform:translateY(-2px);box-shadow:0 6px 16px rgba(142,68,173,.35)}.btn.active{background:var(--accent-dark);box-shadow:inset 0 2px 4px rgba(0,0,0,.2)}input[type=color]{vertical-align:middle;margin-left:.5rem;width:44px;height:36px;border:1px solid #ddd;padding:2px;background-color:#fff;border-radius:.5rem;cursor:pointer}a{color:var(--accent);text-decoration:none;font-weight:600}a:hover{text-decoration:underline}
-#screen-content p{margin:8px 0; font-family:monospace; white-space:pre-wrap; font-weight:bold;}
-</style></head><body><div class="container"><h1>🦋 一体化控制器 v2.6</h1>
-)HTML";
-    html += R"HTML(<div class="card"><h2><svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg> 当前屏幕内容</h2><div id="screen-content">)HTML";
-    if (lines.empty()) {
-        html += "<p style='color:#888;'>屏幕当前无内容</p>";
+// 屏幕右下角状态角标
+void drawRelayBadge(bool state) {
+    lastDrawnRelayState = state;
+    int16_t bw = 66;
+    int16_t bh = 13;
+    int16_t bx = tft.width() - bw - 4;
+    int16_t by = tft.height() - bh - 3;
+
+    uint16_t bgColor     = state ? 0x0340 : 0x2104; 
+    uint16_t borderColor = state ? 0x07E0 : 0x7BEF; 
+    uint16_t textColor   = state ? 0x07E0 : 0xBDF7; 
+
+    tft.fillRect(bx, by, bw, bh, bgColor);
+    tft.drawRect(bx, by, bw, bh, borderColor);
+    tft.setTextSize(1);
+    tft.setTextColor(textColor, bgColor);
+    tft.setCursor(bx + 6, by + 3);
+    tft.print(state ? "RLY: ON" : "RLY: OFF");
+}
+
+// 屏幕底栏 (左侧 IP，右侧继电器)
+void drawScreenFooter() {
+    int16_t footerY = tft.height() - 19;
+    tft.drawFastHLine(0, footerY, tft.width(), 0x2124);
+    tft.fillRect(0, footerY + 1, tft.width(), 18, 0x0842);
+
+    tft.setTextSize(1);
+    tft.setTextColor(0x6BC9, 0x0842);
+    tft.setCursor(6, footerY + 5);
+    tft.print("IP:");
+    tft.setTextColor(0x5EBF, 0x0842);
+    tft.print(WiFi.localIP().toString());
+
+    drawRelayBadge(relayManager.getState());
+}
+
+void drawScreenHeader() {
+    tft.fillRect(0, 0, tft.width(), 19, 0x10A2);
+    tft.drawFastHLine(0, 19, tft.width(), 0x05BF);
+    tft.setTextSize(1);
+    tft.setTextColor(0x07FF, 0x10A2);
+    tft.setCursor(6, 6);
+    tft.print("AURAFAN MONITOR");
+    tft.setTextColor(0x07E0, 0x10A2);
+    tft.setCursor(tft.width() - 54, 6);
+    tft.print("[ONLINE]");
+}
+
+int parsePercentage(const String& str) {
+    int idx = str.indexOf('%');
+    if (idx <= 0) return -1;
+    int start = idx - 1;
+    while (start >= 0 && isDigit(str.charAt(start))) {
+        start--;
+    }
+    String numStr = str.substring(start + 1, idx);
+    if (numStr.length() > 0) {
+        int v = numStr.toInt();
+        if (v >= 0 && v <= 100) return v;
+    }
+    return -1;
+}
+
+// 提取离线 IP 尾段字符串，仅保留 "(120) (125)"
+String extractOfflineTails(const String& raw) {
+    int colonIdx = raw.indexOf(':');
+    String ipListStr = (colonIdx != -1) ? raw.substring(colonIdx + 1) : raw;
+    ipListStr.trim();
+    if (ipListStr.length() == 0) return "";
+
+    String result = "";
+    int start = 0;
+    int count = 0;
+
+    while (start < (int)ipListStr.length()) {
+        int pipeIdx = ipListStr.indexOf('|', start);
+        String item = (pipeIdx == -1) ? ipListStr.substring(start) : ipListStr.substring(start, pipeIdx);
+        item.trim();
+
+        if (item.length() > 0) {
+            int dotIdx = item.lastIndexOf('.');
+            String lastOctet = (dotIdx != -1) ? item.substring(dotIdx + 1) : item;
+            lastOctet.trim();
+            if (lastOctet.length() > 0) {
+                if (count > 0) result += " ";
+                result += "(" + lastOctet + ")";
+                count++;
+            }
+        }
+
+        if (pipeIdx == -1) break;
+        start = pipeIdx + 1;
+    }
+    return result;
+}
+
+// =========================================================================
+// 🌟【全新高亮色相流转引擎】：
+// 锁定 R=255 全满亮（绝不发暗、绝无欠压感）
+// 在【赛博赤红 (255, 20, 15)】与【耀眼金 (255, 205, 0)】之间平滑流转
+// =========================================================================
+uint16_t getBreathColor(float progress) {
+    // progress: 0.0 ~ 1.0 (正弦波驱动)
+    uint8_t r = 255;                               // 🔴 红色通道永久满亮，杜绝发暗
+    uint8_t g = 20 + (uint8_t)(185 * progress);   // 20 (烈火赤红) <--> 205 (亮金琥珀)
+    uint8_t b = (uint8_t)(15 * (1.0 - progress));  // 微量蓝光增强霓虹通透感
+
+    if (useGBR) {
+        return ((g & 0xF8) << 8) | ((b & 0xFC) << 3) | (r >> 3);
     } else {
-        for (auto const& [key, val] : lines) {
-            html += "<p style='color:" + val.colorHtml + "; font-size:" + String(val.size * 8) + "px;'>" + val.text + "</p>";
+        return tft.color565(r, g, b);
+    }
+}
+
+// 高透色彩转换
+uint16_t parseColor(String colorString) {
+    uint8_t r = 255, g = 255, b = 255;
+
+    if (colorString.equalsIgnoreCase("#0000FF") || colorString.equalsIgnoreCase("blue")) {
+        r = 60; g = 175; b = 255;
+    } else if (colorString.equalsIgnoreCase("#FF0000") || colorString.equalsIgnoreCase("red")) {
+        r = 255; g = 80; b = 80;
+    } else if (colorString.equalsIgnoreCase("#00FF00") || colorString.equalsIgnoreCase("green")) {
+        r = 52; g = 211; b = 153;
+    } else if (colorString.equalsIgnoreCase("#FFFF00") || colorString.equalsIgnoreCase("yellow")) {
+        r = 251; g = 191; b = 36;
+    } else if (colorString.equalsIgnoreCase("#FF00FF") || colorString.equalsIgnoreCase("magenta")) {
+        r = 244; g = 114; b = 182;
+    } else if (colorString.equalsIgnoreCase("#432f40")) {
+        r = 251; g = 146; b = 60;
+    } else if (colorString.startsWith("#") && colorString.length() == 7) {
+        long number = strtol(colorString.substring(1).c_str(), NULL, 16);
+        r = (number >> 16) & 0xFF;
+        g = (number >> 8) & 0xFF;
+        b = number & 0xFF;
+    }
+
+    if (useGBR) {
+        return ((g & 0xF8) << 8) | ((b & 0xFC) << 3) | (r >> 3);
+    } else {
+        return tft.color565(r, g, b);
+    }
+}
+
+// 现代化双卡片排版
+void updateDisplay() {
+    tft.fillScreen(ILI9341_BLACK);
+    drawScreenHeader();
+
+    bool isStandardDashboard = (lines.count(4) || lines.count(5) || lines.count(6));
+
+    if (isStandardDashboard) {
+        // 卡片 1: 节点与遥测区
+        tft.drawRoundRect(4, 23, tft.width() - 8, 102, 4, 0x18E3);
+        int16_t yPos = 28;
+        for (int i = 0; i <= 3; i++) {
+            if (lines.count(i)) {
+                tft.setCursor(10, yPos);
+                tft.setTextColor(lines[i].color, ILI9341_BLACK);
+                tft.setTextSize(2);
+                tft.println(lines[i].text);
+            }
+            yPos += 23;
+        }
+
+        // 卡片 2: 系统硬件资源区
+        tft.drawRoundRect(4, 131, tft.width() - 8, 164, 4, 0x18E3);
+        yPos = 139;
+
+        for (int i = 4; i <= 7; i++) {
+            if (!lines.count(i)) continue;
+
+            // 🌟 核心：OFF: 采用高对比冰蓝冷灰常亮，右侧括号部分进行金-红流光渐变
+            if (lines[i].text.startsWith("OFF:")) {
+                int totalLen = lines[i].text.length();
+                int fontSize = (totalLen > 16) ? 1 : 2;
+                offlineIpsFontSize = fontSize;
+
+                int16_t tagY = (fontSize == 1) ? (yPos + 6) : yPos;
+                tft.setTextSize(fontSize);
+
+                // 1. 固定绘制高对比冰蓝冷灰前缀 "OFF: "，沉着清晰
+                tft.setCursor(12, tagY);
+                tft.setTextColor(0xAEDC, ILI9341_BLACK); 
+                tft.print("OFF: ");
+
+                // 2. 捕获括号起始点坐标
+                offlineIpsX = tft.getCursorX();
+                offlineIpsY = tft.getCursorY();
+
+                // 3. 初始帧绘制括号内容（初值为正金）
+                tft.setTextColor(getBreathColor(1.0), ILI9341_BLACK);
+                tft.print(offlineIpsText);
+
+                yPos += 22;
+                continue;
+            }
+            
+            tft.setCursor(12, yPos);
+            tft.setTextColor(lines[i].color, ILI9341_BLACK);
+            tft.setTextSize(2);
+            tft.print(lines[i].text);
+
+            int pct = parsePercentage(lines[i].text);
+            if (pct >= 0) {
+                int16_t barX = 12;
+                int16_t barY = yPos + 19;
+                int16_t barW = tft.width() - 32;
+                int16_t barH = 5;
+                tft.fillRoundRect(barX, barY, barW, barH, 2, 0x18E3);
+
+                int16_t fillW = (barW * pct) / 100;
+                if (fillW > 0) {
+                    tft.fillRoundRect(barX, barY, fillW, barH, 2, lines[i].color);
+                }
+                yPos += 38;
+            } else {
+                yPos += 24;
+            }
+        }
+    } else {
+        int16_t yPos = 26;
+        int16_t maxY = tft.height() - 24;
+
+        for (auto& [lineNum, line] : lines) {
+            if (yPos >= maxY) break;
+            tft.setCursor(10, yPos);
+            tft.setTextColor(line.color, ILI9341_BLACK);
+            tft.setTextSize(line.size);
+            tft.println(line.text);
+            yPos += line.size * 8 + 8;
         }
     }
-    html += R"HTML(</div></div>)HTML";
-    html += R"HTML(<div class="card"><h2><svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 12c2.76 0 5-2.24 5-5s-2.24-5-5-5-5 2.24-5 5 2.24 5 5 5z"/><path d="M19.78 14.78a2.5 2.5 0 0 0-3.53 0l-1.06 1.06a2.5 2.5 0 0 1-3.53 0l-1.06-1.06a2.5 2.5 0 0 0-3.53 0l-1.06 1.06a2.5 2.5 0 0 0 0 3.53l1.06 1.06a2.5 2.5 0 0 0 3.53 0l1.06-1.06a2.5 2.5 0 0 1 3.53 0l1.06 1.06a2.5 2.5 0 0 0 3.53 0l1.06-1.06a2.5 2.5 0 0 0 0-3.53l-1.06-1.06z"/></svg>风扇控制</h2><div class="label">当前速度: <span id="spd" class="value">--</span></div><input id="fanSlider" class="slider" type="range" min="0" max="255" value="0"><div class="label">当前转速: <span id="rpm" class="value">-- RPM</span></div></div><div class="card"><h2><svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2.69l.34.34a8 8 0 0 1 0 11.32l-1.06-1.06a6 6 0 0 0 0-8.5l-1.06-1.06-1.06 1.06a6 6 0 0 0 0 8.5L10 14.83a8 8 0 0 1-11.32-11.32l.34-.34L12 15l1-1 1-1-1-1-1-1 1-1z"/></svg>灯光控制</h2><div class="btn-group"><button id="btn_static" class="btn">静态单色</button><input id="colorPicker" type="color" value="#8b00ff"><button id="btn_rainbow" class="btn">彩虹</button><button id="btn_fade" class="btn">呼吸</button><button id="btn_off" class="btn">关灯</button></div><div class="label">点亮灯珠数量: <span id="ledCountVal" class="value">--</span></div><input id="ledCountSlider" class="slider" type="range" min="0" max="120" value="120"></div><div class="card"><h2><svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>系统管理</h2><div style="line-height:1.6"><p style="margin:4px 0">设备 IP: <strong id="ipAddr">...</strong></p><p style="margin:4px 0">点击 <a href="/update">这里</a> 进入固件更新页面。</p></div></div></div>)HTML";
-    html += R"HTML(<script>const spdEl=document.getElementById('spd'),rpmEl=document.getElementById('rpm'),fanSlider=document.getElementById('fanSlider'),ipAddrEl=document.getElementById('ipAddr'),colorPicker=document.getElementById('colorPicker'),btnStatic=document.getElementById('btn_static'),btnRainbow=document.getElementById('btn_rainbow'),btnFade=document.getElementById('btn_fade'),btnOff=document.getElementById('btn_off'),allBtns=[btnStatic,btnRainbow,btnFade,btnOff],ledCountSlider=document.getElementById('ledCountSlider'),ledCountVal=document.getElementById('ledCountVal');function setFanLabel(v){const p=Math.round(v/255*100);spdEl.textContent=`${v} (${p}%)`}function updateButtonState(activeMode){allBtns.forEach(btn=>{btn.id===`btn_${activeMode}`?btn.classList.add('active'):btn.classList.remove('active')})}fanSlider.addEventListener('input',()=>{const v=fanSlider.value;setFanLabel(v);fetch(`/setSpeed?value=${v}`).catch(console.error)});ledCountSlider.addEventListener('input',()=>{const v=ledCountSlider.value;ledCountVal.textContent=v;fetch(`/setActiveLeds?value=${v}`).catch(console.error)});colorPicker.addEventListener('input',()=>{const hex=colorPicker.value;const r=parseInt(hex.slice(1,3),16),g=parseInt(hex.slice(3,5),16),b=parseInt(hex.slice(5,7),16);fetch(`/setRGB?r=${r}&g=${g}&b=${b}`).then(()=>updateButtonState('static')).catch(console.error)});btnStatic.onclick=()=>{colorPicker.dispatchEvent(new Event('input'))};btnRainbow.onclick=()=>{fetch('/setLedMode?mode=rainbow').then(()=>updateButtonState('rainbow')).catch(console.error)};btnFade.onclick=()=>{fetch('/setLedMode?mode=fade').then(()=>updateButtonState('fade')).catch(console.error)};btnOff.onclick=()=>{fetch('/setLedMode?mode=off').then(()=>updateButtonState('off')).catch(console.error)};function fetchAllState(){fetch('/getState').then(r=>r.json()).then(s=>{fanSlider.value=s.fanSpeed;setFanLabel(s.fanSpeed);ipAddrEl.textContent=s.ip;const c=`#${s.ledR.toString(16).padStart(2,'0')}${s.ledG.toString(16).padStart(2,'0')}${s.ledB.toString(16).padStart(2,'0')}`;colorPicker.value=c;updateButtonState(s.ledMode);ledCountSlider.max=s.maxLeds;ledCountSlider.value=s.activeLeds;ledCountVal.textContent=s.activeLeds}).catch(console.error)}window.addEventListener('load',fetchAllState);setInterval(()=>{fetch('/getRPM').then(r=>r.text()).then(t=>{rpmEl.textContent=`${t} RPM`}).catch(console.error)},1500);</script></body></html>)HTML";
-    server.send(200, "text/html; charset=UTF-8", html);
+
+    drawScreenFooter();
 }
+
+void handleRoot() {
+    server.send_P(200, "text/html; charset=UTF-8", MAIN_PAGE_HTML);
+}
+
 void handleSetSpeed() { if (server.hasArg("value")) { fanSliderValue = server.arg("value").toInt(); server.send(200, "text/plain", "OK"); } else { server.send(400, "text/plain", "Bad Request"); }}
 void handleGetRPM() { server.send(200, "text/plain", String(computeRPM())); }
+void handleGetUptime() { server.send(200, "text/plain", getUptime()); }
 void handleSetRGB() { if (server.hasArg("r") && server.hasArg("g") && server.hasArg("b")) { staticColor = CRGB(server.arg("r").toInt(), server.arg("g").toInt(), server.arg("b").toInt()); currentLedMode = STATIC; server.send(200, "text/plain", "OK"); } else { server.send(400, "text/plain", "Bad Request"); }}
 void handleSetActiveLeds() { if (server.hasArg("value")) { numLedsToLight = server.arg("value").toInt(); server.send(200, "text/plain", "OK"); } else { server.send(400, "text/plain", "Bad Request"); }}
 void handleSetLedMode() { if (server.hasArg("mode")) { String mode = server.arg("mode"); if (mode == "off") currentLedMode = OFF; else if (mode == "static") currentLedMode = STATIC; else if (mode == "rainbow") currentLedMode = RAINBOW; else if (mode == "fade") currentLedMode = FADE; server.send(200, "text/plain", "OK"); } else { server.send(400, "text/plain", "Bad Request"); }}
-void handleGetState() { String modeStr = "off"; if (currentLedMode == STATIC) modeStr = "static"; else if (currentLedMode == RAINBOW) modeStr = "rainbow"; else if (currentLedMode == FADE) modeStr = "fade"; String json = "{\"fanSpeed\":" + String(fanSliderValue) + ",\"ip\":\"" + WiFi.localIP().toString() + "\",\"ledMode\":\"" + modeStr + "\",\"ledR\":" + String(staticColor.r) + ",\"ledG\":" + String(staticColor.g) + ",\"ledB\":" + String(staticColor.b) + ",\"activeLeds\":" + String(numLedsToLight) + ",\"maxLeds\":" + String(TOTAL_LEDS) + "}"; server.send(200, "application/json", json); }
-void handleSetText() { lines.clear(); for (int i = 0; i < 100; i++) { String lineKey = "line" + String(i); if (server.hasArg(lineKey)) { LineData line; line.text = server.arg(lineKey); String colorKey = "color" + String(i); if(server.hasArg(colorKey)){ line.colorHtml = server.arg(colorKey); } else { line.colorHtml = "#FFFFFF"; } line.color = parseColor(line.colorHtml); int size = server.hasArg("size" + String(i)) ? server.arg("size" + String(i)).toInt() : 2; line.size = (size >= 1 && size <= 7) ? size : 2; lines[i] = line; } } updateDisplay(); server.send(200, "text/plain", "OK"); }
-void handleImage() { if (server.hasArg("width") && server.hasArg("height") && server.hasArg("data")) { int width = server.arg("width").toInt(); int height = server.arg("height").toInt(); String data = server.arg("data"); if (width > 0 && height > 0 && data.length() > 0) { image.width = width; image.height = height; image.pixels.clear(); image.pixels.reserve(width * height); for (unsigned int i = 0; i + 4 <= data.length(); i += 4) { String hexColor = data.substring(i, i + 4); image.pixels.push_back(strtoul(hexColor.c_str(), NULL, 16)); } image.y_offset = server.hasArg("y_offset") ? server.arg("y_offset").toInt() : 0; updateDisplay(); server.send(200, "text/plain", "Image OK"); } else { server.send(400, "text/plain", "Invalid image parameters"); } } else { server.send(400, "text/plain", "Image parameters missing"); } }
-void handleNotFound() { server.send(404, "text/plain", "404: Not Found"); }
 
-// ====================== 显示屏辅助函数 ======================
-void updateDisplay() {
-    tft.fillScreen(ILI9341_BLACK);
-    int16_t yPos = 20;
-    for (auto& [lineNum, line] : lines) {
-        int16_t xPos = 20;
-        tft.setCursor(xPos, yPos);
-        tft.setTextColor(line.color);
-        tft.setTextSize(line.size);
-        tft.println(line.text);
-        yPos += line.size * 6 * (tft.getRotation() % 2 == 0 ? 1 : 2) + 15;
+void handleGetState() { 
+    String modeStr = "off"; 
+    if (currentLedMode == STATIC) modeStr = "static"; 
+    else if (currentLedMode == RAINBOW) modeStr = "rainbow"; 
+    else if (currentLedMode == FADE) modeStr = "fade"; 
+
+    String json = "{";
+    json += "\"fanSpeed\":" + String(fanSliderValue) + ",";
+    json += "\"rpm\":" + String(computeRPM()) + ",";
+    json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
+    json += "\"uptime\":\"" + getUptime() + "\",";
+    json += "\"resetReason\":\"" + bootResetReason + "\",";
+    json += "\"relayState\":" + String(relayManager.getState() ? "true" : "false") + ",";
+    json += "\"ledMode\":\"" + modeStr + "\",";
+    json += "\"ledR\":" + String(staticColor.r) + ",";
+    json += "\"ledG\":" + String(staticColor.g) + ",";
+    json += "\"ledB\":" + String(staticColor.b) + ",";
+    json += "\"activeLeds\":" + String(numLedsToLight) + ",";
+    json += "\"maxLeds\":" + String(TOTAL_LEDS) + ",";
+    json += "\"lines\":[";
+    bool first = true;
+    for (auto const& [key, val] : lines) {
+        if (!first) json += ",";
+        first = false;
+        json += "{\"text\":\"" + val.text + "\",\"color\":\"" + val.colorHtml + "\",\"size\":" + String(val.size) + "}";
     }
-    if (!image.pixels.empty()) {
-        int16_t startY = yPos + image.y_offset;
-        for (int y = 0; y < image.height; y++) {
-            for (int x = 0; x < image.width; x++) {
-                if (x < tft.width() && (startY + y) < tft.height()) {
-                    tft.drawPixel(x, startY + y, image.pixels[y * image.width + x]);
+    json += "]}";
+    server.send(200, "application/json", json); 
+}
+
+void handleSetText() {
+    lines.clear();
+    hasOfflineAlert = false;
+    offlineIpsText = "";
+
+    for (int i = 0; i < 100; i++) {
+        String lineKey = "line" + String(i);
+        if (server.hasArg(lineKey)) {
+            LineData line;
+            line.text = server.arg(lineKey);
+            String colorKey = "color" + String(i);
+            line.colorHtml = server.hasArg(colorKey) ? server.arg(colorKey) : "#FFFFFF";
+
+            if (line.text.startsWith("offline:") || line.text.startsWith("offline")) {
+                offlineIpsText = extractOfflineTails(line.text); 
+                if (offlineIpsText.length() > 0) {
+                    hasOfflineAlert = true;
+                    line.text = "OFF: " + offlineIpsText;
+                } else {
+                    line.text = "";
                 }
+                line.colorHtml = "#fb923c";
             }
+
+            line.color = parseColor(line.colorHtml);
+            int size = server.hasArg("size" + String(i)) ? server.arg("size" + String(i)).toInt() : 2;
+            line.size = (size >= 1 && size <= 7) ? size : 2;
+            lines[i] = line;
         }
     }
-}
-uint16_t parseColor(String colorString) {
-    if (colorString == "red") return ILI9341_RED;
-    if (colorString == "green") return ILI9341_GREEN;
-    if (colorString == "blue") return ILI9341_BLUE;
-    if (colorString == "yellow") return ILI9341_YELLOW;
-    if (colorString == "cyan") return ILI9341_CYAN;
-    if (colorString == "magenta") return ILI9341_MAGENTA;
-    if (colorString == "white") return ILI9341_WHITE;
-    if (colorString == "black") return ILI9341_BLACK;
-    if (colorString == "orange") return ILI9341_ORANGE;
-    if (colorString.startsWith("#") && colorString.length() == 7) {
-        long number = strtol(colorString.substring(1).c_str(), NULL, 16);
-        uint8_t r = (number >> 16) & 0xFF;
-        uint8_t g = (number >> 8) & 0xFF;
-        uint8_t b = number & 0xFF;
-        if (useGBR) { return ((g & 0xF8) << 8) | ((b & 0xFC) << 3) | (r >> 3); } 
-        else { return tft.color565(r, g, b); }
-    }
-    return ILI9341_WHITE;
+    updateDisplay();
+    server.send(200, "text/plain", "OK");
 }
 
-// ====================== SETUP ======================
+void handleImage() {
+    if (server.hasArg("width") && server.hasArg("height") && server.hasArg("data")) {
+        int width = server.arg("width").toInt();
+        int height = server.arg("height").toInt();
+        String data = server.arg("data");
+        if (width > 0 && height > 0 && data.length() > 0) {
+            image.width = width;
+            image.height = height;
+            image.pixels.clear();
+            image.pixels.reserve(width * height);
+            for (unsigned int i = 0; i + 4 <= data.length(); i += 4) {
+                String hexColor = data.substring(i, i + 4);
+                image.pixels.push_back(strtoul(hexColor.c_str(), NULL, 16));
+            }
+            image.y_offset = server.hasArg("y_offset") ? server.arg("y_offset").toInt() : 0;
+            updateDisplay();
+            server.send(200, "text/plain", "Image OK");
+        } else {
+            server.send(400, "text/plain", "Invalid image parameters");
+        }
+    } else {
+        server.send(400, "text/plain", "Image parameters missing");
+    }
+}
+
+void handleNotFound() { server.send(404, "text/plain", "404: Not Found"); }
+
 void setup() {
   Serial.begin(115200);
   delay(100);
-  Serial.println("\n\n===== AuraFan & Display Controller v2.6 (Single Pin) =====");
+
+  bootResetReason = ESP.getResetReason();
 
   pinMode(PWM_PIN, OUTPUT);
   analogWriteFreq(PWM_FREQUENCY);
@@ -222,13 +507,10 @@ void setup() {
   pinMode(TACH_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(TACH_PIN), tachISR, FALLING);
   lastRpmTime = millis();
-  Serial.println("Fan system initialized.");
 
-  // ✅ [修改] 简化了LED初始化
   if (TOTAL_LEDS > 0) {
       FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, TOTAL_LEDS);
       FastLED.clear(true);
-      Serial.println("Single FastLED strip initialized.");
   }
 
   tft.begin();
@@ -242,39 +524,33 @@ void setup() {
   uint8_t madctl_data = 0xE8;
   tft.sendCommand(ILI9341_MADCTL, &madctl_data, 1);
   tft.fillScreen(ILI9341_BLACK);
+  
+  drawScreenHeader();
   tft.setTextColor(ILI9341_WHITE);
   tft.setTextSize(2);
-  tft.setCursor(10, 20);
-  tft.println("Controller Booting...");
-  Serial.println("ILI9341 display initialized CORRECTLY.");
+  tft.setCursor(10, 35);
+  tft.println("Booting...");
 
   WiFi.hostname(deviceName);
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
-  Serial.print("Connecting to Wi-Fi");
-  tft.setCursor(10, 50);
+  tft.setCursor(10, 65);
+  tft.setTextSize(1);
   tft.print("Connecting WiFi...");
   while (WiFi.status() != WL_CONNECTED) { delay(400); Serial.print("."); }
-  Serial.println("\nConnected!");
-  Serial.print("IP Address: "); Serial.println(WiFi.localIP());
 
-  tft.fillScreen(ILI9341_BLACK);
-  tft.setCursor(10, 20);
-  tft.setTextSize(2);
-  tft.println("System Ready!");
-  tft.setTextSize(1);
-  tft.setCursor(10, 50);
-  tft.print("Web UI & API at:");
-  tft.setCursor(10, 70);
-  tft.setTextSize(2);
-  tft.setTextColor(ILI9341_CYAN);
-  tft.println(WiFi.localIP());
+  relayManager.begin(&server);
 
-  if (MDNS.begin(deviceName)) { MDNS.addService("http", "tcp", 80); Serial.printf("mDNS Responder started. Access at: http://%s.local\n", deviceName); }
+  updateDisplay();
+
+  if (MDNS.begin(deviceName)) {
+      MDNS.addService("http", "tcp", 80);
+  }
 
   server.on("/", HTTP_GET, handleRoot);
   server.on("/setSpeed", HTTP_GET, handleSetSpeed);
   server.on("/getRPM", HTTP_GET, handleGetRPM);
+  server.on("/getUptime", HTTP_GET, handleGetUptime);
   server.on("/setRGB", HTTP_GET, handleSetRGB);
   server.on("/setLedMode", HTTP_GET, handleSetLedMode);
   server.on("/setActiveLeds", HTTP_GET, handleSetActiveLeds);
@@ -282,15 +558,32 @@ void setup() {
   server.on("/set", HTTP_POST, handleSetText);
   server.on("/image", HTTP_POST, handleImage);
   server.onNotFound(handleNotFound);
-  
+
   httpUpdater.setup(&server);
   server.begin();
-  Serial.println("HTTP server started with all routes.");
 }
 
-// ====================== LOOP ======================
 void loop() {
   server.handleClient();
   MDNS.update();
   updateLeds();
+  relayManager.update();
+
+  bool currentRelayState = relayManager.getState();
+  if (currentRelayState != lastDrawnRelayState) {
+      drawRelayBadge(currentRelayState);
+  }
+
+  // 🌟【高亮色相流转】：周期 2.2 秒，平滑刷新微步，R=255 全满亮，无抖动、无闪烁
+  if (hasOfflineAlert && offlineIpsText.length() > 0 && millis() - lastBreathUpdate >= 50) {
+      lastBreathUpdate = millis();
+      // 2.2秒优雅正弦波进度 0.0 ~ 1.0
+      float progress = (sin(millis() / 2200.0 * 2.0 * PI) + 1.0) / 2.0;
+      uint16_t breathCol = getBreathColor(progress);
+
+      tft.setTextSize(offlineIpsFontSize);
+      tft.setCursor(offlineIpsX, offlineIpsY);
+      tft.setTextColor(breathCol, ILI9341_BLACK); 
+      tft.print(offlineIpsText);
+  }
 }
