@@ -540,6 +540,7 @@ void setup() {
   delay(50);
   SPI.setFrequency(1000000); //[cite: 3]
   tft.setRotation(0); //[cite: 3]
+  tft.invertDisplay(false);
   uint8_t caset_data[] = {0x00, 0x00, 0x00, 0xEF}; //[cite: 3]
   tft.sendCommand(ILI9341_CASET, caset_data, 4); //[cite: 3]
   uint8_t raset_data[] = {0x00, 0x00, 0x01, 0x3F}; //[cite: 3]
@@ -547,6 +548,8 @@ void setup() {
   tft.writeCommand(ILI9341_RAMWR); //[cite: 3]
   uint8_t madctl_data = 0xE8; //[cite: 3]
   tft.sendCommand(ILI9341_MADCTL, &madctl_data, 1); //[cite: 3]
+    // 确保屏幕使用正常显示模式
+  tft.invertDisplay(false);
   tft.fillScreen(ILI9341_BLACK); //[cite: 3]
 
   drawScreenHeader(); //[cite: 3]
