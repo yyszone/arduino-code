@@ -397,7 +397,16 @@ void handleRoot() {
     server.send_P(200, "text/html; charset=UTF-8", MAIN_PAGE_HTML);
 }
 
-void handleSetSpeed() { if (server.hasArg("value")) { fanSliderValue = server.arg("value").toInt(); server.send(200, "text/plain", "OK"); } else { server.send(400, "text/plain", "Bad Request"); }}
+void handleSetSpeed() {
+    if (server.hasArg("value")) {
+        fanSliderValue = constrain(
+            server.arg("value").toInt(), 0, 255
+        );
+        server.send(200, "text/plain", "OK");
+    } else {
+        server.send(400, "text/plain", "Bad Request");
+    }
+}
 void handleGetRPM() { server.send(200, "text/plain", String(computeRPM())); }
 void handleGetUptime() { server.send(200, "text/plain", getUptime()); }
 void handleSetRGB() { if (server.hasArg("r") && server.hasArg("g") && server.hasArg("b")) { staticColor = CRGB(server.arg("r").toInt(), server.arg("g").toInt(), server.arg("b").toInt()); currentLedMode = STATIC; server.send(200, "text/plain", "OK"); } else { server.send(400, "text/plain", "Bad Request"); }}
@@ -496,72 +505,99 @@ void handleImage() {
 void handleNotFound() { server.send(404, "text/plain", "404: Not Found"); }
 
 void setup() {
+  // 1. 上电最优先：立刻拉低灯带引脚，锁死继电器电平，避开冷启动浪涌[cite: 2, 3]
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  // 继电器默认关闭，避免 ESP8266 重启时自动启动 220V 负载
+  digitalWrite(RELAY_PIN, !RELAY_ON_LEVEL);
+  pinMode(RELAY_PIN, OUTPUT);
+
+  // 2. 冷启动等待 500ms，让 LM2596 输出电压和外部电容稳定
+  delay(500);
+
   Serial.begin(115200);
-  delay(100);
+  delay(100); //[cite: 3]
+  bootResetReason = ESP.getResetReason(); //[cite: 3]
 
-  bootResetReason = ESP.getResetReason();
+  // 3. 初始化风扇 PWM 与测速引脚[cite: 3]
+  pinMode(PWM_PIN, OUTPUT); //[cite: 3]
+  analogWriteFreq(PWM_FREQUENCY); //[cite: 3]
+  analogWrite(PWM_PIN, PWM_INVERTED ? PWM_RESOLUTION : 0); //[cite: 3]
+  pinMode(TACH_PIN, INPUT_PULLUP); //[cite: 3]
+  attachInterrupt(digitalPinToInterrupt(TACH_PIN), tachISR, FALLING); //[cite: 3]
+  lastRpmTime = millis(); //[cite: 3]
 
-  pinMode(PWM_PIN, OUTPUT);
-  analogWriteFreq(PWM_FREQUENCY);
-  analogWrite(PWM_PIN, PWM_INVERTED ? PWM_RESOLUTION : 0);
-  pinMode(TACH_PIN, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(TACH_PIN), tachISR, FALLING);
-  lastRpmTime = millis();
-
-  if (TOTAL_LEDS > 0) {
-      FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, TOTAL_LEDS);
-      FastLED.clear(true);
+  // 4. 尽早清空灯带，防止冷启动灯珠乱亮吃电流
+  if (TOTAL_LEDS > 0) { //[cite: 3]
+      FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, TOTAL_LEDS); //[cite: 3]
+      FastLED.setBrightness(50); // 启动阶段限制最大亮度，降低电流冲击
+      FastLED.clear(true); //[cite: 3]
   }
 
-  tft.begin();
-  SPI.setFrequency(1000000);
-  tft.setRotation(0);
-  uint8_t caset_data[] = {0x00, 0x00, 0x00, 0xEF};
-  tft.sendCommand(ILI9341_CASET, caset_data, 4);
-  uint8_t raset_data[] = {0x00, 0x00, 0x01, 0x3F};
-  tft.sendCommand(ILI9341_PASET, raset_data, 4);
-  tft.writeCommand(ILI9341_RAMWR);
-  uint8_t madctl_data = 0xE8;
-  tft.sendCommand(ILI9341_MADCTL, &madctl_data, 1);
-  tft.fillScreen(ILI9341_BLACK);
-  
-  drawScreenHeader();
-  tft.setTextColor(ILI9341_WHITE);
-  tft.setTextSize(2);
-  tft.setCursor(10, 35);
-  tft.println("Booting...");
+  // 5. 初始化 ILI9341 屏幕[cite: 3]
+  tft.begin(); //[cite: 3]
+  delay(50);
+  SPI.setFrequency(1000000); //[cite: 3]
+  tft.setRotation(0); //[cite: 3]
+  uint8_t caset_data[] = {0x00, 0x00, 0x00, 0xEF}; //[cite: 3]
+  tft.sendCommand(ILI9341_CASET, caset_data, 4); //[cite: 3]
+  uint8_t raset_data[] = {0x00, 0x00, 0x01, 0x3F}; //[cite: 3]
+  tft.sendCommand(ILI9341_PASET, raset_data, 4); //[cite: 3]
+  tft.writeCommand(ILI9341_RAMWR); //[cite: 3]
+  uint8_t madctl_data = 0xE8; //[cite: 3]
+  tft.sendCommand(ILI9341_MADCTL, &madctl_data, 1); //[cite: 3]
+  tft.fillScreen(ILI9341_BLACK); //[cite: 3]
 
-  WiFi.hostname(deviceName);
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
-  tft.setCursor(10, 65);
-  tft.setTextSize(1);
-  tft.print("Connecting WiFi...");
-  while (WiFi.status() != WL_CONNECTED) { delay(400); Serial.print("."); }
+  drawScreenHeader(); //[cite: 3]
+  tft.setTextColor(ILI9341_WHITE); //[cite: 3]
+  tft.setTextSize(2); //[cite: 3]
+  tft.setCursor(10, 35); //[cite: 3]
+  tft.println("Booting..."); //[cite: 3]
 
-  relayManager.begin(&server);
+  // 6. 先在屏幕上打印连接提示，再开始连 WiFi（超时自动重启）[cite: 3]
+  tft.setCursor(10, 65); //[cite: 3]
+  tft.setTextSize(1); //[cite: 3]
+  tft.print("Connecting WiFi..."); //[cite: 3]
 
-  updateDisplay();
+  WiFi.persistent(false);
+  WiFi.hostname(deviceName); //[cite: 3]
+  WiFi.mode(WIFI_STA); //[cite: 3]
+  WiFi.begin(ssid, password); //[cite: 3]
 
-  if (MDNS.begin(deviceName)) {
-      MDNS.addService("http", "tcp", 80);
+  int wifiRetry = 0;
+  while (WiFi.status() != WL_CONNECTED) {
+      delay(400); //[cite: 3]
+      Serial.print("."); //[cite: 3]
+      wifiRetry++;
+      if (wifiRetry > 40) { // 约 16 秒连不上自动重启，应对冷启动射频异常
+          ESP.restart();
+      }
   }
 
-  server.on("/", HTTP_GET, handleRoot);
-  server.on("/setSpeed", HTTP_GET, handleSetSpeed);
-  server.on("/getRPM", HTTP_GET, handleGetRPM);
-  server.on("/getUptime", HTTP_GET, handleGetUptime);
-  server.on("/setRGB", HTTP_GET, handleSetRGB);
-  server.on("/setLedMode", HTTP_GET, handleSetLedMode);
-  server.on("/setActiveLeds", HTTP_GET, handleSetActiveLeds);
-  server.on("/getState", HTTP_GET, handleGetState);
-  server.on("/set", HTTP_POST, handleSetText);
-  server.on("/image", HTTP_POST, handleImage);
-  server.onNotFound(handleNotFound);
+  relayManager.begin(&server); //[cite: 2, 3]
+  updateDisplay(); //[cite: 3]
 
-  httpUpdater.setup(&server);
-  server.begin();
+  if (MDNS.begin(deviceName)) { //[cite: 3]
+      MDNS.addService("http", "tcp", 80); //[cite: 3]
+  }
+
+  server.on("/", HTTP_GET, handleRoot); //[cite: 3]
+  server.on("/setSpeed", HTTP_GET, handleSetSpeed); //[cite: 3]
+  server.on("/getRPM", HTTP_GET, handleGetRPM); //[cite: 3]
+  server.on("/getUptime", HTTP_GET, handleGetUptime); //[cite: 3]
+  server.on("/setRGB", HTTP_GET, handleSetRGB); //[cite: 3]
+  server.on("/setLedMode", HTTP_GET, handleSetLedMode); //[cite: 3]
+  server.on("/setActiveLeds", HTTP_GET, handleSetActiveLeds); //[cite: 3]
+  server.on("/getState", HTTP_GET, handleGetState); //[cite: 3]
+  server.on("/set", HTTP_POST, handleSetText); //[cite: 3]
+  server.on("/image", HTTP_POST, handleImage); //[cite: 3]
+  server.onNotFound(handleNotFound); //[cite: 3]
+
+  httpUpdater.setup(&server); //[cite: 3]
+  server.begin(); //[cite: 3]
 }
+
 
 void loop() {
   server.handleClient();

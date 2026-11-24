@@ -155,6 +155,8 @@ const char MAIN_HTML[] PROGMEM = R"HTML(
     <a href="/update" class="btn btn-primary">固件更新 🚀</a>
     <a href="/logs" class="btn btn-secondary">查看日志 📋</a>
     <a href="/tft-reset" class="btn btn-warning">TFT 屏幕恢复 🖥️</a>
+    <!-- ⭐️ 新增：像素屏控制入口 -->
+    <a href="/pixel" class="btn" style="background:#8957e5; color:#fff;">iPixel 像素屏 📺</a>
   </div>
 </div>
 

@@ -187,13 +187,22 @@ void drawClockScreen(bool isInitialDraw) {
 }
 
 void updateClockTime() {
-    time_t rawTime = timeClient.getEpochTime();
-    struct tm * ti = localtime(&rawTime);
+    // ⭐️ 核心修复：优先使用 ESP32 原生时区感知接口，杜绝时区被二次叠加导致多出 8 小时
+    struct tm ti;
+    bool timeOk = getLocalTime(&ti, 5); // 读取系统时间（已由 configTime 设为准确北京时间）
+
+    // 如果系统时间未就绪，安全回退到 timeClient，并使用 gmtime 避免二次加时区
+    if (!timeOk) {
+        time_t rawTime = timeClient.getEpochTime();
+        if (rawTime < 1000000000L) return; // 时间无效直接跳过
+        ti = *gmtime(&rawTime); // 关键：用 gmtime 替代 localtime，防止再次叠加 8 小时
+    }
     
-    if (ti->tm_mday != lastDay) {
-        lastDay = ti->tm_mday;
+    // 1. 刷新日期
+    if (ti.tm_mday != lastDay) {
+        lastDay = ti.tm_mday;
         char dateBuf[20];
-        sprintf(dateBuf, "%04d.%02d.%02d", ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday);
+        sprintf(dateBuf, "%04d.%02d.%02d", ti.tm_year + 1900, ti.tm_mon + 1, ti.tm_mday);
         tft.fillRect(10, 30, 220, 20, C_BG);
         tft.setTextColor(C_GREEN);
         tft.setTextSize(2);
@@ -201,10 +210,11 @@ void updateClockTime() {
         tft.print(dateBuf);
     }
     
-    if (ti->tm_min != lastMinute) {
-        lastMinute = ti->tm_min;
+    // 2. 刷新小时与分钟 (彻底恢复 17:xx 正确时间)
+    if (ti.tm_min != lastMinute) {
+        lastMinute = ti.tm_min;
         char timeBuf[6];
-        sprintf(timeBuf, "%02d:%02d", ti->tm_hour, ti->tm_min);
+        sprintf(timeBuf, "%02d:%02d", ti.tm_hour, ti.tm_min);
         tft.fillRect(10, 55, 220, 50, C_BG);
         tft.setTextColor(C_WHITE);
         tft.setTextSize(6);
@@ -212,14 +222,15 @@ void updateClockTime() {
         tft.print(timeBuf);
     }
 
-    if (ti->tm_sec != lastSecond) {
-        lastSecond = ti->tm_sec;
-        int barWidth = map(ti->tm_sec, 0, 59, 0, 196);
+    // 3. 刷新秒数与仪表盘
+    if (ti.tm_sec != lastSecond) {
+        lastSecond = ti.tm_sec;
+        int barWidth = map(ti.tm_sec, 0, 59, 0, 196);
         tft.fillRect(22, 272, 196, 21, C_DARK_GREY);
         tft.fillRect(22, 272, barWidth, 21, C_ORANGE);
         
         char secBuf[3];
-        sprintf(secBuf, "%02d", ti->tm_sec);
+        sprintf(secBuf, "%02d", ti.tm_sec);
         tft.fillRect(105, 120, 30, 16, C_BG);
         tft.setTextSize(2);
         tft.setTextColor(C_ORANGE);

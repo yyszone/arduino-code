@@ -19,7 +19,14 @@
 #include "ina219_sensor.h"
 #include "dht11.h"
 #include "web_pages.h"
+// 引入像素屏模块与独立 HTML 页面
+#include "pixel_manager.h"
+#include "pixel_html.h"
 
+// ⭐️ 确保主 .ino 中这里定义了实体
+bool wifiAvailable = false; 
+// 实例化像素屏管理器
+PixelManager pixelManager;
 // ==================== 全局实体变量定义 ====================
 Settings settings;                
 SystemState st;
@@ -98,17 +105,26 @@ INA219Sensor inaSensor;
 #include "gui.h"
 #include "network_web.h"
 
-// ==================== 定时与继电器硬件逻辑 ====================
+// ==================== 屏幕待机睡眠判定 (绝对准时版) ====================
 bool isSleepTime() {
-  if (timeClient.getEpochTime() <= 0) return false; 
+  struct tm ti;
+  // 优先直接读底层带时区的硬件时间，超时设为0（不阻塞主循环）
+  if (!getLocalTime(&ti, 0)) {
+    // 系统时间如果未就绪，才临时回退读 timeClient
+    if (timeClient.getEpochTime() <= 0) return false;
+    ti.tm_hour = timeClient.getHours();
+    ti.tm_min  = timeClient.getMinutes();
+  }
   
   int sleepM = settings.sleepHour * 60 + settings.sleepMinute; 
   int wakeM  = settings.wakeHour * 60 + settings.wakeMinute;   
-  int currM  = timeClient.getHours() * 60 + timeClient.getMinutes();
+  int currM  = ti.tm_hour * 60 + ti.tm_min; // 真实准确的北京时间
 
   if (wakeM > sleepM) {
+    // 比如 01:00 睡，07:00 醒 (同一天)
     return (currM >= sleepM && currM < wakeM);
   } else {
+    // 比如 23:00 睡，07:00 醒 (跨午夜)
     return (currM >= sleepM || currM < wakeM);
   }
 }
@@ -485,16 +501,20 @@ void saveSystemState() {
 // 注意：INA219 欠压 / 低功率保护已经独立处理
 // ============================================================
 // ============================================================
-// 判定当前时间是否处于定时开启时段
-// ============================================================
+// ==================== 继电器定时判定 (绝对准时版) ====================
 bool isRelayTimerActive() {
-  if (!settings.relayTimerEnabled || timeClient.getEpochTime() <= 0) {
-    return false;
+  if (!settings.relayTimerEnabled) return false;
+
+  struct tm ti;
+  if (!getLocalTime(&ti, 0)) {
+    if (timeClient.getEpochTime() <= 0) return false;
+    ti.tm_hour = timeClient.getHours();
+    ti.tm_min  = timeClient.getMinutes();
   }
   
   int onMinutes  = settings.relayOnHour * 60 + settings.relayOnMinute;
   int offMinutes = settings.relayOffHour * 60 + settings.relayOffMinute;
-  int curMinutes = timeClient.getHours() * 60 + timeClient.getMinutes();
+  int curMinutes = ti.tm_hour * 60 + ti.tm_min; // 真实准确的北京时间
 
   if (onMinutes < offMinutes) {
     // 正常时段 (例如 08:00 到 22:00)
@@ -503,7 +523,7 @@ bool isRelayTimerActive() {
     // 跨天时段 (例如 22:00 到次日 08:00)
     return (curMinutes >= onMinutes || curMinutes < offMinutes);
   }
-  return false; // 开关时间相同视为无效
+  return false;
 }
 
 // ============================================================
@@ -653,7 +673,7 @@ void maintainWiFi() {
 
     Serial.print("[WiFi] RSSI: ");
     Serial.println(WiFi.RSSI());
-
+    configTime(8 * 3600, 0, "ntp.aliyun.com", "pool.ntp.org");
     timeClient.begin();
     timeClient.update();
 
@@ -711,10 +731,37 @@ void setup() {
   tft.setRotation(0);
 
   exitStandby(false); 
+  configTime(8 * 3600, 0, "ntp.aliyun.com", "pool.ntp.org");
+
+  // 初始化像素屏蓝牙后台驱动
+  pixelManager.begin();
+  Serial.println("[Pixel] 像素屏蓝牙后台驱动已启动。");
+
   addLog("ESP32-C3 控制台 v9.3 上电启动。");
 }
 
 void loop() {
+  // ==============================================================
+  // 🌙 休眠待机区：只留触摸检测与唤醒检测，其他所有复杂业务全部跳过！
+  // ==============================================================
+  if (isInStandby) {
+    // 1. 到达清晨设定时间，自动定时唤醒
+    if (!isSleepTime()) {
+      exitStandby(false);
+    }
+    
+    // 2. ⭐️ 允许休眠期间检测触摸（摸一下屏幕即可触发唤醒亮屏）
+    handleTouch();
+
+    // 待机延时降低发热与功耗
+    delay(50);
+    return; // ⭐️ 跳过下面耗电的传感器读取、蓝牙扫描、页面刷新与继电器业务
+  }
+
+  // ==============================================================
+  // ☀️ 正常工作区 (白天运行，或半夜摸屏唤醒后临时运行)
+  // ==============================================================
+  pixelManager.loop();
   handleTouch(); 
 
   unsigned long now = millis();
@@ -729,12 +776,10 @@ void loop() {
 
       if (st.relayOn) {
           st.todayOnSec += 2;
-          st.cumulativeWh +=
-              (st.power_mW / 1000.f) * (2.5 / 3600.0);
+          st.cumulativeWh += (st.power_mW / 1000.f) * (2.5 / 3600.0);
       }
 
       float t = NAN, h = NAN;
-
       bool success = dht.read(t, h);
 
       if (!success) {
@@ -747,9 +792,7 @@ void loop() {
           dhtHum = h;
           lastValidDhtTime = now;
       } else {
-          if (now - lastValidDhtTime > 30000 &&
-              lastValidDhtTime > 0) {
-
+          if (now - lastValidDhtTime > 30000 && lastValidDhtTime > 0) {
               dhtTemp = NAN;
               dhtHum = NAN;
           }
@@ -758,46 +801,41 @@ void loop() {
       updateRelayLogic();
   }
 
+  // Web 与屏幕刷新逻辑
+  server.handleClient();
 
-  if (!isInStandby) {
-    server.handleClient();
+  if (now - lastStatusUpdate > 1000) {
+    if (WiFi.status() == WL_CONNECTED) timeClient.update();
+    if (currentScreen == SCREEN_CLOCK) updateClockTime();
+    else updateStatusLine();
+    lastStatusUpdate = now;
+  }
 
-    if (now - lastStatusUpdate > 1000) {
-      if (WiFi.status() == WL_CONNECTED) timeClient.update();
-      if (currentScreen == SCREEN_CLOCK) updateClockTime();
-      else updateStatusLine();
-      lastStatusUpdate = now;
-    }
-
-    if (!pauseRotation) {
-      if (currentScreen == SCREEN_CONTROL) {
-        currentScreen = SCREEN_WEATHER;
-        drawCurrentScreen(true);
-      }
-      if (now - lastScreenSwitchTime > 5000) {
-        if (currentScreen == SCREEN_WEATHER) currentScreen = SCREEN_CLOCK;
-        else currentScreen = SCREEN_WEATHER;
-        drawCurrentScreen(true);
-        lastScreenSwitchTime = now;
-      }
-    } else if (now - lastActivityTime > 10000) {
-      pauseRotation = false;
+  if (!pauseRotation) {
+    if (currentScreen == SCREEN_CONTROL) {
       currentScreen = SCREEN_WEATHER;
       drawCurrentScreen(true);
     }
-
-    if (WiFi.status() == WL_CONNECTED && (now - lastWeatherUpdate > WEATHER_UPDATE_INTERVAL || lastWeatherUpdate == 0)) {
-      updateWeather();
+    if (now - lastScreenSwitchTime > 5000) {
+      if (currentScreen == SCREEN_WEATHER) currentScreen = SCREEN_CLOCK;
+      else currentScreen = SCREEN_WEATHER;
+      drawCurrentScreen(true);
+      lastScreenSwitchTime = now;
     }
+  } else if (now - lastActivityTime > 10000) {
+    pauseRotation = false;
+    currentScreen = SCREEN_WEATHER;
+    drawCurrentScreen(true);
+  }
 
-    if (isSleepTime() && (now - lastActivityTime > standbyDelay)) {
+  if (WiFi.status() == WL_CONNECTED && (now - lastWeatherUpdate > WEATHER_UPDATE_INTERVAL || lastWeatherUpdate == 0)) {
+    updateWeather();
+  }
+
+  // 到达睡眠时段，触发休眠（被临时唤醒后 15 秒无操作自动重新熄灭）
+  if (isSleepTime()) {
+    if (now - lastActivityTime > 15000UL) {
       enterStandby();
     }
-
-  } else {
-    if (!isSleepTime() && timeClient.getEpochTime() > 0) {
-      exitStandby(false);
-    }
-    delay(200);
   }
 }

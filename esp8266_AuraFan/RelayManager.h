@@ -6,6 +6,7 @@
 #include <ESP8266WebServer.h>
 #include <LittleFS.h>
 #include <time.h>
+#include <stdlib.h>
 
 #define MAX_SCHEDULES 20
 #define RELAY_PIN D6 // 继电器控制引脚 D6 (GPIO12)
@@ -55,6 +56,7 @@ const char HTML_TEMPLATE[] PROGMEM = R"rawliteral(
       text-decoration: none; transition: all 0.2s; box-shadow: 0 4px 10px rgba(0,0,0,0.1);
     }
     .button:hover, button:hover { transform: translateY(-2px); opacity: 0.95; }
+    .button:disabled, button:disabled { opacity: 0.55; cursor: not-allowed; transform: none; }
     .btn-on { background-color: var(--green); flex: 1; }
     .btn-off { background-color: var(--red); flex: 1; }
     .btn-add { background-color: var(--accent); }
@@ -93,8 +95,8 @@ const char HTML_TEMPLATE[] PROGMEM = R"rawliteral(
       <h2>⏰ 添加定时任务</h2>
       <div class="input-group">
         <input type="time" id="scheduleTime" step="1" value="12:00:00">
-        <button class="button btn-add" onclick="addSchedule(1)">添加开机</button>
-        <button class="button btn-add" onclick="addSchedule(0)" style="background:#5c6bc0;">添加关机</button>
+        <button id="btnAddOn" class="button btn-add" onclick="addSchedule(1, this)">添加开机</button>
+        <button id="btnAddOff" class="button btn-add" onclick="addSchedule(0, this)" style="background:#5c6bc0;">添加关机</button>
       </div>
     </div>
 
@@ -104,7 +106,7 @@ const char HTML_TEMPLATE[] PROGMEM = R"rawliteral(
       <ul id="on-list">##ON_TASKS##</ul>
       <h3 style="font-size:1rem; margin:1.2rem 0 0.3rem; color:var(--red);">🔴 关机任务</h3>
       <ul id="off-list">##OFF_TASKS##</ul>
-      
+
       <div class="nav-links">
         <a href="/">⬅ 返回一体化主控主页</a>
         <a href="/update">固件 OTA 更新 ➡</a>
@@ -119,17 +121,34 @@ const char HTML_TEMPLATE[] PROGMEM = R"rawliteral(
   <script>
     // 严格与原请求 URL (/LED-Control?ledPwm=...) 保持完全一致
     function manualControl(pwm) { window.location.href = `/LED-Control?ledPwm=${pwm}`; }
-    function addSchedule(pwm) {
-      const time = document.getElementById('scheduleTime').value;
-      if (time) window.location.href = `/LED-Control?ledPwm=${pwm}&time=${time.split(':').length==2 ? time+':00' : time}`;
-      else alert('请先选择时间！');
+
+    let isSubmittingSchedule = false;
+
+    function addSchedule(pwm, btnEl) {
+      if (isSubmittingSchedule) return;
+
+      const timeInput = document.getElementById('scheduleTime');
+      const time = timeInput.value;
+      if (!time) {
+        alert('请先选择时间！');
+        return;
+      }
+
+      isSubmittingSchedule = true;
+      document.querySelectorAll('.btn-add').forEach(b => b.disabled = true);
+      if (btnEl) btnEl.innerText = '添加中...';
+
+      const formattedTime = time.split(':').length == 2 ? time + ':00' : time;
+      window.location.href = `/LED-Control?ledPwm=${pwm}&time=${encodeURIComponent(formattedTime)}`;
     }
+
     function deleteSchedule(time) {
       if (confirm(`确定要删除时间点 ${time} 吗?`)) window.location.href = `/LED-Control?ledPwm=5&time=${time}`;
     }
+
     setInterval(() => {
-        const d = new Date();
-        document.getElementById('timeDisplay').innerText = d.toLocaleTimeString('zh-CN', {hour12:false});
+      const d = new Date();
+      document.getElementById('timeDisplay').innerText = d.toLocaleTimeString('zh-CN', {hour12:false});
     }, 1000);
   </script>
 </body>
@@ -139,13 +158,67 @@ const char HTML_TEMPLATE[] PROGMEM = R"rawliteral(
 class RelayManager {
 private:
     ESP8266WebServer* server;
-    bool currentState = true; // ✅ 默认通电开
+    bool currentState = false; // ✅ 默认通电关
     unsigned long lastCheckTime = 0;
 
     String onTimes[MAX_SCHEDULES];
     int onTimesCount = 0;
     String offTimes[MAX_SCHEDULES];
     int offTimesCount = 0;
+    // 安全校验时间
+    bool isValidScheduleTime(const String& value) {
+        if (value.length() != 8 ||
+            value.charAt(2) != ':' ||
+            value.charAt(5) != ':') {
+            return false;
+        }
+
+        for (int i = 0; i < 8; i++) {
+            if (i == 2 || i == 5) continue;
+
+            char c = value.charAt(i);
+
+            if (c < '0' || c > '9') return false;
+        }
+
+        int hour = (value[0] - '0') * 10 + value[1] - '0';
+        int minute = (value[3] - '0') * 10 + value[4] - '0';
+        int second = (value[6] - '0') * 10 + value[7] - '0';
+
+        return hour < 24 && minute < 60 && second < 60;
+    }
+
+    // 安全读取任务数量
+    bool readSafeCount(File& f, int& count) {
+        String value = f.readStringUntil('\n');
+        value.trim();
+
+        if (value.length() == 0) return false;
+
+        char* endPtr = nullptr;
+        long number = strtol(value.c_str(), &endPtr, 10);
+
+        if (endPtr == value.c_str() ||
+            *endPtr != '\0' ||
+            number < 0 ||
+            number > MAX_SCHEDULES) {
+            return false;
+        }
+
+        count = (int)number;
+        return true;
+    }
+    bool hasTime(const String* arr, int count, const String& target) {
+        if (count < 0 || count > MAX_SCHEDULES) {
+            return false;
+        }
+
+        for (int i = 0; i < count; i++) {
+            if (arr[i] == target) return true;
+        }
+
+        return false;
+    }
 
     void setHardware(bool state) {
         currentState = state;
@@ -159,6 +232,9 @@ public:
         time_t now = time(nullptr);
         if (now < 100000) return "00:00:00";
         struct tm* t = localtime(&now);
+        if (t == nullptr) {
+            return "00:00:00";
+        }
         char buf[10];
         strftime(buf, sizeof(buf), "%H:%M:%S", t);
         return String(buf);
@@ -169,36 +245,102 @@ public:
     }
 
     void saveSchedules() {
+        // 防止异常计数导致数组越界
+        if (onTimesCount < 0 ||
+            onTimesCount > MAX_SCHEDULES ||
+            offTimesCount < 0 ||
+            offTimesCount > MAX_SCHEDULES) {
+
+            Serial.println("[RELAY] Invalid schedule count, save skipped");
+            return;
+        }
+
         File f = LittleFS.open("/schedules.dat", "w");
-        if (!f) return;
+
+        if (!f) {
+            Serial.println("[RELAY] Failed to open schedules.dat");
+            return;
+        }
+
         f.println(onTimesCount);
-        for (int i = 0; i < onTimesCount; i++) f.println(onTimes[i]);
+
+        for (int i = 0; i < onTimesCount; i++) {
+            f.println(onTimes[i]);
+        }
+
         f.println(offTimesCount);
-        for (int i = 0; i < offTimesCount; i++) f.println(offTimes[i]);
+
+        for (int i = 0; i < offTimesCount; i++) {
+            f.println(offTimes[i]);
+        }
+
         f.close();
     }
 
     void loadSchedules() {
-        if (!LittleFS.exists("/schedules.dat")) return;
-        File f = LittleFS.open("/schedules.dat", "r");
-        if (!f) return;
-        onTimesCount = f.readStringUntil('\n').toInt();
-        for (int i = 0; i < onTimesCount && i < MAX_SCHEDULES; i++) {
-            onTimes[i] = f.readStringUntil('\n');
-            onTimes[i].trim();
-        }
-        offTimesCount = f.readStringUntil('\n').toInt();
-        for (int i = 0; i < offTimesCount && i < MAX_SCHEDULES; i++) {
-            offTimes[i] = f.readStringUntil('\n');
-            offTimes[i].trim();
-        }
+    onTimesCount = 0;
+    offTimesCount = 0;
+
+    for (int i = 0; i < MAX_SCHEDULES; i++) {
+        onTimes[i] = "";
+        offTimes[i] = "";
+    }
+
+    if (!LittleFS.exists("/schedules.dat")) return;
+
+    File f = LittleFS.open("/schedules.dat", "r");
+
+    if (!f) return;
+
+    int count = 0;
+
+    // 读取开机任务数量
+    if (!readSafeCount(f, count)) {
+        Serial.println("[RELAY] Invalid ON count");
         f.close();
+        return;
+    }
+
+    for (int i = 0; i < count; i++) {
+        String value = f.readStringUntil('\n');
+        value.trim();
+
+        if (isValidScheduleTime(value)) {
+                onTimes[onTimesCount++] = value;
+            }
+        }
+
+        // 读取关机任务数量
+        if (!readSafeCount(f, count)) {
+            Serial.println("[RELAY] Invalid OFF count");
+
+            onTimesCount = 0;
+            f.close();
+            return;
+        }
+
+        for (int i = 0; i < count; i++) {
+            String value = f.readStringUntil('\n');
+            value.trim();
+
+            if (isValidScheduleTime(value)) {
+                offTimes[offTimesCount++] = value;
+            }
+        }
+
+        f.close();
+
+        Serial.printf(
+            "[RELAY] Loaded ON=%d OFF=%d\n",
+            onTimesCount,
+            offTimesCount
+        );
     }
 
     String generatePage() {
         String page = FPSTR(HTML_TEMPLATE);
         String relayStatus = currentState ? "<span class='status-on'>开启</span>" : "<span class='status-off'>关闭</span>";
-        
+
         String onTasksHtml = "";
         if (onTimesCount == 0) onTasksHtml = "<li>无</li>";
         else {
@@ -225,10 +367,10 @@ public:
     void begin(ESP8266WebServer* webServer) {
         server = webServer;
 
-        // ✅ 默认开机开启
-        digitalWrite(RELAY_PIN, RELAY_ON_LEVEL);
+        // ✅ 开机默认关闭，避免重启时自动吸合
+        digitalWrite(RELAY_PIN, RELAY_OFF_LEVEL);
         pinMode(RELAY_PIN, OUTPUT);
-        currentState = true;
+        currentState = false;
 
         if (LittleFS.begin()) {
             loadSchedules();
@@ -246,14 +388,14 @@ public:
             retry++;
         }
 
-        // ✅ 自动设置 40 分钟后关闭
+        // ✅ 自动设置 40 分钟后关闭（同样去重，防止每次重启都塞一条）
         if (now > 1000000) {
             time_t future = now + (40 * 60);
             struct tm* fInfo = localtime(&future);
             char buf[10];
             strftime(buf, sizeof(buf), "%H:%M:%S", fInfo);
             String autoOffTime = String(buf);
-            if (offTimesCount < MAX_SCHEDULES) {
+            if (offTimesCount < MAX_SCHEDULES && !hasTime(offTimes, offTimesCount, autoOffTime)) {
                 offTimes[offTimesCount++] = autoOffTime;
                 saveSchedules();
             }
@@ -262,21 +404,29 @@ public:
         setupRoutes();
     }
 
-    // 核心：严格对齐原 Python 脚本的 URL 调度逻辑
+    // 核心：严格对齐原 Python 脚本的 URL 调度逻辑 + 去重
     void handleLedControl() {
         String ledPwm = server->arg("ledPwm");
         int ledPwmVal = ledPwm.toInt();
         String timeParam = server->arg("time");
+        timeParam.trim();
 
         switch (ledPwmVal) {
-            case 0: // 添加关机
-                if (offTimesCount < MAX_SCHEDULES && timeParam.length() > 0) {
+           case 0: // 添加关机
+                if (offTimesCount < MAX_SCHEDULES &&
+                    isValidScheduleTime(timeParam) &&
+                    !hasTime(offTimes, offTimesCount, timeParam)) {
+
                     offTimes[offTimesCount++] = timeParam;
                     saveSchedules();
                 }
                 break;
+
             case 1: // 添加开机
-                if (onTimesCount < MAX_SCHEDULES && timeParam.length() > 0) {
+                if (onTimesCount < MAX_SCHEDULES &&
+                    isValidScheduleTime(timeParam) &&
+                    !hasTime(onTimes, onTimesCount, timeParam)) {
+
                     onTimes[onTimesCount++] = timeParam;
                     saveSchedules();
                 }
@@ -316,10 +466,6 @@ public:
     }
 
     void setupRoutes() {
-        // =========================================================================
-        // 🌟 1. 适配 NewSwitch2400Optimized 的三大专属接口
-        // =========================================================================
-
         // ① 清空所有任务 (/deleteAllTasks?relay=1)
         server->on("/deleteAllTasks", [this]() {
             this->onTimesCount = 0;
@@ -338,75 +484,27 @@ public:
             this->server->send(200, "text/plain", "OK");
         });
 
-        // ③ 返回插座 JSON 状态，满足 Go 代码读取 relay2 和 relay3 校验要求
+        // ③ 返回插座 JSON 状态
         server->on("/getSocketData", [this]() {
             String stateStr = this->currentState ? "true" : "false";
             String json = "{\"relay1\":" + stateStr + ",\"relay2\":" + stateStr + ",\"relay3\":" + stateStr + "}";
             this->server->send(200, "application/json", json);
         });
 
-        // =========================================================================
-        // 🌟 ④ 【就是漏了这里！】首页“一键切换”按钮专属接口
-        // =========================================================================
+        // ④ 首页“一键切换”按钮专属接口
         server->on("/relay/api/toggle", [this]() {
             if (this->server->hasArg("state")) {
                 String s = this->server->arg("state");
                 this->setHardware(s == "1" || s == "true" || s == "on");
             } else {
-                // 点击一键切换时，没有传参，直接状态取反（开变关，关变开）
                 this->setHardware(!this->currentState);
             }
             this->server->send(200, "text/plain", "OK");
         });
 
-        // =========================================================================
-        // 🌟 2. 适配经典版 Switch2400 接口 (支持 GET 和 POST，兼容 relay 参数)
-        // =========================================================================
+        // ⑤ 经典版 /LED-Control 路由直接复用 handleLedControl()
         server->on("/LED-Control", [this]() {
-            String ledPwm = this->server->arg("ledPwm");
-            int ledPwmVal = ledPwm.toInt();
-            String timeParam = this->server->arg("time");
-
-            switch (ledPwmVal) {
-                case 0:
-                    if (this->offTimesCount < MAX_SCHEDULES && timeParam.length() > 0) {
-                        this->offTimes[this->offTimesCount++] = timeParam;
-                        this->saveSchedules();
-                    }
-                    break;
-                case 1:
-                    if (this->onTimesCount < MAX_SCHEDULES && timeParam.length() > 0) {
-                        this->onTimes[this->onTimesCount++] = timeParam;
-                        this->saveSchedules();
-                    }
-                    break;
-                case 2: break;
-                case 3: this->setHardware(true); break;
-                case 4: this->setHardware(false); break;
-                case 5: {
-                    int idx = -1;
-                    for (int i = 0; i < this->offTimesCount; i++) {
-                        if (this->offTimes[i] == timeParam) { idx = i; break; }
-                    }
-                    if (idx != -1) {
-                        for (int i = idx; i < this->offTimesCount - 1; i++) this->offTimes[i] = this->offTimes[i + 1];
-                        this->offTimes[--this->offTimesCount] = "";
-                        this->saveSchedules();
-                    }
-
-                    idx = -1;
-                    for (int i = 0; i < this->onTimesCount; i++) {
-                        if (this->onTimes[i] == timeParam) { idx = i; break; }
-                    }
-                    if (idx != -1) {
-                        for (int i = idx; i < this->onTimesCount - 1; i++) this->onTimes[i] = this->onTimes[i + 1];
-                        this->onTimes[--this->onTimesCount] = "";
-                        this->saveSchedules();
-                    }
-                    break;
-                }
-            }
-            this->server->send(200, "text/html; charset=UTF-8", this->generatePage());
+            this->handleLedControl();
         });
 
         server->on("/relay", [this]() {

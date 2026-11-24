@@ -11,6 +11,8 @@
 #include <FS.h>
 #include <LittleFS.h>
 #include "config.h"
+#include "pixel_manager.h"
+#include "pixel_html.h"
 
 extern Settings settings;
 extern SystemState st;
@@ -18,6 +20,7 @@ extern WebServer server;
 extern NTPClient timeClient;
 extern IRsend irsend;
 extern HTTPUpdateServer httpUpdater;
+extern PixelManager pixelManager;
 
 extern bool haDeviceState;
 extern bool httpDeviceState;
@@ -190,9 +193,13 @@ void updateStatusLine() {
 
 void enterStandby() {
   if (isInStandby) return;
+  // ⭐️ 核心代码：进入休眠前，先将像素屏熄屏关机
+    if (pixelManager.isConnected) {
+      pixelManager.setPower(false);
+    }
 
   isInStandby = true;
-  addLog("进入待机模式。");
+  addLog("进入待机模式，已关闭像素屏。");
 
   // 先关闭背光
   digitalWrite(TFT_BL, LOW);
@@ -303,17 +310,11 @@ void setupWifiAndServices(bool wifiAlreadyConnected) {
     Serial.println();
     Serial.println("========== WiFi 连接开始 ==========");
 
-    // 不要使用 disconnect(true)
-    // true 会清除底层连接配置/状态，没必要每次都这么做
     WiFi.disconnect(false);
     delay(300);
 
     WiFi.mode(WIFI_STA);
-
-    // 允许 ESP32 自动重连
     WiFi.setAutoReconnect(true);
-
-    // 不让 WiFi 配置频繁写 Flash
     WiFi.persistent(false);
 
     Serial.print("[WiFi] SSID: ");
@@ -325,62 +326,35 @@ void setupWifiAndServices(bool wifiAlreadyConnected) {
     unsigned long lastPrint = 0;
 
     // 最多等待 20 秒
-    while (WiFi.status() != WL_CONNECTED &&
-           millis() - start < 20000UL) {
-
+    while (WiFi.status() != WL_CONNECTED && millis() - start < 20000UL) {
       delay(250);
 
       if (millis() - lastPrint >= 1000) {
         lastPrint = millis();
-
-        Serial.printf(
-          "[WiFi] 等待中... status=%d RSSI=%d\n",
-          WiFi.status(),
-          WiFi.RSSI()
-        );
+        Serial.printf("[WiFi] 等待中... status=%d RSSI=%d\n", WiFi.status(), WiFi.RSSI());
       }
     }
 
     Serial.println();
 
     if (WiFi.status() == WL_CONNECTED) {
-
       Serial.println("========== WiFi 连接成功 ==========");
       Serial.print("[WiFi] IP: ");
       Serial.println(WiFi.localIP());
-
       Serial.print("[WiFi] RSSI: ");
       Serial.print(WiFi.RSSI());
       Serial.println(" dBm");
-
-      Serial.print("[WiFi] Gateway: ");
-      Serial.println(WiFi.gatewayIP());
-
-      Serial.print("[WiFi] DNS: ");
-      Serial.println(WiFi.dnsIP());
-
     } else {
-
-      Serial.println("========== WiFi 连接失败 ==========");
-
-      Serial.printf(
-        "[WiFi] 最终状态码: %d\n",
-        WiFi.status()
-      );
-
-      Serial.println("[WiFi] 之后由后台自动重连");
+      Serial.println("========== WiFi 连接失败，转入后台重试 ==========");
     }
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-
-    addLog(
-      "WiFi 已连接, IP: " +
-      WiFi.localIP().toString()
-    );
+    addLog("WiFi 已连接, IP: " + WiFi.localIP().toString());
 
     timeClient.begin();
     timeClient.update();
+    configTime(8 * 3600, 0, "ntp.aliyun.com", "pool.ntp.org");
 
     server.on("/", HTTP_GET, handleRoot);
     server.on("/api/status", HTTP_GET, handleApiStatus);
@@ -408,50 +382,121 @@ void setupWifiAndServices(bool wifiAlreadyConnected) {
     });
 
     server.on("/logs", HTTP_GET, handleLogs);
+    
+    // ==========================================
+    // iPixel 像素屏专属 Web 与 REST API 路由
+    // ==========================================
+    server.on("/pixel", HTTP_GET, []() {
+      server.send(200, "text/html; charset=UTF-8", PIXEL_HTML);
+    });
+
+    server.on("/api/pixel/status", HTTP_GET, []() {
+      String j = "{";
+      j += "\"connected\":"   + String(pixelManager.isConnected ? "true":"false") + ",";
+      j += "\"power\":"       + String(pixelManager.currentPower ? "true":"false") + ",";
+      j += "\"brightness\":"  + String(pixelManager.currentBrightness) + ",";
+      j += "\"clock_style\":" + String(pixelManager.currentClockStyle) + ",";
+      j += "\"mac\":\""       + pixelManager.targetMacStr + "\",";
+      j += "\"rssi\":"        + String(pixelManager.getRssi()) + ",";
+      j += "\"cycle_sec\":"   + String(pixelManager.clockCycleSec) + ",";
+      j += "\"auto_on\":\""   + pixelManager.autoOnTime + "\",";
+      j += "\"auto_off\":\""  + pixelManager.autoOffTime + "\"";
+      j += "}";
+      server.send(200, "application/json", j);
+    });
+
+    server.on("/api/pixel/power", HTTP_GET, []() {
+      if (server.hasArg("state")) {
+        pixelManager.setPower(server.arg("state").toInt() == 1);
+        server.send(200, "application/json", "{\"status\":\"ok\"}");
+      } else {
+        server.send(400, "text/plain", "Missing state");
+      }
+    });
+
+    server.on("/api/pixel/brightness", HTTP_GET, []() {
+      if (server.hasArg("val")) {
+        pixelManager.setBrightness(server.arg("val").toInt());
+        server.send(200, "application/json", "{\"status\":\"ok\"}");
+      } else {
+        server.send(400, "text/plain", "Missing val");
+      }
+    });
+
+    // 切换样式路由 (无需外部传时分秒，内部自动获取真实时间)
+    server.on("/api/pixel/clock", HTTP_GET, []() {
+      if (server.hasArg("style")) {
+        uint8_t style = server.arg("style").toInt();
+        pixelManager.setClockMode(style, false);
+        server.send(200, "application/json", "{\"status\":\"ok\"}");
+      } else {
+        server.send(400, "text/plain", "Missing style");
+      }
+    });
+
+    // NTP 对时路由 (主动更新并回写时钟)
+    server.on("/api/pixel/sync_ntp", HTTP_GET, []() {
+      bool ok = pixelManager.syncNtp();
+      server.send(200, "application/json", ok ? "{\"status\":\"ok\"}" : "{\"status\":\"fail\"}");
+    });
+
+    server.on("/api/pixel/text", []() {
+      String msg = server.arg("msg");
+      int anim = server.hasArg("anim") ? server.arg("anim").toInt() : 1;
+      int speed = server.hasArg("speed") ? server.arg("speed").toInt() : 90;
+      String color = server.hasArg("color") ? server.arg("color") : "FF5500";
+      int size = server.hasArg("size") ? server.arg("size").toInt() : 2;
+
+      if (msg.length() == 0) {
+        server.send(400, "text/plain", "Missing msg");
+        return;
+      }
+      bool ok = pixelManager.sendText(msg, anim, speed, color, size);
+      server.send(200, "application/json", ok ? "{\"status\":\"ok\"}" : "{\"status\":\"fail\"}");
+    });
+
+    server.on("/api/pixel/save_cfg", HTTP_POST, []() {
+      String mac = server.arg("mac");
+      int cycle = server.arg("cycle").toInt();
+      String onT = server.hasArg("auto_on") ? server.arg("auto_on") : "";
+      String offT = server.hasArg("auto_off") ? server.arg("auto_off") : "";
+
+      pixelManager.saveConfig(mac, cycle, onT, offT);
+      server.send(200, "text/html; charset=utf-8", "<h3>像素屏配置保存成功！</h3><script>setTimeout(()=>location.href='/pixel',1500);</script>");
+    });
+    
     server.on("/tft-reset", HTTP_GET, []() {
-      Serial.println("[TFT] HTTP 强制恢复");
-
       digitalWrite(TFT_BL, LOW);
-
       pinMode(TFT_CS, OUTPUT);
       digitalWrite(TFT_CS, HIGH);
-
       pinMode(T_CS, OUTPUT);
       digitalWrite(T_CS, HIGH);
 
       SPI.end();
       delay(20);
-
       SPI.begin(TFT_SCK, TFT_MISO, TFT_MOSI);
       delay(20);
 
       pinMode(TFT_RST, OUTPUT);
-
       digitalWrite(TFT_RST, LOW);
       delay(50);
-
       digitalWrite(TFT_RST, HIGH);
       delay(150);
 
       tft.begin(20000000);
       tft.setRotation(0);
-
       ts.begin();
-
       delay(30);
 
       tft.writeCommand(ILI9341_SLPOUT);
       delay(120);
-
       tft.writeCommand(ILI9341_DISPON);
       delay(20);
 
       tft.fillScreen(C_BG);
-
       digitalWrite(TFT_BL, HIGH);
 
       drawCurrentScreen(true);
-
       server.send(200, "text/plain", "TFT RESET OK");
     });
 
@@ -459,17 +504,10 @@ void setupWifiAndServices(bool wifiAlreadyConnected) {
     server.begin();
 
     updateWeather();
-
-    addLog(
-      "网络服务启动成功，IP: " +
-      WiFi.localIP().toString()
-    );
+    addLog("网络服务启动成功，IP: " + WiFi.localIP().toString());
 
   } else {
-
-    addLog(
-      "WiFi 连接失败，等待后台自动重连。"
-    );
+    addLog("WiFi 连接失败，等待后台自动重连。");
   }
 
   drawCurrentScreen(true);
@@ -501,18 +539,14 @@ void handleIrCommand() {
   server.send(302, "text/plain", "");
 }
 
-// ⭐️ 优化：生成包含定时与温控状态的网页状态提示 HTML
 String buildStatusHtml() {
   unsigned long nowMs = millis();
 
-  // 1. 开机预热提示
   if (nowMs < 60000UL) {
     long remWarm = (60000UL - nowMs) / 1000UL;
-    return "<span style='color:#f0883e;font-weight:bold;'>"
-           "⏳ 系统开机预热中（剩余 " + String(remWarm) + " 秒）</span>";
+    return "<span style='color:#f0883e;font-weight:bold;'>⏳ 系统开机预热中（剩余 " + String(remWarm) + " 秒）</span>";
   }
 
-  // 2. 手动安全断开冷却提示
   long manualRemain = getManualOffRemaining();
   if (manualOff || manualRemain > 0) {
     return "<div style='color:#d29922;font-weight:bold;line-height:1.6;'>"
@@ -521,7 +555,6 @@ String buildStatusHtml() {
            "<small style='color:#8b949e;font-size:0.8em;'>冷却结束后自动恢复控制</small></div>";
   }
 
-  // 3. 故障锁定（欠压/低功率）提示
   long rem = getCooldownRemaining();
   if (rem > 0) {
     String rText = (st.tripReason == TripReason::UNDERVOLTAGE) ? "欠压保护切断" : "低功率保护切断";
@@ -530,64 +563,45 @@ String buildStatusHtml() {
            "⏳ <b>冷却锁定倒计时：<span style='color:#ffea00;font-size:1.1em;'>" + formatSeconds(rem) + "</span></b></div>";
   }
 
-  // ==========================================================
-  // 4. 定时开关与智能温控状态联动提示
-  // ==========================================================
   bool timerActive = isRelayTimerActive();
 
   if (settings.tempCtrlEnabled && settings.relayTimerEnabled) {
-    // 兼具温控与定时
     if (!timerActive) {
-      return "<span style='color:#8b949e;font-weight:bold;'>"
-             "⏱️ 定时休眠中 (不在设定时间段内，继电器强制关闭)</span>";
+      return "<span style='color:#8b949e;font-weight:bold;'>⏱️ 定时休眠中 (不在设定时间段内，继电器强制关闭)</span>";
     }
     if (isnan(dhtTemp)) {
-      return "<span style='color:#f0883e;font-weight:bold;'>"
-             "🌡️ 定时时段内 | 传感器异常，正在等待有效温湿度...</span>";
+      return "<span style='color:#f0883e;font-weight:bold;'>🌡️ 定时时段内 | 传感器异常，正在等待有效温湿度...</span>";
     }
     if (st.relayOn) {
-      return "<span style='color:#3fb950;font-weight:bold;'>"
-             "🌡️ 定时时段内 | 智能温控运行中 (当前温度: " + String(dhtTemp, 1) + "°C >= 开启阈值)</span>";
+      return "<span style='color:#3fb950;font-weight:bold;'>🌡️ 定时时段内 | 智能温控运行中 (当前温度: " + String(dhtTemp, 1) + "°C >= 开启阈值)</span>";
     } else {
-      return "<span style='color:#58a6ff;font-weight:bold;'>"
-             "🌡️ 定时时段内 | 智能温控待命中 (当前温度: " + String(dhtTemp, 1) + "°C，未达开启阈值)</span>";
+      return "<span style='color:#58a6ff;font-weight:bold;'>🌡️ 定时时段内 | 智能温控待命中 (当前温度: " + String(dhtTemp, 1) + "°C，未达开启阈值)</span>";
     }
   } 
   else if (settings.tempCtrlEnabled) {
-    // 仅启用智能温控
     if (isnan(dhtTemp)) {
-      return "<span style='color:#f0883e;font-weight:bold;'>"
-             "🌡️ 智能温控启用 | 传感器异常，等待数据...</span>";
+      return "<span style='color:#f0883e;font-weight:bold;'>🌡️ 智能温控启用 | 传感器异常，等待数据...</span>";
     }
     if (st.relayOn) {
-      return "<span style='color:#3fb950;font-weight:bold;'>"
-             "🌡️ 智能温控加热/降温中 (当前: " + String(dhtTemp, 1) + "°C, 阈值: " + String(settings.tempThreshold, 1) + "°C)</span>";
+      return "<span style='color:#3fb950;font-weight:bold;'>🌡️ 智能温控加热/降温中 (当前: " + String(dhtTemp, 1) + "°C, 阈值: " + String(settings.tempThreshold, 1) + "°C)</span>";
     } else {
-      return "<span style='color:#58a6ff;font-weight:bold;'>"
-             "🌡️ 智能温控待命中 (当前: " + String(dhtTemp, 1) + "°C, 关闭阈值: " + String(settings.tempThresholdOff, 1) + "°C)</span>";
+      return "<span style='color:#58a6ff;font-weight:bold;'>🌡️ 智能温控待命中 (当前: " + String(dhtTemp, 1) + "°C, 关闭阈值: " + String(settings.tempThresholdOff, 1) + "°C)</span>";
     }
   } 
   else if (settings.relayTimerEnabled) {
-    // 仅启用定时开关
     if (timerActive) {
-      return "<span style='color:#3fb950;font-weight:bold;'>"
-             "⏱️ 定时时段内 (继电器已按计划自动开启)</span>";
+      return "<span style='color:#3fb950;font-weight:bold;'>⏱️ 定时时段内 (继电器已按计划自动开启)</span>";
     } else {
-      return "<span style='color:#8b949e;font-weight:bold;'>"
-             "⏱️ 定时休眠中 (不在设定时间段内，保持关闭)</span>";
+      return "<span style='color:#8b949e;font-weight:bold;'>⏱️ 定时休眠中 (不在设定时间段内，保持关闭)</span>";
     }
   }
 
-  // 5. 默认电压监控状态
   if (st.busVoltage > settings.turnOnVoltage) {
-    return "<span style='color:#58a6ff;font-weight:bold;'>"
-           "⏳ 电压高于开启阈值，正在确认采样...</span>";
+    return "<span style='color:#58a6ff;font-weight:bold;'>⏳ 电压高于开启阈值，正在确认采样...</span>";
   }
 
-  return "<span style='color:#8b949e;font-weight:bold;'>"
-         "🔍 待机监测中 (电压低于 " + String(settings.turnOnVoltage, 1) + "V)</span>";
+  return "<span style='color:#8b949e;font-weight:bold;'>🔍 待机监测中 (电压低于 " + String(settings.turnOnVoltage, 1) + "V)</span>";
 }
-
 
 void handleApiStatus() {
   String statusHtml = buildStatusHtml();
@@ -737,21 +751,19 @@ void handleTouch() {
   if (ts.touched()) {
     TS_Point p = ts.getPoint();
 
-    // 1. 严格过滤伪触摸（杂波时直接返回，不刷新活跃时间，不中断屏保/轮播）
     if (p.z < 400 || p.z > 3800 || p.x < 100 || p.x > 3900 || p.y < 100 || p.y > 3900) {
       return; 
     }
 
-    // 2. 防抖
     static unsigned long lastTouchDebounce = 0;
     if (millis() - lastTouchDebounce < 400) return; 
     lastTouchDebounce = millis(); 
 
-    // 3. 只有确认是人手真触摸，才更新活跃时间
     lastActivityTime = millis();
 
     if (isInStandby) {
       exitStandby(false); 
+      lastActivityTime = millis(); // ⭐️ 重新刷新时间戳，防止立刻又睡
       return;
     }
 
@@ -781,7 +793,6 @@ void handleTouch() {
               forceOnSystem();
           }
       }
-
       else if (sy > 230 && sy < 285) {
         irLightState = !irLightState;
         irsend.sendNEC(irLightState ? settings.ir_on : settings.ir_off);

@@ -25,7 +25,7 @@ const char ADB_HTML[] PROGMEM = R"rawliteral(
   #toast.show{visibility:visible}
 </style>
 </head><body><div class="container">
-<h1>🔋 ADB 手机电量监控 & 自动充电联动</h1>
+<h1>🔋  ESP32 ADB 手机电量监控 & 自动充电联动</h1>
 <div id="toast"></div>
 
 <!-- 卡片 1: 设备列表 -->

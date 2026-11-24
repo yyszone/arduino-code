@@ -786,12 +786,42 @@ void setupRoutes() {
   server.on("/setNasRelay",         HTTP_GET,  handleSetNasRelay);
   // 通用
   server.on("/sysinfo",             HTTP_GET,  handleSysInfo);
+  // 固件在线 OTA 更新路由（主 .ino 全局函数版）
   server.on("/update", HTTP_POST, []() {
     server.sendHeader("Connection", "close");
-    server.send(200, "text/plain", Update.hasError() ? "更新失败" : "更新成功!");
-    delay(1000);
-    ESP.restart();
-  }, handleUpdateUpload);
+    
+    if (Update.hasError()) {
+      String errStr = String(Update.errorString());
+      int errCode = Update.getError();
+      String failMsg = "更新失败! 错误码: " + String(errCode) + " - 原因: " + errStr;
+      Serial.println("[OTA] " + failMsg);
+      server.send(200, "text/plain; charset=UTF-8", failMsg);
+    } else {
+      Serial.println("[OTA] 更新成功，设备即将重启...");
+      server.send(200, "text/plain; charset=UTF-8", "更新成功!");
+      delay(500);
+      ESP.restart();
+    }
+  }, []() {
+    HTTPUpload& up = server.upload();
+    if (up.status == UPLOAD_FILE_START) {
+      Serial.printf("[OTA] 开始接收固件: %s\n", up.filename.c_str());
+      if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+        Update.printError(Serial);
+      }
+    } else if (up.status == UPLOAD_FILE_WRITE) {
+      yield(); // 喂狗防止卡死
+      if (Update.write(up.buf, up.currentSize) != up.currentSize) {
+        Update.printError(Serial);
+      }
+    } else if (up.status == UPLOAD_FILE_END) {
+      if (Update.end(true)) {
+        Serial.printf("[OTA] 写入完成，总计: %u 字节\n", up.totalSize);
+      } else {
+        Update.printError(Serial);
+      }
+    }
+  });
 
   // ---------- ADB 电池与自动充电控制页面 ----------
   server.on("/adb", HTTP_GET, []() {
