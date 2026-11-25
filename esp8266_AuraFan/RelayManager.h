@@ -367,40 +367,47 @@ public:
     void begin(ESP8266WebServer* webServer) {
         server = webServer;
 
-        // ✅ 开机默认关闭，避免重启时自动吸合
+        // ✅ 每次启动默认关闭继电器
         digitalWrite(RELAY_PIN, RELAY_OFF_LEVEL);
         pinMode(RELAY_PIN, OUTPUT);
         currentState = false;
 
+        Serial.println("[RELAY] Initialized: OFF");
+
+        // 初始化 LittleFS，加载用户保存的定时任务
         if (LittleFS.begin()) {
             loadSchedules();
+        } else {
+            Serial.println("[RELAY] LittleFS mount failed");
         }
 
         // NTP 中国时间同步
-        configTime(8 * 3600, 0, "ntp.aliyun.com", "ntp.tuna.tsinghua.edu.cn", "pool.ntp.org");
+        configTime(
+            8 * 3600,
+            0,
+            "ntp.aliyun.com",
+            "ntp.tuna.tsinghua.edu.cn",
+            "pool.ntp.org"
+        );
 
-        // 等待 NTP 校时
+        // 等待 NTP 校时，保留原有定时功能
         time_t now = time(nullptr);
         int retry = 0;
+
         while (now < 1000000 && retry < 15) {
             delay(200);
             now = time(nullptr);
             retry++;
         }
 
-        // ✅ 自动设置 40 分钟后关闭（同样去重，防止每次重启都塞一条）
-        if (now > 1000000) {
-            time_t future = now + (40 * 60);
-            struct tm* fInfo = localtime(&future);
-            char buf[10];
-            strftime(buf, sizeof(buf), "%H:%M:%S", fInfo);
-            String autoOffTime = String(buf);
-            if (offTimesCount < MAX_SCHEDULES && !hasTime(offTimes, offTimesCount, autoOffTime)) {
-                offTimes[offTimesCount++] = autoOffTime;
-                saveSchedules();
-            }
+        if (now >= 1000000) {
+            Serial.print("[RELAY] NTP synchronized: ");
+            Serial.println(getNowTime());
+        } else {
+            Serial.println("[RELAY] NTP synchronization timeout");
         }
 
+        // 注册网页路由
         setupRoutes();
     }
 

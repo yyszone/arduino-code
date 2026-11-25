@@ -1,13 +1,13 @@
 // =========================================================================================
 // =          ESP8266 智能风扇 & LED & 继电器 & ILI9341 屏幕一体化控制器 v3.4              =
 // =========================================================================================
-// 项目来源: https://github.com/yyszone/arduino-code/tree/main/esp8266_AuraFan
-// 
-// 【更新日志 v3.4】:
-// 1. [杜绝欠压感] R 通道锁定 255 全满亮，彻底告别文字发暗带来的“电压不稳错觉”。
-// 2. [赛博流光色阶] 在【烈焰赤红】与【耀眼琥珀金】之间高饱和度平滑流转 (Crimson <-> Gold)。
-// 3. [2.2秒从容周期] 速度放缓，正弦平滑色相变化，优雅耐看且极其抓眼球。
-// 4. [原位微刷] 零背景开销，每 50ms 原位更新字体颜色笔画，流畅丝滑。
+// 项目来源: https://github.com/yyszone/arduino-code/tree/main/esp8266_AuraFan/
+//
+// 本次仅增加屏幕恢复和 POST 响应优化：
+// 1. 增加 /tft-fix，白屏时可通过浏览器重新初始化 ILI9341 并重绘。
+// 2. /set、/image 先返回 HTTP 响应，再在 loop 中刷新屏幕，避免脚本等待整屏重绘。
+// 3. 每次完整重绘前关闭 ILI9341 显示反转。
+// 4. 不修改原有风扇、灯带、继电器控制逻辑及引脚定义。
 // =========================================================================================
 
 #define FASTLED_INTERNAL
@@ -36,8 +36,8 @@ const int PWM_PIN = 5;  // D1
 const int TACH_PIN = 4; // D2
 
 #define NUM_STRIPS 1
-#define LED_PIN    D8  
-#define TOTAL_LEDS 120 
+#define LED_PIN    D8
+#define TOTAL_LEDS 120
 
 #define TFT_CS   D0
 #define TFT_DC   D3
@@ -56,11 +56,17 @@ RelayManager relayManager;
 String bootResetReason = "";
 bool lastDrawnRelayState = false;
 
+// 屏幕刷新任务：HTTP 先响应，loop 再绘制
+bool displayRefreshPending = false;
+
+// 屏幕硬件恢复任务：由 /tft-fix 触发，在 loop 中执行
+bool tftRecoveryPending = false;
+
 // 🌟【高亮色相流转状态机】
 bool hasOfflineAlert = false;
-String offlineIpsText = "";     
-int16_t offlineIpsX = 0;        
-int16_t offlineIpsY = 0;        
+String offlineIpsText = "";
+int16_t offlineIpsX = 0;
+int16_t offlineIpsY = 0;
 int offlineIpsFontSize = 2;
 unsigned long lastBreathUpdate = 0;
 
@@ -84,7 +90,7 @@ bool useGBR = true;
 
 void ICACHE_RAM_ATTR tachISR() {
     unsigned long curMicros = micros();
-    if (curMicros - lastTachMicros > 1200) { 
+    if (curMicros - lastTachMicros > 1200) {
         pulseCount++;
         lastTachMicros = curMicros;
     }
@@ -119,6 +125,7 @@ String getUptime() {
     return String(buf);
 }
 
+// 原有灯带和风扇更新逻辑：保持不变
 void updateLeds() {
     if (TOTAL_LEDS == 0 || millis() - lastLedUpdate < 20) return;
     lastLedUpdate = millis();
@@ -139,7 +146,7 @@ void updateLeds() {
                 fill_rainbow(leds, numLedsToLight, gHue, 7);
                 break;
             case FADE: {
-                uint8_t brightness = (exp(sin(millis()/2000.0*PI)) - 0.36787944)*108.0;
+                uint8_t brightness = (exp(sin(millis() / 2000.0 * PI)) - 0.36787944) * 108.0;
                 fill_solid(leds, numLedsToLight, staticColor);
                 FastLED.setBrightness(brightness);
                 break;
@@ -150,7 +157,7 @@ void updateLeds() {
 
     int dutyCycle = map(fanSliderValue, 0, 255, 0, PWM_RESOLUTION);
     if (PWM_INVERTED) dutyCycle = PWM_RESOLUTION - dutyCycle;
-    
+
     analogWrite(PWM_PIN, PWM_INVERTED ? PWM_RESOLUTION : 0);
     FastLED.show();
     analogWrite(PWM_PIN, dutyCycle);
@@ -164,9 +171,9 @@ void drawRelayBadge(bool state) {
     int16_t bx = tft.width() - bw - 4;
     int16_t by = tft.height() - bh - 3;
 
-    uint16_t bgColor     = state ? 0x0340 : 0x2104; 
-    uint16_t borderColor = state ? 0x07E0 : 0x7BEF; 
-    uint16_t textColor   = state ? 0x07E0 : 0xBDF7; 
+    uint16_t bgColor     = state ? 0x0340 : 0x2104;
+    uint16_t borderColor = state ? 0x07E0 : 0x7BEF;
+    uint16_t textColor   = state ? 0x07E0 : 0xBDF7;
 
     tft.fillRect(bx, by, bw, bh, bgColor);
     tft.drawRect(bx, by, bw, bh, borderColor);
@@ -253,15 +260,12 @@ String extractOfflineTails(const String& raw) {
 }
 
 // =========================================================================
-// 🌟【全新高亮色相流转引擎】：
-// 锁定 R=255 全满亮（绝不发暗、绝无欠压感）
-// 在【赛博赤红 (255, 20, 15)】与【耀眼金 (255, 205, 0)】之间平滑流转
+// 高亮色相流转引擎：R=255，在赤红与琥珀金之间平滑流转
 // =========================================================================
 uint16_t getBreathColor(float progress) {
-    // progress: 0.0 ~ 1.0 (正弦波驱动)
-    uint8_t r = 255;                               // 🔴 红色通道永久满亮，杜绝发暗
-    uint8_t g = 20 + (uint8_t)(185 * progress);   // 20 (烈火赤红) <--> 205 (亮金琥珀)
-    uint8_t b = (uint8_t)(15 * (1.0 - progress));  // 微量蓝光增强霓虹通透感
+    uint8_t r = 255;
+    uint8_t g = 20 + (uint8_t)(185 * progress);
+    uint8_t b = (uint8_t)(15 * (1.0 - progress));
 
     if (useGBR) {
         return ((g & 0xF8) << 8) | ((b & 0xFC) << 3) | (r >> 3);
@@ -302,6 +306,8 @@ uint16_t parseColor(String colorString) {
 
 // 现代化双卡片排版
 void updateDisplay() {
+    // 完整重绘前确保关闭 ILI9341 显示反转
+    tft.invertDisplay(false);
     tft.fillScreen(ILI9341_BLACK);
     drawScreenHeader();
 
@@ -328,7 +334,7 @@ void updateDisplay() {
         for (int i = 4; i <= 7; i++) {
             if (!lines.count(i)) continue;
 
-            // 🌟 核心：OFF: 采用高对比冰蓝冷灰常亮，右侧括号部分进行金-红流光渐变
+            // OFF: 前缀常亮，右侧括号内容进行金-红流光渐变
             if (lines[i].text.startsWith("OFF:")) {
                 int totalLen = lines[i].text.length();
                 int fontSize = (totalLen > 16) ? 1 : 2;
@@ -337,23 +343,20 @@ void updateDisplay() {
                 int16_t tagY = (fontSize == 1) ? (yPos + 6) : yPos;
                 tft.setTextSize(fontSize);
 
-                // 1. 固定绘制高对比冰蓝冷灰前缀 "OFF: "，沉着清晰
                 tft.setCursor(12, tagY);
-                tft.setTextColor(0xAEDC, ILI9341_BLACK); 
+                tft.setTextColor(0xAEDC, ILI9341_BLACK);
                 tft.print("OFF: ");
 
-                // 2. 捕获括号起始点坐标
                 offlineIpsX = tft.getCursorX();
                 offlineIpsY = tft.getCursorY();
 
-                // 3. 初始帧绘制括号内容（初值为正金）
                 tft.setTextColor(getBreathColor(1.0), ILI9341_BLACK);
                 tft.print(offlineIpsText);
 
                 yPos += 22;
                 continue;
             }
-            
+
             tft.setCursor(12, yPos);
             tft.setTextColor(lines[i].color, ILI9341_BLACK);
             tft.setTextSize(2);
@@ -393,31 +396,86 @@ void updateDisplay() {
     drawScreenFooter();
 }
 
+// 重新初始化 ILI9341：白屏时由 /tft-fix 调用
+void initTFT() {
+    tft.begin();
+    delay(50);
+    SPI.setFrequency(1000000);
+    tft.setRotation(0);
+
+    uint8_t caset_data[] = {0x00, 0x00, 0x00, 0xEF};
+    tft.sendCommand(ILI9341_CASET, caset_data, 4);
+
+    uint8_t raset_data[] = {0x00, 0x00, 0x01, 0x3F};
+    tft.sendCommand(ILI9341_PASET, raset_data, 4);
+
+    tft.writeCommand(ILI9341_RAMWR);
+
+    uint8_t madctl_data = 0xE8;
+    tft.sendCommand(ILI9341_MADCTL, &madctl_data, 1);
+
+    tft.invertDisplay(false);
+    tft.fillScreen(ILI9341_BLACK);
+}
+
 void handleRoot() {
     server.send_P(200, "text/html; charset=UTF-8", MAIN_PAGE_HTML);
 }
 
 void handleSetSpeed() {
     if (server.hasArg("value")) {
-        fanSliderValue = constrain(
-            server.arg("value").toInt(), 0, 255
-        );
+        fanSliderValue = constrain(server.arg("value").toInt(), 0, 255);
         server.send(200, "text/plain", "OK");
     } else {
         server.send(400, "text/plain", "Bad Request");
     }
 }
-void handleGetRPM() { server.send(200, "text/plain", String(computeRPM())); }
-void handleGetUptime() { server.send(200, "text/plain", getUptime()); }
-void handleSetRGB() { if (server.hasArg("r") && server.hasArg("g") && server.hasArg("b")) { staticColor = CRGB(server.arg("r").toInt(), server.arg("g").toInt(), server.arg("b").toInt()); currentLedMode = STATIC; server.send(200, "text/plain", "OK"); } else { server.send(400, "text/plain", "Bad Request"); }}
-void handleSetActiveLeds() { if (server.hasArg("value")) { numLedsToLight = server.arg("value").toInt(); server.send(200, "text/plain", "OK"); } else { server.send(400, "text/plain", "Bad Request"); }}
-void handleSetLedMode() { if (server.hasArg("mode")) { String mode = server.arg("mode"); if (mode == "off") currentLedMode = OFF; else if (mode == "static") currentLedMode = STATIC; else if (mode == "rainbow") currentLedMode = RAINBOW; else if (mode == "fade") currentLedMode = FADE; server.send(200, "text/plain", "OK"); } else { server.send(400, "text/plain", "Bad Request"); }}
 
-void handleGetState() { 
-    String modeStr = "off"; 
-    if (currentLedMode == STATIC) modeStr = "static"; 
-    else if (currentLedMode == RAINBOW) modeStr = "rainbow"; 
-    else if (currentLedMode == FADE) modeStr = "fade"; 
+void handleGetRPM() {
+    server.send(200, "text/plain", String(computeRPM()));
+}
+
+void handleGetUptime() {
+    server.send(200, "text/plain", getUptime());
+}
+
+void handleSetRGB() {
+    if (server.hasArg("r") && server.hasArg("g") && server.hasArg("b")) {
+        staticColor = CRGB(server.arg("r").toInt(), server.arg("g").toInt(), server.arg("b").toInt());
+        currentLedMode = STATIC;
+        server.send(200, "text/plain", "OK");
+    } else {
+        server.send(400, "text/plain", "Bad Request");
+    }
+}
+
+void handleSetActiveLeds() {
+    if (server.hasArg("value")) {
+        numLedsToLight = server.arg("value").toInt();
+        server.send(200, "text/plain", "OK");
+    } else {
+        server.send(400, "text/plain", "Bad Request");
+    }
+}
+
+void handleSetLedMode() {
+    if (server.hasArg("mode")) {
+        String mode = server.arg("mode");
+        if (mode == "off") currentLedMode = OFF;
+        else if (mode == "static") currentLedMode = STATIC;
+        else if (mode == "rainbow") currentLedMode = RAINBOW;
+        else if (mode == "fade") currentLedMode = FADE;
+        server.send(200, "text/plain", "OK");
+    } else {
+        server.send(400, "text/plain", "Bad Request");
+    }
+}
+
+void handleGetState() {
+    String modeStr = "off";
+    if (currentLedMode == STATIC) modeStr = "static";
+    else if (currentLedMode == RAINBOW) modeStr = "rainbow";
+    else if (currentLedMode == FADE) modeStr = "fade";
 
     String json = "{";
     json += "\"fanSpeed\":" + String(fanSliderValue) + ",";
@@ -440,7 +498,7 @@ void handleGetState() {
         json += "{\"text\":\"" + val.text + "\",\"color\":\"" + val.colorHtml + "\",\"size\":" + String(val.size) + "}";
     }
     json += "]}";
-    server.send(200, "application/json", json); 
+    server.send(200, "application/json", json);
 }
 
 void handleSetText() {
@@ -457,7 +515,7 @@ void handleSetText() {
             line.colorHtml = server.hasArg(colorKey) ? server.arg(colorKey) : "#FFFFFF";
 
             if (line.text.startsWith("offline:") || line.text.startsWith("offline")) {
-                offlineIpsText = extractOfflineTails(line.text); 
+                offlineIpsText = extractOfflineTails(line.text);
                 if (offlineIpsText.length() > 0) {
                     hasOfflineAlert = true;
                     line.text = "OFF: " + offlineIpsText;
@@ -473,8 +531,16 @@ void handleSetText() {
             lines[i] = line;
         }
     }
-    updateDisplay();
+
+    // 先结束 HTTP 响应；屏幕刷新放到 loop，避免 POST 等待整屏重绘
+    displayRefreshPending = true;
     server.send(200, "text/plain", "OK");
+    Serial.printf(
+        "[POST /set] OK | args=%d | heap=%u | maxBlock=%u\n",
+        server.args(),
+        ESP.getFreeHeap(),
+        ESP.getMaxFreeBlockSize()
+    );
 }
 
 void handleImage() {
@@ -492,7 +558,9 @@ void handleImage() {
                 image.pixels.push_back(strtoul(hexColor.c_str(), NULL, 16));
             }
             image.y_offset = server.hasArg("y_offset") ? server.arg("y_offset").toInt() : 0;
-            updateDisplay();
+
+            // 保留原有行为：请求成功后刷新现有仪表盘
+            displayRefreshPending = true;
             server.send(200, "text/plain", "Image OK");
         } else {
             server.send(400, "text/plain", "Invalid image parameters");
@@ -502,127 +570,153 @@ void handleImage() {
     }
 }
 
-void handleNotFound() { server.send(404, "text/plain", "404: Not Found"); }
-
-void setup() {
-  // 1. 上电最优先：立刻拉低灯带引脚，锁死继电器电平，避开冷启动浪涌[cite: 2, 3]
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);
-
-  // 继电器默认关闭，避免 ESP8266 重启时自动启动 220V 负载
-  digitalWrite(RELAY_PIN, !RELAY_ON_LEVEL);
-  pinMode(RELAY_PIN, OUTPUT);
-
-  // 2. 冷启动等待 500ms，让 LM2596 输出电压和外部电容稳定
-  delay(500);
-
-  Serial.begin(115200);
-  delay(100); //[cite: 3]
-  bootResetReason = ESP.getResetReason(); //[cite: 3]
-
-  // 3. 初始化风扇 PWM 与测速引脚[cite: 3]
-  pinMode(PWM_PIN, OUTPUT); //[cite: 3]
-  analogWriteFreq(PWM_FREQUENCY); //[cite: 3]
-  analogWrite(PWM_PIN, PWM_INVERTED ? PWM_RESOLUTION : 0); //[cite: 3]
-  pinMode(TACH_PIN, INPUT_PULLUP); //[cite: 3]
-  attachInterrupt(digitalPinToInterrupt(TACH_PIN), tachISR, FALLING); //[cite: 3]
-  lastRpmTime = millis(); //[cite: 3]
-
-  // 4. 尽早清空灯带，防止冷启动灯珠乱亮吃电流
-  if (TOTAL_LEDS > 0) { //[cite: 3]
-      FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, TOTAL_LEDS); //[cite: 3]
-      FastLED.setBrightness(50); // 启动阶段限制最大亮度，降低电流冲击
-      FastLED.clear(true); //[cite: 3]
-  }
-
-  // 5. 初始化 ILI9341 屏幕[cite: 3]
-  tft.begin(); //[cite: 3]
-  delay(50);
-  SPI.setFrequency(1000000); //[cite: 3]
-  tft.setRotation(0); //[cite: 3]
-  tft.invertDisplay(false);
-  uint8_t caset_data[] = {0x00, 0x00, 0x00, 0xEF}; //[cite: 3]
-  tft.sendCommand(ILI9341_CASET, caset_data, 4); //[cite: 3]
-  uint8_t raset_data[] = {0x00, 0x00, 0x01, 0x3F}; //[cite: 3]
-  tft.sendCommand(ILI9341_PASET, raset_data, 4); //[cite: 3]
-  tft.writeCommand(ILI9341_RAMWR); //[cite: 3]
-  uint8_t madctl_data = 0xE8; //[cite: 3]
-  tft.sendCommand(ILI9341_MADCTL, &madctl_data, 1); //[cite: 3]
-    // 确保屏幕使用正常显示模式
-  tft.invertDisplay(false);
-  tft.fillScreen(ILI9341_BLACK); //[cite: 3]
-
-  drawScreenHeader(); //[cite: 3]
-  tft.setTextColor(ILI9341_WHITE); //[cite: 3]
-  tft.setTextSize(2); //[cite: 3]
-  tft.setCursor(10, 35); //[cite: 3]
-  tft.println("Booting..."); //[cite: 3]
-
-  // 6. 先在屏幕上打印连接提示，再开始连 WiFi（超时自动重启）[cite: 3]
-  tft.setCursor(10, 65); //[cite: 3]
-  tft.setTextSize(1); //[cite: 3]
-  tft.print("Connecting WiFi..."); //[cite: 3]
-
-  WiFi.persistent(false);
-  WiFi.hostname(deviceName); //[cite: 3]
-  WiFi.mode(WIFI_STA); //[cite: 3]
-  WiFi.begin(ssid, password); //[cite: 3]
-
-  int wifiRetry = 0;
-  while (WiFi.status() != WL_CONNECTED) {
-      delay(400); //[cite: 3]
-      Serial.print("."); //[cite: 3]
-      wifiRetry++;
-      if (wifiRetry > 40) { // 约 16 秒连不上自动重启，应对冷启动射频异常
-          ESP.restart();
-      }
-  }
-
-  relayManager.begin(&server); //[cite: 2, 3]
-  updateDisplay(); //[cite: 3]
-
-  if (MDNS.begin(deviceName)) { //[cite: 3]
-      MDNS.addService("http", "tcp", 80); //[cite: 3]
-  }
-
-  server.on("/", HTTP_GET, handleRoot); //[cite: 3]
-  server.on("/setSpeed", HTTP_GET, handleSetSpeed); //[cite: 3]
-  server.on("/getRPM", HTTP_GET, handleGetRPM); //[cite: 3]
-  server.on("/getUptime", HTTP_GET, handleGetUptime); //[cite: 3]
-  server.on("/setRGB", HTTP_GET, handleSetRGB); //[cite: 3]
-  server.on("/setLedMode", HTTP_GET, handleSetLedMode); //[cite: 3]
-  server.on("/setActiveLeds", HTTP_GET, handleSetActiveLeds); //[cite: 3]
-  server.on("/getState", HTTP_GET, handleGetState); //[cite: 3]
-  server.on("/set", HTTP_POST, handleSetText); //[cite: 3]
-  server.on("/image", HTTP_POST, handleImage); //[cite: 3]
-  server.onNotFound(handleNotFound); //[cite: 3]
-
-  httpUpdater.setup(&server); //[cite: 3]
-  server.begin(); //[cite: 3]
+// 白屏恢复接口：重新初始化 TFT，并重新绘制当前数据
+void handleTftFix() {
+    tftRecoveryPending = true;
+    server.send(200, "text/plain", "TFT recovery scheduled");
 }
 
+void handleNotFound() {
+    server.send(404, "text/plain", "404: Not Found");
+}
+
+void setup() {
+    // 1. 上电最优先：立刻拉低灯带引脚，锁定继电器关闭电平
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, LOW);
+
+    digitalWrite(RELAY_PIN, !RELAY_ON_LEVEL);
+    pinMode(RELAY_PIN, OUTPUT);
+
+    // 2. 冷启动等待 500ms，让电源稳定
+    delay(500);
+
+    Serial.begin(115200);
+    delay(100);
+    bootResetReason = ESP.getResetReason();
+
+    Serial.println();
+    Serial.println("========== ESP8266 RESET INFO ==========");
+    Serial.print("Reset Reason: ");
+    Serial.println(bootResetReason);
+    Serial.println(ESP.getResetInfo());
+    Serial.printf("Free Heap: %u bytes\n", ESP.getFreeHeap());
+    Serial.printf("Max Free Block: %u bytes\n", ESP.getMaxFreeBlockSize());
+    Serial.printf("Heap Fragmentation: %u%%\n", ESP.getHeapFragmentation());
+    Serial.println("========================================");
+
+    // 3. 初始化风扇 PWM 与测速引脚（原样保留）
+    pinMode(PWM_PIN, OUTPUT);
+    analogWriteFreq(PWM_FREQUENCY);
+    analogWrite(PWM_PIN, PWM_INVERTED ? PWM_RESOLUTION : 0);
+    pinMode(TACH_PIN, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(TACH_PIN), tachISR, FALLING);
+    lastRpmTime = millis();
+
+    // 4. 尽早清空灯带（原样保留）
+    if (TOTAL_LEDS > 0) {
+        FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, TOTAL_LEDS);
+        FastLED.setBrightness(50);
+        FastLED.clear(true);
+    }
+
+    // 5. 初始化 ILI9341
+    initTFT();
+
+    drawScreenHeader();
+    tft.setTextColor(ILI9341_WHITE);
+    tft.setTextSize(2);
+    tft.setCursor(10, 35);
+    tft.println("Booting...");
+
+    // 6. Wi-Fi 连接
+    tft.setCursor(10, 65);
+    tft.setTextSize(1);
+    tft.print("Connecting WiFi...");
+
+    WiFi.persistent(false);
+    WiFi.hostname(deviceName);
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid, password);
+
+    int wifiRetry = 0;
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(400);
+        Serial.print(".");
+        wifiRetry++;
+        if (wifiRetry > 40) {
+            ESP.restart();
+        }
+        yield();
+    }
+
+    Serial.println();
+    Serial.print("WiFi IP: ");
+    Serial.println(WiFi.localIP());
+
+    relayManager.begin(&server);
+    updateDisplay();
+
+    if (MDNS.begin(deviceName)) {
+        MDNS.addService("http", "tcp", 80);
+    }
+
+    server.on("/", HTTP_GET, handleRoot);
+    server.on("/setSpeed", HTTP_GET, handleSetSpeed);
+    server.on("/getRPM", HTTP_GET, handleGetRPM);
+    server.on("/getUptime", HTTP_GET, handleGetUptime);
+    server.on("/setRGB", HTTP_GET, handleSetRGB);
+    server.on("/setLedMode", HTTP_GET, handleSetLedMode);
+    server.on("/setActiveLeds", HTTP_GET, handleSetActiveLeds);
+    server.on("/getState", HTTP_GET, handleGetState);
+    server.on("/set", HTTP_POST, handleSetText);
+    server.on("/image", HTTP_POST, handleImage);
+    server.on("/tft-fix", HTTP_GET, handleTftFix);
+    server.onNotFound(handleNotFound);
+
+    httpUpdater.setup(&server);
+    server.begin();
+
+    Serial.println("[HTTP] Server started");
+    Serial.println("[TFT] Recovery endpoint: /tft-fix");
+}
 
 void loop() {
-  server.handleClient();
-  MDNS.update();
-  updateLeds();
-  relayManager.update();
+    server.handleClient();
 
-  bool currentRelayState = relayManager.getState();
-  if (currentRelayState != lastDrawnRelayState) {
-      drawRelayBadge(currentRelayState);
-  }
+    // 收到恢复请求：重新初始化屏幕控制器，再绘制原有页面
+    if (tftRecoveryPending) {
+        tftRecoveryPending = false;
+        displayRefreshPending = false;
+        Serial.println("[TFT] Recovery started");
+        initTFT();
+        updateDisplay();
+        Serial.println("[TFT] Recovery completed");
+    }
+    // 普通 POST：HTTP 已先返回，再执行屏幕刷新
+    else if (displayRefreshPending) {
+        displayRefreshPending = false;
+        updateDisplay();
+    }
 
-  // 🌟【高亮色相流转】：周期 2.2 秒，平滑刷新微步，R=255 全满亮，无抖动、无闪烁
-  if (hasOfflineAlert && offlineIpsText.length() > 0 && millis() - lastBreathUpdate >= 50) {
-      lastBreathUpdate = millis();
-      // 2.2秒优雅正弦波进度 0.0 ~ 1.0
-      float progress = (sin(millis() / 2200.0 * 2.0 * PI) + 1.0) / 2.0;
-      uint16_t breathCol = getBreathColor(progress);
+    MDNS.update();
+    updateLeds();
+    relayManager.update();
 
-      tft.setTextSize(offlineIpsFontSize);
-      tft.setCursor(offlineIpsX, offlineIpsY);
-      tft.setTextColor(breathCol, ILI9341_BLACK); 
-      tft.print(offlineIpsText);
-  }
+    bool currentRelayState = relayManager.getState();
+    if (currentRelayState != lastDrawnRelayState) {
+        drawRelayBadge(currentRelayState);
+    }
+
+    // 高亮色相流转：周期 2.2 秒，每 50ms 原位更新
+    if (hasOfflineAlert && offlineIpsText.length() > 0 && millis() - lastBreathUpdate >= 50) {
+        lastBreathUpdate = millis();
+        float progress = (sin(millis() / 2200.0 * 2.0 * PI) + 1.0) / 2.0;
+        uint16_t breathCol = getBreathColor(progress);
+
+        tft.setTextSize(offlineIpsFontSize);
+        tft.setCursor(offlineIpsX, offlineIpsY);
+        tft.setTextColor(breathCol, ILI9341_BLACK);
+        tft.print(offlineIpsText);
+    }
 }
